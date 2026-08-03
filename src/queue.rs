@@ -82,7 +82,6 @@ pub enum AppTabs {
 	Files,
 	Stashing,
 	Stashlist,
-	Reflog,
 }
 
 ///

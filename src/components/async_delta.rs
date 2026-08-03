@@ -18,7 +18,9 @@ use ratatui::{
 	text::{Line, Span},
 };
 
-use crate::ansi::ansi_to_lines;
+use crate::ansi::{
+	ansi_to_lines, expand_indexed_colors, expanded_color,
+};
 use unicode_width::UnicodeWidthStr;
 
 /// Parameters identifying a delta render request.
@@ -384,6 +386,16 @@ fn run_delta(
 		delta_args.push(params.width.max(20).to_string());
 		delta_args.push("--side-by-side".to_string());
 	}
+	// Delta cannot auto-detect the terminal background or true-color support
+	// when its stdout is this internal pipe. Pass the detected light/dark mode
+	// explicitly: unlike `--syntax-theme` alone, this also selects the correct
+	// addition/deletion backgrounds and other delta UI colors. The parsed ANSI
+	// is ultimately rendered by gitui's RGB-capable crossterm backend, so keep
+	// delta from downgrading theme colors to the 256-color palette.
+	if let Some(flag) = crate::os_theme::get().delta_flag() {
+		delta_args.push(flag.to_string());
+	}
+	delta_args.push("--true-color=always".to_string());
 
 	let delta_bytes = if let Ok(mut child) =
 		std::process::Command::new("delta")
@@ -432,13 +444,22 @@ fn run_delta(
 		},
 	);
 
-	Some(rebuild(
+	let mut processed = rebuild(
 		raw_lines,
 		line_level_bgs,
 		diff,
 		usize::from(params.width),
 		params.side_by_side,
-	))
+	);
+	// Keep indexed colors intact while rebuilding: the side-by-side gutter
+	// logic uses them as structural markers. Expand only the finished output
+	// so Windows/crossterm cannot reduce xterm's fixed 256-color palette to
+	// the nearest configurable ANSI color.
+	expand_indexed_colors(&mut processed.display_lines);
+	for bg in &mut processed.line_level_bgs {
+		*bg = bg.map(expanded_color);
+	}
+	Some(processed)
 }
 
 /// Build display lines, hunk map, and position map from raw delta

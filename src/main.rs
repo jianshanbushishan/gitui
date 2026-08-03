@@ -70,6 +70,7 @@ mod input;
 mod keys;
 mod notify_mutex;
 mod options;
+mod os_theme;
 mod popup_stack;
 mod popups;
 mod queue;
@@ -170,6 +171,13 @@ fn main() -> Result<()> {
 
 	asyncgit::register_tracing_logging();
 	ensure_valid_path(&cliargs.repo_path)?;
+
+	// Resolve the OS light/dark scheme once and pin the corresponding
+	// external-tool settings for the lifetime of the process. bat/delta are
+	// launched with piped stdout, so they cannot perform the terminal query
+	// that they use when run directly.
+	let scheme = os_theme::detect_color_scheme();
+	os_theme::set(scheme);
 
 	let key_config = KeyConfig::init(
 		cliargs.key_bindings_path.as_ref(),

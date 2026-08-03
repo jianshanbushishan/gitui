@@ -6,6 +6,7 @@ use once_cell::sync::{Lazy, OnceCell};
 use ratatui::text::{Line, Span};
 use scopetime::scope_time;
 use std::{
+	ffi::OsString,
 	io::Write,
 	ops::Range,
 	path::{Path, PathBuf},
@@ -355,16 +356,22 @@ impl AsyncJob for AsyncSyntaxJob {
 
 /// Try to highlight `content` via `bat` (looks for `bat` then `batcat` on
 /// PATH). Returns `None` on any failure so the caller falls back to the
-/// built-in `syntect` highlighter. `bat` reads `$BAT_THEME` itself — no
-/// wiring needed here. When `line_numbers` is true, bat emits a
-/// right-aligned line-number gutter (e.g. `···1`) using
+/// built-in `syntect` highlighter. When `line_numbers` is true, bat emits
+/// a right-aligned line-number gutter (e.g. `···1`) using
 /// `--style=plain,numbers` instead of `--plain`.
+///
+/// The detected scheme is passed as bat's special `light`/`dark` theme
+/// value. This reproduces `--theme=auto` even though bat's stdout is a pipe
+/// and it cannot query the terminal itself.
 fn try_bat(
 	content: &str,
 	path: &str,
 	line_numbers: bool,
 ) -> Option<SyntaxText> {
-	let bat = find_in_path(&["bat", "batcat"])?;
+	let Some(bat) = find_in_path(&["bat", "batcat"]) else {
+		log::debug!("bat preview unavailable: bat/batcat not found on PATH");
+		return None;
+	};
 
 	let style_arg = if line_numbers {
 		"--style=plain,numbers"
@@ -372,18 +379,26 @@ fn try_bat(
 		"--plain"
 	};
 
+	let mut args: Vec<String> = vec![
+		"--color=always".to_string(),
+		style_arg.to_string(),
+		"--paging=never".to_string(),
+		"--file-name".to_string(),
+		path.to_string(),
+	];
+	if let Some(theme) = crate::os_theme::get().bat_theme() {
+		args.push(format!("--theme={theme}"));
+	}
+
 	let mut child = Command::new(bat)
-		.args([
-			"--color=always",
-			style_arg,
-			"--paging=never",
-			"--file-name",
-			path,
-		])
+		.args(&args)
 		.stdin(Stdio::piped())
 		.stdout(Stdio::piped())
-		.stderr(Stdio::null())
+		.stderr(Stdio::piped())
 		.spawn()
+		.map_err(|e| {
+			log::debug!("bat preview failed to start: {e}");
+		})
 		.ok()?;
 
 	let stdin_handle = child.stdin.take();
@@ -394,16 +409,27 @@ fn try_bat(
 		}
 	});
 
-	let output = child.wait_with_output().ok();
+	let output = child
+		.wait_with_output()
+		.map_err(|e| {
+			log::debug!("bat preview failed while waiting: {e}");
+		})
+		.ok();
 	let _ = stdin_thread.join();
 
 	let output = output?;
 	if !output.status.success() || output.stdout.is_empty() {
+		log::debug!(
+			"bat preview failed: status={}, stderr={}",
+			output.status,
+			String::from_utf8_lossy(&output.stderr).trim()
+		);
 		return None;
 	}
 
 	let text = String::from_utf8_lossy(&output.stdout);
-	let (lines, _) = crate::ansi::ansi_to_lines(&text);
+	let (mut lines, _) = crate::ansi::ansi_to_lines(&text);
+	crate::ansi::expand_indexed_colors(&mut lines);
 	if lines.is_empty() {
 		return None;
 	}
@@ -500,7 +526,8 @@ fn run_lister(
 	}
 
 	let text = String::from_utf8_lossy(&output.stdout);
-	let (lines, _) = crate::ansi::ansi_to_lines(&text);
+	let (mut lines, _) = crate::ansi::ansi_to_lines(&text);
+	crate::ansi::expand_indexed_colors(&mut lines);
 	if lines.is_empty() {
 		return None;
 	}
@@ -515,16 +542,115 @@ pub fn bat_available() -> bool {
 	find_in_path(&["bat", "batcat"]).is_some()
 }
 
-/// Return the first matching binary found on `PATH`, or `None`.
+/// Return the first matching binary found on `PATH`, or `None`. On Windows,
+/// honor `PATHEXT`; joining a PATH directory with bare `"bat"` does not find
+/// Scoop's `bat.exe`, even though `Command::new("bat")` would.
 fn find_in_path(names: &[&str]) -> Option<PathBuf> {
 	let path_var = std::env::var_os("PATH")?;
-	for dir in std::env::split_paths(&path_var) {
+	find_in_dirs(names, std::env::split_paths(&path_var))
+}
+
+fn find_in_dirs(
+	names: &[&str],
+	dirs: impl IntoIterator<Item = PathBuf>,
+) -> Option<PathBuf> {
+	let extensions = executable_extensions();
+	for dir in dirs {
 		for name in names {
-			let candidate = dir.join(name);
-			if candidate.is_file() {
-				return Some(candidate);
+			for executable_name in executable_names(name, &extensions) {
+				let candidate = dir.join(executable_name);
+				if candidate.is_file() {
+					return Some(candidate);
+				}
 			}
 		}
 	}
 	None
+}
+
+fn executable_names(name: &str, extensions: &[OsString]) -> Vec<OsString> {
+	let mut names = vec![OsString::from(name)];
+	if Path::new(name).extension().is_none() {
+		for extension in extensions {
+			let mut executable = OsString::from(name);
+			executable.push(extension);
+			names.push(executable);
+		}
+	}
+	names
+}
+
+fn executable_extensions() -> Vec<OsString> {
+	#[cfg(windows)]
+	{
+		let value = std::env::var("PATHEXT")
+			.unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+		return value
+			.split(';')
+			.filter(|extension| !extension.is_empty())
+			.map(OsString::from)
+			.collect();
+	}
+
+	#[cfg(not(windows))]
+	{
+		Vec::new()
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{bat_available, find_in_dirs, try_bat, SyntaxTextInner};
+	use std::{fs::File, iter};
+	use tempfile::TempDir;
+
+	#[test]
+	fn find_in_dirs_finds_exact_filename() {
+		let dir = TempDir::new().unwrap();
+		let executable = dir.path().join("preview-tool");
+		File::create(&executable).unwrap();
+
+		assert_eq!(
+			find_in_dirs(
+				&["preview-tool"],
+				iter::once(dir.path().to_path_buf())
+			),
+			Some(executable)
+		);
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn find_in_dirs_honors_windows_pathext() {
+		let dir = TempDir::new().unwrap();
+		let executable = dir.path().join("bat.exe");
+		File::create(&executable).unwrap();
+
+		let found = find_in_dirs(
+			&["bat"],
+			iter::once(dir.path().to_path_buf()),
+		);
+		let found = found.unwrap();
+		assert_eq!(found.parent(), executable.parent());
+		assert!(found
+			.file_name()
+			.unwrap()
+			.to_string_lossy()
+			.eq_ignore_ascii_case("bat.exe"));
+	}
+
+	#[test]
+	fn try_bat_returns_ansi_when_bat_is_installed() {
+		if !bat_available() {
+			return;
+		}
+
+		let result = try_bat(
+			"[package]\nname = \"preview-test\"\n",
+			"Cargo.toml",
+			false,
+		)
+		.expect("installed bat should render piped content");
+		assert!(matches!(result.inner, SyntaxTextInner::Ansi(_)));
+	}
 }

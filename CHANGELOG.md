@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+* the `bat` file preview and the `delta` diff renderer now follow the Windows light/dark system theme. At startup gitui reads the `AppsUseLightTheme` registry value (which Windows Terminal mirrors when its `theme` is `system`, the default). Because both tools are launched with piped stdout and cannot query the terminal themselves, gitui passes `light`/`dark` to bat and `--light`/`--dark` plus true-color output to delta. This keeps bat's automatic syntax-theme choice and delta's complete palette (including addition/deletion backgrounds) consistent with direct terminal execution. The scheme is detected once at launch, so switching the OS theme requires reopening gitui. On macOS/Linux the detection returns "unknown" and the tools retain their previous behavior.
+* xterm palette colors 16–255 emitted by external preview tools are expanded to their exact RGB values before rendering. This prevents the Windows crossterm path from reducing bat's 256-color syntax output to the nearest 16-color terminal entry (for example, bat color 197 `#ff005f` previously appeared as the terminal's pale bright red), making gitui's preview match direct bat output.
+* external preview-tool discovery now honors Windows `PATHEXT`. Previously gitui searched PATH for the literal extensionless names `bat`/`batcat`/`eza`; Scoop installs `bat.exe`, so Windows silently fell back to the built-in Syntect highlighter even though running `bat` directly worked. BAT startup and exit failures are now also recorded in the debug log.
+
 ## [v2.15] - 2026-07-22
 
 ### Added

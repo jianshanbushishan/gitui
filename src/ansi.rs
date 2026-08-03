@@ -4,6 +4,59 @@ use ratatui::{
 };
 use std::borrow::Cow;
 
+/// Convert the fixed part of the xterm 256-color palette to RGB.
+///
+/// Crossterm's Windows rendering path can reduce `Color::Indexed` values to
+/// the nearest one of the terminal's 16 configurable ANSI colors. Indices
+/// 16..=255 are not configurable: their RGB values are defined by xterm, so
+/// expanding them before rendering preserves the exact color emitted by
+/// tools such as bat and delta. Indices 0..=15 deliberately remain indexed
+/// because those colors *are* supplied by the active terminal color scheme.
+const fn expand_indexed_color(color: Color) -> Color {
+	let Color::Indexed(index) = color else {
+		return color;
+	};
+
+	match index {
+		0..=15 => color,
+		16..=231 => {
+			let cube = index - 16;
+			let r = xterm_cube_component(cube / 36);
+			let g = xterm_cube_component((cube % 36) / 6);
+			let b = xterm_cube_component(cube % 6);
+			Color::Rgb(r, g, b)
+		}
+		232..=255 => {
+			let gray = 8 + (index - 232) * 10;
+			Color::Rgb(gray, gray, gray)
+		}
+	}
+}
+
+const fn xterm_cube_component(value: u8) -> u8 {
+	if value == 0 {
+		0
+	} else {
+		55 + value * 40
+	}
+}
+
+/// Expand fixed xterm indexed foreground/background colors in parsed lines
+/// after any logic that relies on their original indexed representation.
+pub fn expand_indexed_colors(lines: &mut [Line<'static>]) {
+	for line in lines {
+		for span in &mut line.spans {
+			span.style.fg = span.style.fg.map(expand_indexed_color);
+			span.style.bg = span.style.bg.map(expand_indexed_color);
+		}
+	}
+}
+
+/// Expand a standalone color, such as delta's remembered line background.
+pub const fn expanded_color(color: Color) -> Color {
+	expand_indexed_color(color)
+}
+
 /// When delta outputs a long line it sometimes resets styles mid-line and
 /// restores only bg, not fg. After a line's spans are fully parsed we scan
 /// them to find the dominant fg color (the first rgb fg seen while bg is
@@ -344,6 +397,36 @@ mod tests {
 		assert_eq!(spans.len(), 1);
 		assert_eq!(spans[0].content.as_ref(), "rgb");
 		assert_eq!(spans[0].style.fg, Some(Color::Rgb(200, 100, 50)));
+	}
+
+	#[test]
+	fn test_expand_xterm_indexed_colors_to_exact_rgb() {
+		let input = concat!(
+			"\x1b[38;5;197mred\x1b[0m",
+			"\x1b[38;5;101mstring\x1b[0m",
+			"\x1b[38;5;70msection\x1b[0m",
+			"\x1b[38;5;238mtext\x1b[0m",
+			"\x1b[48;5;232mbg\x1b[0m",
+		);
+		let (mut lines, _) = ansi_to_lines(input);
+		expand_indexed_colors(&mut lines);
+		let spans = &lines[0].spans;
+
+		assert_eq!(spans[0].style.fg, Some(Color::Rgb(255, 0, 95)));
+		assert_eq!(spans[1].style.fg, Some(Color::Rgb(135, 135, 95)));
+		assert_eq!(spans[2].style.fg, Some(Color::Rgb(95, 175, 0)));
+		assert_eq!(spans[3].style.fg, Some(Color::Rgb(68, 68, 68)));
+		assert_eq!(spans[4].style.bg, Some(Color::Rgb(8, 8, 8)));
+	}
+
+	#[test]
+	fn test_expand_preserves_configurable_ansi_palette() {
+		let (mut lines, _) = ansi_to_lines("\x1b[38;5;9mred\x1b[0m");
+		expand_indexed_colors(&mut lines);
+		assert_eq!(
+			lines[0].spans[0].style.fg,
+			Some(Color::Indexed(9))
+		);
 	}
 
 	#[test]
