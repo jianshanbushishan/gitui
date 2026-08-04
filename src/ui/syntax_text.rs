@@ -200,6 +200,27 @@ impl SyntaxText {
 	pub fn path(&self) -> &Path {
 		&self.path
 	}
+
+	/// Return the plain (unstyled) source lines of this text, used for
+	/// in-content substring search. For the syntect variant this is the
+	/// original source; for the ANSI/bat variant the plain text is
+	/// reconstructed from the rendered spans (sans any coloring).
+	pub fn source_lines(&self) -> Vec<String> {
+		match &self.inner {
+			SyntaxTextInner::Syntect { text, .. } => {
+				text.lines().map(ToString::to_string).collect()
+			}
+			SyntaxTextInner::Ansi(lines) => lines
+				.iter()
+				.map(|line| {
+					line.spans
+						.iter()
+						.map(|span| span.content.as_ref())
+						.collect::<String>()
+				})
+				.collect(),
+		}
+	}
 }
 
 impl<'a> From<&'a SyntaxText> for ratatui::text::Text<'a> {

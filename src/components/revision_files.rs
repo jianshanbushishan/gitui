@@ -252,6 +252,15 @@ impl RevisionFilesComponent {
 		}
 	}
 
+	/// Forward a content-search selection to the preview pane.
+	pub fn content_search_selected(
+		&mut self,
+		query: String,
+		line: usize,
+	) {
+		self.current_file.set_search_result(query, line);
+	}
+
 	pub fn find_file(&mut self, file: &Path) {
 		self.tree.collapse_but_root();
 		if self.tree.select_file(file) {
@@ -565,7 +574,39 @@ impl Component for RevisionFilesComponent {
 			);
 			tree_nav_cmds(&self.tree, &self.key_config, out);
 		} else {
-			self.current_file.commands(out, force_all);
+			// preview pane focused
+			out.push(
+				CommandInfo::new(
+					strings::commands::preview_return(
+						&self.key_config,
+					),
+					true,
+					true,
+				)
+				.order(order::NAV),
+			);
+			if self.current_file.has_search() {
+				out.push(
+					CommandInfo::new(
+						strings::commands::search_prev(
+							&self.key_config,
+						),
+						true,
+						true,
+					)
+					.order(order::NAV),
+				);
+				out.push(
+					CommandInfo::new(
+						strings::commands::search_next(
+							&self.key_config,
+						),
+						true,
+						true,
+					)
+					.order(order::NAV),
+				);
+			}
 		}
 
 		if self.copy_path_popup.is_visible() {
@@ -625,20 +666,17 @@ impl Component for RevisionFilesComponent {
 			} else if key_match(key, self.key_config.keys.file_find) {
 				if is_tree_focused {
 					self.open_finder();
-					return Ok(EventState::Consumed);
+				} else {
+					// preview pane focused: open in-content search
+					self.current_file.start_search()?;
 				}
+				return Ok(EventState::Consumed);
 			} else if key_match(key, self.key_config.keys.edit_file) {
 				if let Some(file) =
 					self.selected_file_path_with_prefix()
 				{
-					//Note: switch to status tab so its clear we are
-					// not altering a file inside a revision here
-					self.queue.push(InternalEvent::TabSwitchStatus);
 					self.queue.push(
-						InternalEvent::OpenExternalEditor(
-							Some(file),
-							None,
-						),
+						InternalEvent::OpenExternalEditor(Some(file), None),
 					);
 					return Ok(EventState::Consumed);
 				}

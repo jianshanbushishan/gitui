@@ -34,6 +34,7 @@ pub static POPUP_TITLE_REMOTES: &str = "Remotes";
 pub static POPUP_SUBTITLE_REMOTES: &str = "Details";
 pub static POPUP_TITLE_FUZZY_FIND: &str = "Fuzzy Finder";
 pub static POPUP_TITLE_LOG_SEARCH: &str = "Search";
+pub static POPUP_TITLE_CONTENT_SEARCH: &str = "Search in File";
 
 pub static POPUP_FAIL_COPY: &str = "Failed to copy text";
 pub static POPUP_SUCCESS_COPY: &str = "Copied Text";
@@ -576,6 +577,40 @@ pub mod commands {
 				key_config.get_hint(key_config.keys.file_find)
 			),
 			"find file in tree",
+			CMD_GROUP_GENERAL,
+		)
+	}
+	pub fn search_next(key_config: &SharedKeyConfig) -> CommandText {
+		CommandText::new(
+			format!(
+				"Next [{}]",
+				key_config
+					.get_hint(key_config.keys.diff_hunk_next),
+			),
+			"next search match",
+			CMD_GROUP_GENERAL,
+		)
+	}
+	pub fn search_prev(key_config: &SharedKeyConfig) -> CommandText {
+		CommandText::new(
+			format!(
+				"Prev [{}]",
+				key_config
+					.get_hint(key_config.keys.diff_hunk_prev),
+			),
+			"previous search match",
+			CMD_GROUP_GENERAL,
+		)
+	}
+	pub fn preview_return(
+		key_config: &SharedKeyConfig,
+	) -> CommandText {
+		CommandText::new(
+			format!(
+				"Return [{}]",
+				key_config.get_hint(key_config.keys.move_left),
+			),
+			"return focus to file tree",
 			CMD_GROUP_GENERAL,
 		)
 	}

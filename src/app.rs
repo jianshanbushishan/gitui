@@ -20,7 +20,7 @@ use crate::{
 		PushPopup, PushTagsPopup, RemoteListPopup, RenameBranchPopup,
 		RenameRemotePopup, ResetPopup, RevisionFilesPopup,
 		StashMsgPopup, SubmodulesListPopup, TagCommitPopup,
-		TagListPopup, UpdateRemoteUrlPopup,
+		TagListPopup, UpdateRemoteUrlPopup, ContentSearchPopup,
 	},
 	queue::{
 		Action, AppTabs, InternalEvent, NeedsUpdate, Queue,
@@ -83,6 +83,7 @@ pub struct App {
 	revision_files_popup: RevisionFilesPopup,
 	fuzzy_find_popup: FuzzyFindPopup,
 	log_search_popup: LogSearchPopupPopup,
+	content_search_popup: ContentSearchPopup,
 	push_popup: PushPopup,
 	push_tags_popup: PushTagsPopup,
 	pull_popup: PullPopup,
@@ -223,6 +224,7 @@ impl App {
 			submodule_popup: SubmodulesListPopup::new(&env),
 			log_search_popup: LogSearchPopupPopup::new(&env),
 			fuzzy_find_popup: FuzzyFindPopup::new(&env),
+			content_search_popup: ContentSearchPopup::new(&env),
 			do_quit: QuitState::None,
 			cmdbar: RefCell::new(CommandBar::new(
 				env.theme.clone(),
@@ -500,6 +502,7 @@ impl App {
 		[
 			log_search_popup,
 			fuzzy_find_popup,
+			content_search_popup,
 			msg_popup,
 			confirm_popup,
 			commit_popup,
@@ -563,6 +566,7 @@ impl App {
 			revision_files_popup,
 			fuzzy_find_popup,
 			log_search_popup,
+			content_search_popup,
 			push_popup,
 			push_tags_popup,
 			pull_popup,
@@ -867,6 +871,24 @@ impl App {
 			}
 			InternalEvent::OpenLogSearchPopup => {
 				self.log_search_popup.open()?;
+				flags
+					.insert(NeedsUpdate::ALL | NeedsUpdate::COMMANDS);
+			}
+			InternalEvent::OpenContentSearch(lines) => {
+				self.content_search_popup.open(lines)?;
+				flags
+					.insert(NeedsUpdate::ALL | NeedsUpdate::COMMANDS);
+			}
+			InternalEvent::ContentSearchSelected(query, line) => {
+				if self.revision_files_popup.is_visible() {
+					self.revision_files_popup.content_search_selected(
+						query.clone(),
+						line,
+					)?;
+				}
+				if self.files_tab.is_visible() {
+					self.files_tab.content_search_selected(query, line);
+				}
 				flags
 					.insert(NeedsUpdate::ALL | NeedsUpdate::COMMANDS);
 			}

@@ -69,6 +69,16 @@ impl RevisionFilesPopup {
 		self.files.find_file(file);
 	}
 
+	/// Forward a content-search selection (query + line) to the preview.
+	pub fn content_search_selected(
+		&mut self,
+		query: String,
+		line: usize,
+	) -> Result<()> {
+		self.files.content_search_selected(query, line);
+		Ok(())
+	}
+
 	fn hide_stacked(&mut self, stack: bool) {
 		self.hide();
 

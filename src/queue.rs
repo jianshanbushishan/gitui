@@ -139,6 +139,10 @@ pub enum InternalEvent {
 	///
 	OpenLogSearchPopup,
 	///
+	OpenContentSearch(Vec<String>),
+	///
+	ContentSearchSelected(String, usize),
+	///
 	FuzzyFinderChanged(usize, String, FuzzyFinderTarget),
 	///
 	FetchRemotes,

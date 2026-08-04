@@ -1,5 +1,6 @@
 mod blame_file;
 mod branchlist;
+mod content_search;
 mod checkout_option;
 mod commit;
 mod compare_commits;
@@ -33,6 +34,7 @@ mod update_remote_url;
 
 pub use blame_file::{BlameFileOpen, BlameFilePopup};
 pub use branchlist::BranchListPopup;
+pub use content_search::ContentSearchPopup;
 pub use checkout_option::CheckoutOptionPopup;
 pub use commit::CommitPopup;
 pub use compare_commits::CompareCommitsPopup;
