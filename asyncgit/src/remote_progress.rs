@@ -11,6 +11,7 @@ use git2::PackBuilderStage;
 use std::{
 	sync::{Arc, Mutex},
 	thread::{self, JoinHandle},
+	time::{Duration, Instant},
 };
 
 /// used for push/pull
@@ -75,30 +76,48 @@ impl RemoteProgress {
 		receiver: Receiver<T>,
 		progress: Arc<Mutex<Option<T>>>,
 	) -> JoinHandle<()> {
-		thread::spawn(move || loop {
-			let incoming = receiver.recv();
-			match incoming {
-				Ok(update) => {
-					Self::set_progress(
-						&progress,
-						Some(update.clone()),
-					)
-					.expect("set progress failed");
-					sender
-						.send(notification_type)
-						.expect("Notification error");
+		thread::spawn(move || {
+			let notification_interval = Duration::from_millis(33);
+			let mut last_notification = None;
+			loop {
+				let incoming = receiver.recv();
+				match incoming {
+					Ok(mut update) => {
+						// Collapse a burst to the freshest value before touching
+						// shared state or waking the UI.
+						for newer in receiver.try_iter() {
+							update = newer;
+						}
+						Self::set_progress(
+							&progress,
+							Some(update.clone()),
+						)
+						.expect("set progress failed");
 
-					thread::yield_now();
+						let done = update.is_done();
+						let now = Instant::now();
+						let should_notify = done
+							|| last_notification.is_none_or(|last| {
+								now.duration_since(last)
+									>= notification_interval
+							});
+						if should_notify {
+							sender
+								.send(notification_type)
+								.expect("Notification error");
+							last_notification = Some(now);
+						}
 
-					if update.is_done() {
+						if done {
+							break;
+						}
+					}
+					Err(e) => {
+						log::error!(
+							"remote progress receiver error: {e}",
+						);
 						break;
 					}
-				}
-				Err(e) => {
-					log::error!(
-						"remote progress receiver error: {e}",
-					);
-					break;
 				}
 			}
 		})

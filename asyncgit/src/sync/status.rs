@@ -285,6 +285,60 @@ pub fn get_status(
 	Ok(res)
 }
 
+/// Fetch staged and worktree changes in one repository status walk.
+///
+/// The first result contains index/tree changes and the second contains
+/// index/worktree changes. Keeping them separate preserves the two status
+/// panes without opening and scanning the repository twice.
+pub fn get_status_split(
+	repo_path: &RepoPath,
+	show_untracked: Option<ShowUntrackedFilesConfig>,
+) -> Result<(Vec<StatusItem>, Vec<StatusItem>)> {
+	scope_time!("get_status_split");
+
+	let repo: gix::Repository = gix_repo(repo_path)?;
+	let show_untracked = if let Some(config) = show_untracked {
+		config
+	} else {
+		let git2_repo = crate::sync::repository::repo(repo_path)?;
+		untracked_files_config_repo(&git2_repo)?
+	};
+	let status = repo
+		.status(gix::progress::Discard)?
+		.untracked_files(show_untracked.into());
+	let mut staged = Vec::new();
+	let mut workdir = Vec::new();
+
+	for item in status.into_iter(Vec::new())? {
+		match item? {
+			gix::status::Item::IndexWorktree(item) => {
+				if let Some(status) = item.summary().map(Into::into) {
+					workdir.push(StatusItem {
+						path: item.rela_path().to_string(),
+						status,
+					});
+				}
+			}
+			gix::status::Item::TreeIndex(change) => {
+				staged.push(StatusItem {
+					path: change.fields().0.to_string(),
+					status: change.into(),
+				});
+			}
+		}
+	}
+
+	let sort = |items: &mut Vec<StatusItem>| {
+		items.sort_by(|a, b| {
+			Path::new(a.path.as_str()).cmp(Path::new(b.path.as_str()))
+		});
+	};
+	sort(&mut staged);
+	sort(&mut workdir);
+
+	Ok((staged, workdir))
+}
+
 /// discard all changes in the working directory
 pub fn discard_status(repo_path: &RepoPath) -> Result<bool> {
 	let repo = repo(repo_path)?;
@@ -307,7 +361,7 @@ mod tests {
 		},
 		StatusItem, StatusItemType,
 	};
-	use std::{fs::File, io::Write, path::Path};
+	use std::{fs, fs::File, io::Write, path::Path};
 	use tempfile::TempDir;
 
 	#[test]
@@ -367,5 +421,31 @@ mod tests {
 				status: StatusItemType::New
 			}]
 		);
+	}
+
+	#[test]
+	fn test_get_status_split_matches_individual_scans() {
+		let (_td, repo) = repo_init().unwrap();
+		let root = repo.path().parent().unwrap();
+		let repo_path: RepoPath = root.to_path_buf().into();
+		let file_path = Path::new("split.txt");
+
+		fs::write(root.join(file_path), "initial\n").unwrap();
+		stage_add_file(&repo_path, file_path).unwrap();
+		commit(&repo_path, "initial").unwrap();
+		fs::write(root.join(file_path), "staged\n").unwrap();
+		stage_add_file(&repo_path, file_path).unwrap();
+		fs::write(root.join(file_path), "workdir\n").unwrap();
+
+		let expected_staged =
+			get_status(&repo_path, StatusType::Stage, None).unwrap();
+		let expected_workdir =
+			get_status(&repo_path, StatusType::WorkingDir, None)
+				.unwrap();
+		let (staged, workdir) =
+			get_status_split(&repo_path, None).unwrap();
+
+		assert_eq!(staged, expected_staged);
+		assert_eq!(workdir, expected_workdir);
 	}
 }

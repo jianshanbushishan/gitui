@@ -8,7 +8,7 @@ use crate::{
 	},
 	AsyncGitNotification, RemoteProgress,
 };
-use crossbeam_channel::{unbounded, Sender};
+use crossbeam_channel::{bounded, Sender};
 use std::{
 	sync::{Arc, Mutex},
 	thread,
@@ -95,7 +95,7 @@ impl AsyncPush {
 		let repo = self.repo.clone();
 
 		thread::spawn(move || {
-			let (progress_sender, receiver) = unbounded();
+			let (progress_sender, receiver) = bounded(64);
 
 			let handle = RemoteProgress::spawn_receiver_thread(
 				AsyncGitNotification::Push,

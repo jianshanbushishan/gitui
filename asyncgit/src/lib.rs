@@ -45,6 +45,7 @@ It wraps libraries like git2 and gix.
 
 pub mod asyncjob;
 mod blame;
+mod branch_compare;
 mod branches;
 pub mod cached;
 mod commit_files;
@@ -68,6 +69,7 @@ mod treefiles;
 
 pub use crate::{
 	blame::{AsyncBlame, BlameParams},
+	branch_compare::AsyncBranchCompareJob,
 	branches::AsyncBranchesJob,
 	commit_files::{AsyncCommitFiles, CommitFilesParams},
 	diff::{AsyncDiff, DiffParams, DiffType},
@@ -82,7 +84,7 @@ pub use crate::{
 	reflog::{AsyncReflog, FetchStatus as ReflogFetchStatus},
 	remote_progress::{RemoteProgress, RemoteProgressState},
 	revlog::{AsyncLog, FetchStatus},
-	status::{AsyncStatus, StatusParams},
+	status::{AsyncStatus, AsyncStatusPair, StatusPair, StatusParams},
 	sync::{
 		diff::{DiffLine, DiffLineType, FileDiff},
 		remotes::push::PushType,
@@ -103,7 +105,13 @@ pub enum AsyncGitNotification {
 	/// this indicates that no new state was fetched but that a async process finished
 	FinishUnchanged,
 	///
-	Status,
+	StatusChanged(sync::status::StatusType),
+	/// A status scan completed without changing its snapshot.
+	StatusUnchanged(sync::status::StatusType),
+	/// Combined staged/worktree status changed.
+	StatusPairChanged,
+	/// Combined staged/worktree status did not change.
+	StatusPairUnchanged,
 	///
 	Diff,
 	///
@@ -138,6 +146,8 @@ pub enum AsyncGitNotification {
 	Delta,
 	/// staged/unstaged `(+.. -..)` line-count stats finished
 	LineStats,
+	/// ahead/behind comparison with the current branch upstream finished
+	BranchCompare,
 }
 
 /// helper function to calculate the hash of an arbitrary type that implements the `Hash` trait
