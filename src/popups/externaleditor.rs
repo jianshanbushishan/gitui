@@ -34,6 +34,12 @@ fn parse_args(input: &str) -> Vec<String> {
 	let mut in_double_quote = false;
 	let mut chars = input.chars().peekable();
 
+	// On Windows the backslash is the path separator, not an escape
+	// character, so it must be preserved verbatim. Without this, an
+	// unquoted editor path like `C:\Users\...\nvim.exe` would be
+	// mangled into `C:Users...nvim.exe` and fail to launch.
+	let backslash_escapes = !cfg!(target_os = "windows");
+
 	while let Some(c) = chars.next() {
 		if in_single_quote {
 			if c == '\'' {
@@ -44,7 +50,7 @@ fn parse_args(input: &str) -> Vec<String> {
 		} else if in_double_quote {
 			if c == '"' {
 				in_double_quote = false;
-			} else if c == '\\' {
+			} else if backslash_escapes && c == '\\' {
 				// Handle escape in double quotes
 				if let Some(&next) = chars.peek() {
 					chars.next();
@@ -61,7 +67,7 @@ fn parse_args(input: &str) -> Vec<String> {
 				'"' => {
 					in_double_quote = true;
 				}
-				'\\' => {
+				'\\' if backslash_escapes => {
 					// Handle escape outside quotes
 					if let Some(&next) = chars.peek() {
 						chars.next();
@@ -321,5 +327,26 @@ mod tests {
 		);
 
 		assert_eq!(as_strings(&args), vec!["f".to_string()]);
+	}
+
+	#[test]
+	fn parse_args_windows_backslash_path() {
+		// On Windows a backslash is the path separator and must be
+		// preserved verbatim; it must never be consumed as an escape.
+		if !cfg!(target_os = "windows") {
+			return;
+		}
+
+		let args = parse_args(
+			r"C:\Users\jians\scoop\apps\neovim\current\bin\nvim.exe",
+		);
+
+		assert_eq!(
+			args,
+			vec![
+				r"C:\Users\jians\scoop\apps\neovim\current\bin\nvim.exe"
+					.to_string()
+			]
+		);
 	}
 }
