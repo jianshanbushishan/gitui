@@ -2,4 +2,5 @@
 /release
 .DS_Store
 /.idea/
+.zcode
 flamegraph.svg
