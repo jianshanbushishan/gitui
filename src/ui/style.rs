@@ -210,13 +210,8 @@ impl Theme {
 		self.line_break.clone()
 	}
 
-	pub fn commandbar(&self, enabled: bool) -> Style {
-		if enabled {
-			Style::default().fg(self.command_fg)
-		} else {
-			Style::default().fg(self.disabled_fg)
-		}
-		.bg(self.cmdbar_bg)
+	pub fn commandbar(&self) -> Style {
+		Style::default().fg(self.command_fg).bg(self.cmdbar_bg)
 	}
 
 	pub fn commit_hash(&self, selected: bool) -> Style {

@@ -82,6 +82,6 @@ impl CommandInfo {
 
 	///
 	pub const fn show_in_quickbar(&self) -> bool {
-		self.quick_bar && self.available
+		self.quick_bar && self.available && self.enabled
 	}
 }
