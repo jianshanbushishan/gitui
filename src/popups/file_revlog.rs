@@ -654,11 +654,14 @@ impl Component for FileRevlogPopup {
 				true,
 				self.diff.focused(),
 			));
-			out.push(CommandInfo::new(
-				strings::commands::diff_toggle_mode(&self.key_config),
-				true,
-				true,
-			));
+			out.push(
+				CommandInfo::new(
+					strings::commands::diff_toggle_mode(&self.key_config),
+					true,
+					true,
+				)
+				.hidden(),
+			);
 		}
 
 		visibility_blocking(self)

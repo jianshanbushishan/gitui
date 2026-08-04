@@ -1,8 +1,4 @@
-use std::borrow::Cow;
-
 use asyncgit::sync::CommitId;
-use unicode_truncate::UnicodeTruncateStr;
-use unicode_width::UnicodeWidthStr;
 
 use crate::keys::SharedKeyConfig;
 
@@ -48,7 +44,6 @@ pub mod symbol {
 	pub const FOLDER_ICON_COLLAPSED: &str = "\u{25b8}"; //▸
 	pub const FOLDER_ICON_EXPANDED: &str = "\u{25be}"; //▾
 	pub const EMPTY_STR: &str = "";
-	pub const ELLIPSIS: char = '\u{2026}'; // …
 }
 
 pub fn title_branches() -> String {
@@ -448,21 +443,6 @@ pub fn copy_success(s: &str) -> String {
 	s.to_string()
 }
 
-pub fn ellipsis_trim_start(s: &str, width: usize) -> Cow<'_, str> {
-	if s.width() <= width {
-		Cow::Borrowed(s)
-	} else {
-		Cow::Owned(format!(
-			"[{}]{}",
-			symbol::ELLIPSIS,
-			s.unicode_truncate_start(
-				width.saturating_sub(3 /* front indicator */)
-			)
-			.0
-		))
-	}
-}
-
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum CheckoutOptions {
 	KeepLocalChanges,
@@ -563,7 +543,7 @@ pub mod commands {
 	pub fn toggle_tabs(key_config: &SharedKeyConfig) -> CommandText {
 		CommandText::new(
 			format!(
-				"Next [{}]",
+				"NextTab [{}]",
 				key_config.get_hint(key_config.keys.tab_toggle)
 			),
 			"switch to next tab",

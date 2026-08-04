@@ -127,7 +127,7 @@ impl Component for InspectCommitPopup {
 			));
 
 			out.push(CommandInfo::new(
-				strings::commands::close_popup(&self.key_config),
+				strings::commands::diff_focus_left(&self.key_config),
 				true,
 				self.diff.focused() || force_all,
 			));
@@ -140,11 +140,14 @@ impl Component for InspectCommitPopup {
 				true,
 			));
 
-			out.push(CommandInfo::new(
-				strings::commands::diff_toggle_mode(&self.key_config),
-				true,
-				true,
-			));
+			out.push(
+				CommandInfo::new(
+					strings::commands::diff_toggle_mode(&self.key_config),
+					true,
+					true,
+				)
+				.hidden(),
+			);
 		}
 
 		visibility_blocking(self)

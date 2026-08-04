@@ -49,8 +49,8 @@ use std::{
 	Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize,
 )]
 pub enum DiffMode {
-	#[default]
 	Unified,
+	#[default]
 	DeltaSideBySide,
 }
 
@@ -1432,11 +1432,14 @@ impl Component for DiffComponent {
 			true,
 			self.focused(),
 		));
-		out.push(CommandInfo::new(
-			strings::commands::diff_toggle_mode(&self.key_config),
-			true,
-			self.focused(),
-		));
+		out.push(
+			CommandInfo::new(
+				strings::commands::diff_toggle_mode(&self.key_config),
+				true,
+				self.focused(),
+			)
+			.hidden(),
+		);
 
 		CommandBlocking::PassingOn
 	}
@@ -1679,8 +1682,7 @@ mod tests {
 		let mut diff_comp = DiffComponent::new(&env, false);
 		// Point the component at our temp repo
 		*diff_comp.repo.borrow_mut() = repo.clone();
-		// Force delta mode: Unified -> DeltaSideBySide
-		diff_comp.toggle_diff_mode();
+		// default is now DeltaSideBySide
 		assert!(diff_comp.is_delta_preview());
 		diff_comp.current_size.set((120, 40));
 
@@ -1923,8 +1925,7 @@ mod tests {
 		let env = Environment::test_env();
 		let mut diff_comp = DiffComponent::new(&env, false);
 		*diff_comp.repo.borrow_mut() = repo.clone();
-		// Force delta mode: Unified -> DeltaSideBySide
-		diff_comp.toggle_diff_mode();
+		// default is now DeltaSideBySide
 		assert!(diff_comp.is_delta_preview());
 
 		// Narrow preview width: content area = 40 (rect width 42).
@@ -2576,7 +2577,9 @@ mod tests {
 		let env = Environment::test_env();
 		let mut diff_comp = DiffComponent::new(&env, false);
 		*diff_comp.repo.borrow_mut() = repo.clone();
-		// default mode is Unified
+		// default is now DeltaSideBySide; this test exercises the
+		// unified renderer's cursor logic, so switch to Unified.
+		diff_comp.toggle_diff_mode();
 		assert!(!diff_comp.is_delta_preview());
 		diff_comp.current_size.set((120, 40));
 

@@ -117,6 +117,14 @@ impl CommandBar {
 			.filter(CommandInfo::show_in_quickbar)
 			.collect::<Vec<_>>();
 		self.cmd_infos.sort_by_key(|e| e.order);
+		// deduplicate by visible label, keeping the first (lowest
+		// order) occurrence so distinct components can't push the
+		// same shortcut twice (e.g. two "Close [esc]"). Uses a set
+		// rather than `dedup_by` because equal-order entries are not
+		// guaranteed to be adjacent after the sort.
+		let mut seen: std::collections::HashSet<String> =
+			std::collections::HashSet::new();
+		self.cmd_infos.retain(|e| seen.insert(e.text.name.clone()));
 		self.refresh_list(self.width);
 	}
 

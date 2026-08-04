@@ -125,7 +125,8 @@ impl Component for HelpPopup {
 					true,
 					true,
 				)
-				.order(99),
+				.order(99)
+				.hidden(),
 			);
 		}
 

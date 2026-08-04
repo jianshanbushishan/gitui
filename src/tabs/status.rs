@@ -883,11 +883,14 @@ impl Component for Status {
 				true,
 			));
 
-			out.push(CommandInfo::new(
-				strings::commands::diff_toggle_mode(&self.key_config),
-				true,
-				true,
-			));
+			out.push(
+				CommandInfo::new(
+					strings::commands::diff_toggle_mode(&self.key_config),
+					true,
+					true,
+				)
+				.hidden(),
+			);
 		}
 
 		self.commands_nav(out, force_all);

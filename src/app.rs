@@ -27,7 +27,7 @@ use crate::{
 		StackablePopupOpen,
 	},
 	setup_popups,
-	strings::{self, ellipsis_trim_start, order},
+	strings::{self, order},
 	tabs::{FilesTab, Revlog, StashList, Stashing, Status},
 	try_or_popup,
 	ui::style::{SharedTheme, Theme},
@@ -57,7 +57,6 @@ use std::{
 	path::{Path, PathBuf},
 	rc::Rc,
 };
-use unicode_width::UnicodeWidthStr;
 
 #[derive(Clone)]
 pub enum QuitState {
@@ -114,7 +113,6 @@ pub struct App {
 	input: Input,
 	popup_stack: PopupStack,
 	options: SharedOptions,
-	repo_path_text: String,
 	goto_line_popup: GotoLinePopup,
 
 	// "Flags"
@@ -163,9 +161,6 @@ impl App {
 	) -> Result<Self> {
 		let repo = RefCell::new(cliargs.repo_path.clone());
 		log::trace!("open repo at: {repo:?}");
-
-		let repo_path_text =
-			repo_work_dir(&repo.borrow()).unwrap_or_default();
 
 		let env = Environment {
 			queue: Queue::new(),
@@ -247,7 +242,6 @@ impl App {
 			requires_redraw: Cell::new(false),
 			file_to_open: None,
 			repo: env.repo,
-			repo_path_text,
 			popup_stack: PopupStack::default(),
 		};
 
@@ -1161,7 +1155,8 @@ impl App {
 				true,
 				!self.any_popup_visible(),
 			)
-			.order(order::NAV),
+			.order(order::NAV)
+			.hidden(),
 		);
 		res.push(
 			CommandInfo::new(
@@ -1171,7 +1166,8 @@ impl App {
 				true,
 				!self.any_popup_visible(),
 			)
-			.order(order::NAV),
+			.order(order::NAV)
+			.hidden(),
 		);
 		res.push(
 			CommandInfo::new(
@@ -1179,7 +1175,8 @@ impl App {
 				true,
 				!self.any_popup_visible(),
 			)
-			.order(order::NAV),
+			.order(order::NAV)
+			.hidden(),
 		);
 
 		res.push(
@@ -1188,7 +1185,8 @@ impl App {
 				true,
 				!self.any_popup_visible(),
 			)
-			.order(100),
+			.order(100)
+			.hidden(),
 		);
 
 		res
@@ -1196,10 +1194,6 @@ impl App {
 
 	//TODO: make this dynamic
 	fn draw_top_bar(&self, f: &mut Frame, r: Rect) {
-		const DIVIDER_PAD_SPACES: usize = 2;
-		const SIDE_PADS: usize = 2;
-		const MARGIN_LEFT_AND_RIGHT: usize = 2;
-
 		let r = r.inner(Margin {
 			vertical: 0,
 			horizontal: 1,
@@ -1214,26 +1208,43 @@ impl App {
 		];
 		let divider = strings::tab_divider(&self.key_config);
 
-		// heuristic, since tui doesn't provide a way to know
-		// how much space is needed to draw a `Tabs`
-		let tabs_len: usize =
-			tab_labels.iter().map(Span::width).sum::<usize>()
-				+ tab_labels.len().saturating_sub(1)
-					* (divider.width() + DIVIDER_PAD_SPACES)
-				+ SIDE_PADS + MARGIN_LEFT_AND_RIGHT;
+		// shared shortcut hints moved from the bottom command bar
+		// into the top bar, pinned to the right edge.
+		// drawn with the command-bar style (white on blue) so they
+		// stand out as a distinct group from the tabs.
+		let kc = &self.key_config;
+		let quick_names = [
+			strings::commands::toggle_tabs_direct(kc).name,
+			strings::commands::toggle_tabs(kc).name,
+			strings::commands::options_popup(kc).name,
+			strings::commands::help_open(kc).name,
+			strings::commands::quit(kc).name,
+		];
+		let quick_style = self.theme.commandbar();
+		let pad = Span::styled(" ", quick_style);
+		let mut quick_spans: Vec<Span> = Vec::new();
+		quick_spans.push(pad.clone());
+		for (i, name) in quick_names.iter().enumerate() {
+			if i > 0 {
+				quick_spans.push(pad.clone());
+			}
+			quick_spans.push(Span::styled(name.as_str(), quick_style));
+		}
+		quick_spans.push(pad);
+		let quick_len: usize = quick_spans.iter().map(Span::width).sum();
 
-		let left_right = Layout::default()
+		let areas = Layout::default()
 			.direction(Direction::Horizontal)
 			.constraints(vec![
-				Constraint::Length(
-					u16::try_from(tabs_len).unwrap_or(r.width),
-				),
 				Constraint::Min(0),
+				Constraint::Length(
+					u16::try_from(quick_len).unwrap_or(r.width),
+				),
 			])
 			.split(r);
 
 		let table_area = r; // use entire area to allow drawing the horizontal separator line
-		let text_area = left_right[1];
+		let quick_area = areas[1];
 
 		let tabs: Vec<Line> =
 			tab_labels.into_iter().map(Line::from).collect();
@@ -1253,15 +1264,9 @@ impl App {
 		);
 
 		f.render_widget(
-			Paragraph::new(Line::from(vec![Span::styled(
-				ellipsis_trim_start(
-					&self.repo_path_text,
-					text_area.width as usize,
-				),
-				self.theme.title(false),
-			)]))
-			.alignment(Alignment::Right),
-			text_area,
+			Paragraph::new(Line::from(quick_spans))
+				.alignment(Alignment::Right),
+			quick_area,
 		);
 	}
 }

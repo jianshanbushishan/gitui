@@ -104,11 +104,14 @@ impl Component for CompareCommitsPopup {
 				self.diff.focused() || force_all,
 			));
 
-			out.push(CommandInfo::new(
-				strings::commands::diff_toggle_mode(&self.key_config),
-				true,
-				true,
-			));
+			out.push(
+				CommandInfo::new(
+					strings::commands::diff_toggle_mode(&self.key_config),
+					true,
+					true,
+				)
+				.hidden(),
+			);
 		}
 
 		visibility_blocking(self)
