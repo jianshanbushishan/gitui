@@ -221,6 +221,33 @@ impl SyntaxText {
 				.collect(),
 		}
 	}
+
+	/// Materialize styled text with owned span contents. Consumers can cache
+	/// this value and borrow it across frames without rebuilding every span.
+	pub fn to_owned_text(&self) -> ratatui::text::Text<'static> {
+		match &self.inner {
+			SyntaxTextInner::Ansi(lines) => lines.clone().into(),
+			SyntaxTextInner::Syntect { text, lines } => {
+				let mut result_lines =
+					Vec::with_capacity(lines.len());
+				for (syntax_line, line_content) in
+					lines.iter().zip(text.lines())
+				{
+					let mut line = Line::from(Vec::with_capacity(
+						syntax_line.items.len(),
+					));
+					for (style, _, range) in &syntax_line.items {
+						line.spans.push(Span::styled(
+							line_content[range.clone()].to_string(),
+							syntact_style_to_tui(style),
+						));
+					}
+					result_lines.push(line);
+				}
+				result_lines.into()
+			}
+		}
+	}
 }
 
 impl<'a> From<&'a SyntaxText> for ratatui::text::Text<'a> {
@@ -390,7 +417,9 @@ fn try_bat(
 	line_numbers: bool,
 ) -> Option<SyntaxText> {
 	let Some(bat) = find_in_path(&["bat", "batcat"]) else {
-		log::debug!("bat preview unavailable: bat/batcat not found on PATH");
+		log::debug!(
+			"bat preview unavailable: bat/batcat not found on PATH"
+		);
 		return None;
 	};
 
@@ -578,7 +607,8 @@ fn find_in_dirs(
 	let extensions = executable_extensions();
 	for dir in dirs {
 		for name in names {
-			for executable_name in executable_names(name, &extensions) {
+			for executable_name in executable_names(name, &extensions)
+			{
 				let candidate = dir.join(executable_name);
 				if candidate.is_file() {
 					return Some(candidate);
@@ -589,7 +619,10 @@ fn find_in_dirs(
 	None
 }
 
-fn executable_names(name: &str, extensions: &[OsString]) -> Vec<OsString> {
+fn executable_names(
+	name: &str,
+	extensions: &[OsString],
+) -> Vec<OsString> {
 	let mut names = vec![OsString::from(name)];
 	if Path::new(name).extension().is_none() {
 		for extension in extensions {
@@ -606,11 +639,11 @@ fn executable_extensions() -> Vec<OsString> {
 	{
 		let value = std::env::var("PATHEXT")
 			.unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
-		return value
+		value
 			.split(';')
 			.filter(|extension| !extension.is_empty())
 			.map(OsString::from)
-			.collect();
+			.collect()
 	}
 
 	#[cfg(not(windows))]
@@ -621,7 +654,9 @@ fn executable_extensions() -> Vec<OsString> {
 
 #[cfg(test)]
 mod tests {
-	use super::{bat_available, find_in_dirs, try_bat, SyntaxTextInner};
+	use super::{
+		bat_available, find_in_dirs, try_bat, SyntaxTextInner,
+	};
 	use std::{fs::File, iter};
 	use tempfile::TempDir;
 

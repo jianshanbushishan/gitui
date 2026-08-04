@@ -140,6 +140,10 @@ pub enum SyntaxHighlightProgress {
 pub enum AsyncAppNotification {
 	///
 	SyntaxHighlighting(SyntaxHighlightProgress),
+	/// A fuzzy file/path search completed.
+	FuzzyFind,
+	/// A file-content search completed.
+	ContentSearch,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -249,15 +253,15 @@ fn run_app(
 
 	let rx_input = input.receiver();
 
-	let (rx_ticker, rx_watcher) = match updater {
+	let (rx_ticker, rx_watcher, _repo_watcher) = match updater {
 		Updater::NotifyWatcher => {
 			let repo_watcher = RepoWatcher::new(
 				repo_work_dir(&cliargs.repo_path)?.as_str(),
 			);
 
-			(never(), repo_watcher.receiver())
+			(never(), repo_watcher.receiver(), Some(repo_watcher))
 		}
-		Updater::Ticker => (tick(TICK_INTERVAL), never()),
+		Updater::Ticker => (tick(TICK_INTERVAL), never(), None),
 	};
 
 	let spinner_ticker = tick(SPINNER_INTERVAL);
@@ -300,6 +304,7 @@ fn run_app(
 
 			scope_time!("loop");
 
+			let mut redraw = true;
 			match event {
 				QueueEvent::InputEvent(ev) => {
 					if matches!(
@@ -315,19 +320,25 @@ fn run_app(
 					app.update()?;
 				}
 				QueueEvent::AsyncEvent(ev) => {
-					if !matches!(
+					if matches!(
 						ev,
 						AsyncNotification::Git(
 							AsyncGitNotification::FinishUnchanged
+								| AsyncGitNotification::StatusUnchanged(_)
+								| AsyncGitNotification::StatusPairUnchanged
 						)
 					) {
+						redraw = false;
+					} else {
 						app.update_async(ev)?;
 					}
 				}
 				QueueEvent::SpinnerUpdate => unreachable!(),
 			}
 
-			draw(terminal, &app)?;
+			if redraw {
+				draw(terminal, &app)?;
+			}
 
 			spinner.set_state(app.any_work_pending());
 			spinner.draw(terminal)?;

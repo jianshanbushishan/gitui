@@ -197,6 +197,11 @@ impl FileRevlogPopup {
 		Ok(())
 	}
 
+	/// Apply a diff mode changed through the options popup.
+	pub fn sync_diff_mode(&mut self) {
+		self.diff.sync_diff_mode();
+	}
+
 	fn fetch_commits(
 		&mut self,
 		new_offset: usize,

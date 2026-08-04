@@ -23,7 +23,11 @@ use asyncgit::{
 use crossterm::event::Event;
 use ratatui::{layout::Rect, text::Span, Frame};
 use std::fmt::Write;
-use std::{borrow::Cow, cell::Cell, path::Path};
+use std::{
+	borrow::Cow,
+	cell::{Cell, RefCell},
+	path::Path,
+};
 
 //TODO: use new `filetreelist` crate
 
@@ -44,6 +48,8 @@ pub struct StatusTreeComponent {
 	revision: Option<CommitId>,
 	repo: RepoPathRef,
 	copy_path_popup: CopyPathPopup,
+	/// Flattened/folded rows, invalidated only when tree layout changes.
+	draw_cache: RefCell<Option<(Vec<TextDrawInfo>, usize)>>,
 }
 
 impl StatusTreeComponent {
@@ -68,6 +74,7 @@ impl StatusTreeComponent {
 				env.theme.clone(),
 				env.key_config.clone(),
 			),
+			draw_cache: RefCell::new(None),
 		}
 	}
 
@@ -83,6 +90,7 @@ impl StatusTreeComponent {
 		if self.current_hash != new_hash {
 			self.tree.update(list)?;
 			self.current_hash = new_hash;
+			self.draw_cache.borrow_mut().take();
 		}
 
 		Ok(())
@@ -165,7 +173,9 @@ impl StatusTreeComponent {
 	pub fn clear(&mut self) -> Result<()> {
 		self.current_hash = 0;
 		self.pending = true;
-		self.tree.update(&[])
+		self.tree.update(&[])?;
+		self.draw_cache.borrow_mut().take();
+		Ok(())
 	}
 
 	///
@@ -180,6 +190,13 @@ impl StatusTreeComponent {
 
 	fn move_selection(&mut self, dir: MoveSelection) -> bool {
 		let changed = self.tree.move_selection(dir);
+		if changed
+			&& matches!(
+				dir,
+				MoveSelection::Left | MoveSelection::Right
+			) {
+			self.draw_cache.borrow_mut().take();
+		}
 
 		if changed {
 			self.queue.push(InternalEvent::Update(NeedsUpdate::DIFF));
@@ -273,10 +290,8 @@ impl StatusTreeComponent {
 	/// allowing folders to be folded up if they are alone in their directory
 	fn build_vec_text_draw_info_for_drawing(
 		&self,
-	) -> (Vec<TextDrawInfo<'_>>, usize, usize) {
+	) -> (Vec<TextDrawInfo>, usize) {
 		let mut should_skip_over: usize = 0;
-		let mut selection_offset: usize = 0;
-		let mut selection_offset_visible: usize = 0;
 		let mut vec_draw_text_info: Vec<TextDrawInfo> = vec![];
 		let tree_items = self.tree.tree.items();
 
@@ -286,18 +301,12 @@ impl StatusTreeComponent {
 				continue;
 			}
 
-			let index_above_select =
-				index < self.tree.selection.unwrap_or(0);
-
-			if !item.info.visible && index_above_select {
-				selection_offset_visible += 1;
-			}
-
 			vec_draw_text_info.push(TextDrawInfo {
 				name: item.info.path.clone(),
 				indent: item.info.indent,
 				visible: item.info.visible,
-				item_kind: &item.kind,
+				item_kind: item.kind.clone(),
+				source_index: index,
 			});
 
 			let mut idx_temp = index;
@@ -334,16 +343,13 @@ impl StatusTreeComponent {
 				vec_draw_text_info[vec_draw_text_info_len - 1]
 					.name += &(String::from("/")
 					+ &tree_items[idx_temp].info.path);
-				if index_above_select {
-					selection_offset += 1;
-				}
 			}
 		}
-		(
-			vec_draw_text_info,
-			selection_offset,
-			selection_offset_visible,
-		)
+		let visible_count = vec_draw_text_info
+			.iter()
+			.filter(|info| info.visible)
+			.count();
+		(vec_draw_text_info, visible_count)
 	}
 
 	fn open_copy_path_popup(&mut self) {
@@ -402,11 +408,12 @@ impl StatusTreeComponent {
 }
 
 /// Used for drawing the `FileTreeComponent`
-struct TextDrawInfo<'a> {
+struct TextDrawInfo {
 	name: String,
 	indent: u8,
 	visible: bool,
-	item_kind: &'a FileTreeItemKind,
+	item_kind: FileTreeItemKind,
+	source_index: usize,
 }
 
 impl DrawableComponent for StatusTreeComponent {
@@ -430,30 +437,32 @@ impl DrawableComponent for StatusTreeComponent {
 				&self.theme,
 			);
 		} else {
-			let (
-				vec_draw_text_info,
-				selection_offset,
-				selection_offset_visible,
-			) = self.build_vec_text_draw_info_for_drawing();
+			if self.draw_cache.borrow().is_none() {
+				*self.draw_cache.borrow_mut() =
+					Some(self.build_vec_text_draw_info_for_drawing());
+			}
+			let draw_cache = self.draw_cache.borrow();
+			let (vec_draw_text_info, visible_count) = draw_cache
+				.as_ref()
+				.expect("draw cache initialized above");
 
-			let select = self
-				.tree
-				.selection
-				.map(|idx| idx.saturating_sub(selection_offset))
+			let selected_source = self.tree.selection.unwrap_or(0);
+			let select = vec_draw_text_info
+				.iter()
+				.rposition(|row| row.source_index <= selected_source)
 				.unwrap_or_default();
+			let visible_selection = vec_draw_text_info[..select]
+				.iter()
+				.filter(|row| row.visible)
+				.count();
 			let tree_height = r.height.saturating_sub(2) as usize;
 			self.tree.window_height.set(Some(tree_height));
 
 			self.scroll_top.set(ui::calc_scroll_top(
 				self.scroll_top.get(),
 				tree_height,
-				select.saturating_sub(selection_offset_visible),
+				visible_selection,
 			));
-
-			let visible_count = vec_draw_text_info
-				.iter()
-				.filter(|info| info.visible)
-				.count();
 
 			let items = vec_draw_text_info
 				.iter()
@@ -463,7 +472,7 @@ impl DrawableComponent for StatusTreeComponent {
 						&draw_text_info.name,
 						draw_text_info.indent as usize,
 						draw_text_info.visible,
-						draw_text_info.item_kind,
+						&draw_text_info.item_kind,
 						r.width,
 						self.show_selection && select == index,
 						&self.theme,
@@ -480,8 +489,8 @@ impl DrawableComponent for StatusTreeComponent {
 				&self.theme,
 			);
 
-			if self.focused && visible_count > tree_height {
-				let max_top = visible_count - tree_height;
+			if self.focused && *visible_count > tree_height {
+				let max_top = *visible_count - tree_height;
 				draw_scrollbar(
 					f,
 					r,

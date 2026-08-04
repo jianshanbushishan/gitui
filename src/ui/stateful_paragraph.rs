@@ -6,7 +6,7 @@ use ratatui::{
 	text::{StyledGrapheme, Text},
 	widgets::{Block, StatefulWidget, Widget, Wrap},
 };
-use std::iter;
+use std::{borrow::Cow, iter};
 use unicode_width::UnicodeWidthStr;
 
 use super::reflow::{LineComposer, LineTruncator, WordWrapper};
@@ -36,9 +36,11 @@ pub struct StatefulParagraph<'a> {
 	/// How to wrap the text
 	wrap: Option<Wrap>,
 	/// The text to display
-	text: Text<'a>,
+	text: Cow<'a, Text<'a>>,
 	/// Alignment of the text
 	alignment: Alignment,
+	/// Identifies the content/layout inputs used to calculate `state.lines`.
+	layout_key: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -47,7 +49,7 @@ pub struct ScrollPos {
 	pub y: u16,
 }
 
-#[derive(Debug, Copy, Clone, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ParagraphState {
 	/// Scroll
 	scroll: ScrollPos,
@@ -55,18 +57,26 @@ pub struct ParagraphState {
 	lines: u16,
 	/// last visible height
 	height: u16,
+	/// Width used by the last complete layout pass.
+	layout_width: u16,
+	/// Content identity used by the last complete layout pass.
+	layout_key: u64,
+	/// Whether `lines` contains a complete layout measurement.
+	lines_valid: bool,
+	/// Wrapped row at which every source line starts.
+	line_offsets: Vec<u16>,
 }
 
 impl ParagraphState {
-	pub const fn lines(self) -> u16 {
+	pub const fn lines(&self) -> u16 {
 		self.lines
 	}
 
-	pub const fn height(self) -> u16 {
+	pub const fn height(&self) -> u16 {
 		self.height
 	}
 
-	pub const fn scroll(self) -> ScrollPos {
+	pub const fn scroll(&self) -> ScrollPos {
 		self.scroll
 	}
 
@@ -76,16 +86,15 @@ impl ParagraphState {
 }
 
 impl<'a> StatefulParagraph<'a> {
-	pub fn new<T>(text: T) -> Self
-	where
-		T: Into<Text<'a>>,
-	{
+	/// Build a paragraph over cached text without cloning all lines/spans.
+	pub fn borrowed(text: &'a Text<'a>) -> Self {
 		Self {
 			block: None,
 			style: Style::default(),
 			wrap: None,
-			text: text.into(),
+			text: Cow::Borrowed(text),
 			alignment: Alignment::Left,
+			layout_key: 0,
 		}
 	}
 
@@ -97,6 +106,46 @@ impl<'a> StatefulParagraph<'a> {
 	pub const fn wrap(mut self, wrap: Wrap) -> Self {
 		self.wrap = Some(wrap);
 		self
+	}
+
+	/// Set a key that changes whenever content affecting line layout changes.
+	pub const fn layout_key(mut self, key: u64) -> Self {
+		self.layout_key = key;
+		self
+	}
+
+	fn measure_layout(&self, width: u16, state: &mut ParagraphState) {
+		state.line_offsets.clear();
+		state.line_offsets.reserve(self.text.lines.len());
+		let mut total_lines = 0_u16;
+		for line in &self.text.lines {
+			state.line_offsets.push(total_lines);
+			let mut styled = line
+				.spans
+				.iter()
+				.flat_map(|span| span.styled_graphemes(self.style))
+				.chain(iter::once(StyledGrapheme {
+					symbol: "\n",
+					style: self.style,
+				}));
+			let mut composer: Box<dyn LineComposer> =
+				if let Some(Wrap { trim }) = self.wrap {
+					Box::new(WordWrapper::new(
+						&mut styled,
+						width,
+						trim,
+					))
+				} else {
+					Box::new(LineTruncator::new(&mut styled, width))
+				};
+			while composer.next_line().is_some() {
+				total_lines = total_lines.saturating_add(1);
+			}
+		}
+		state.lines = total_lines;
+		state.layout_width = width;
+		state.layout_key = self.layout_key;
+		state.lines_valid = true;
 	}
 }
 
@@ -120,18 +169,38 @@ impl StatefulWidget for StatefulParagraph<'_> {
 			return;
 		}
 
+		let layout_changed = !state.lines_valid
+			|| state.layout_width != text_area.width
+			|| state.layout_key != self.layout_key;
+
+		if layout_changed {
+			self.measure_layout(text_area.width, state);
+		}
+
+		let start_line = state
+			.line_offsets
+			.partition_point(|offset| *offset <= state.scroll.y)
+			.saturating_sub(1);
+		let mut y = state
+			.line_offsets
+			.get(start_line)
+			.copied()
+			.unwrap_or_default();
 		let style = self.style;
-		let mut styled = self.text.lines.iter().flat_map(|line| {
-			line.spans
-				.iter()
-				.flat_map(|span| span.styled_graphemes(style))
-				// Required given the way composers work but might be refactored out if we change
-				// composers to operate on lines instead of a stream of graphemes.
-				.chain(iter::once(StyledGrapheme {
-					symbol: "\n",
-					style: self.style,
-				}))
-		});
+		let mut styled =
+			self.text.lines.iter().skip(start_line).flat_map(
+				|line| {
+					line.spans
+						.iter()
+						.flat_map(|span| span.styled_graphemes(style))
+						// Required given the way composers work but might be refactored out if we change
+						// composers to operate on lines instead of a stream of graphemes.
+						.chain(iter::once(StyledGrapheme {
+							symbol: "\n",
+							style: self.style,
+						}))
+				},
+			);
 
 		let mut line_composer: Box<dyn LineComposer> =
 			if let Some(Wrap { trim }) = self.wrap {
@@ -151,12 +220,10 @@ impl StatefulWidget for StatefulParagraph<'_> {
 				}
 				line_composer
 			};
-		let mut y = 0;
-		let mut end_reached = false;
 		while let Some((current_line, current_line_width)) =
 			line_composer.next_line()
 		{
-			if !end_reached && y >= state.scroll.y {
+			if y >= state.scroll.y {
 				let mut x = get_line_offset(
 					current_line_width,
 					text_area.width,
@@ -180,13 +247,55 @@ impl StatefulWidget for StatefulParagraph<'_> {
 					x += Cast::<u16>::cast(symbol.width());
 				}
 			}
-			y += 1;
+			y = y.saturating_add(1);
 			if y >= text_area.height + state.scroll.y {
-				end_reached = true;
+				break;
 			}
 		}
-
-		state.lines = y;
 		state.height = area.height;
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{ParagraphState, ScrollPos, StatefulParagraph};
+	use ratatui::{
+		buffer::Buffer,
+		layout::Rect,
+		text::Text,
+		widgets::{StatefulWidget, Wrap},
+	};
+
+	#[test]
+	fn deep_scroll_starts_from_cached_source_line() {
+		let text = Text::from("zero\none\ntwo\nthree\nfour");
+		let area = Rect::new(0, 0, 8, 2);
+		let mut state = ParagraphState::default();
+		let mut first = Buffer::empty(area);
+		StatefulWidget::render(
+			StatefulParagraph::borrowed(&text)
+				.wrap(Wrap { trim: false })
+				.layout_key(1),
+			area,
+			&mut first,
+			&mut state,
+		);
+		assert_eq!(state.lines(), 5);
+		assert_eq!(state.line_offsets, vec![0, 1, 2, 3, 4]);
+
+		state.set_scroll(ScrollPos { x: 0, y: 3 });
+		let mut scrolled = Buffer::empty(area);
+		StatefulWidget::render(
+			StatefulParagraph::borrowed(&text)
+				.wrap(Wrap { trim: false })
+				.layout_key(1),
+			area,
+			&mut scrolled,
+			&mut state,
+		);
+		let first_row = (0..5)
+			.map(|x| scrolled[(x, 0)].symbol())
+			.collect::<String>();
+		assert_eq!(first_row, "three");
 	}
 }

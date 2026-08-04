@@ -2,7 +2,8 @@ use crate::{
 	app::Environment,
 	components::{
 		string_width_align, visibility_blocking, CommandBlocking,
-		CommandInfo, Component, DrawableComponent, EventState,
+		CommandInfo, Component, DiffComponent, DiffMode,
+		DrawableComponent, EventState,
 	},
 	keys::{key_match, SharedKeyConfig},
 	options::SharedOptions,
@@ -21,9 +22,10 @@ use ratatui::{
 	Frame,
 };
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppOption {
 	StatusShowUntracked,
+	DiffMode,
 	DiffIgnoreWhitespaces,
 	DiffContextLines,
 	DiffInterhunkLines,
@@ -78,6 +80,16 @@ impl OptionsPopup {
 
 		let diff = self.options.borrow().diff_options();
 		Self::add_header(txt, "Diff");
+		self.add_entry(
+			txt,
+			width,
+			"Mode",
+			match self.options.borrow().diff_mode() {
+				DiffMode::Unified => "Unified",
+				DiffMode::DeltaSideBySide => "Side by side (delta)",
+			},
+			self.is_select(AppOption::DiffMode),
+		);
 		self.add_entry(
 			txt,
 			width,
@@ -140,8 +152,9 @@ impl OptionsPopup {
 				AppOption::StatusShowUntracked => {
 					AppOption::DiffInterhunkLines
 				}
+				AppOption::DiffMode => AppOption::StatusShowUntracked,
 				AppOption::DiffIgnoreWhitespaces => {
-					AppOption::StatusShowUntracked
+					AppOption::DiffMode
 				}
 				AppOption::DiffContextLines => {
 					AppOption::DiffIgnoreWhitespaces
@@ -152,7 +165,8 @@ impl OptionsPopup {
 			};
 		} else {
 			self.selection = match self.selection {
-				AppOption::StatusShowUntracked => {
+				AppOption::StatusShowUntracked => AppOption::DiffMode,
+				AppOption::DiffMode => {
 					AppOption::DiffIgnoreWhitespaces
 				}
 				AppOption::DiffIgnoreWhitespaces => {
@@ -191,6 +205,11 @@ impl OptionsPopup {
 					self.options
 						.borrow_mut()
 						.set_status_show_untracked(untracked);
+				}
+				AppOption::DiffMode => {
+					if !self.switch_diff_mode() {
+						return;
+					}
 				}
 				AppOption::DiffIgnoreWhitespaces => {
 					self.options
@@ -231,6 +250,11 @@ impl OptionsPopup {
 						.borrow_mut()
 						.set_status_show_untracked(untracked);
 				}
+				AppOption::DiffMode => {
+					if !self.switch_diff_mode() {
+						return;
+					}
+				}
 				AppOption::DiffIgnoreWhitespaces => {
 					self.options
 						.borrow_mut()
@@ -251,6 +275,26 @@ impl OptionsPopup {
 
 		self.queue
 			.push(InternalEvent::OptionSwitched(self.selection));
+	}
+
+	fn switch_diff_mode(&self) -> bool {
+		let next = match self.options.borrow().diff_mode() {
+			DiffMode::Unified => DiffMode::DeltaSideBySide,
+			DiffMode::DeltaSideBySide => DiffMode::Unified,
+		};
+
+		if next == DiffMode::DeltaSideBySide
+			&& !DiffComponent::is_delta_available()
+		{
+			self.queue.push(InternalEvent::ShowErrorMsg(
+				"delta not found. Install delta for enhanced diff preview."
+					.to_string(),
+			));
+			return false;
+		}
+
+		self.options.borrow_mut().set_diff_mode(next);
+		true
 	}
 }
 
@@ -364,5 +408,37 @@ impl Component for OptionsPopup {
 		self.visible = true;
 
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn diff_mode_is_part_of_diff_option_navigation() {
+		let env = Environment::test_env();
+		let mut popup = OptionsPopup::new(&env);
+
+		popup.move_selection(false);
+		assert_eq!(popup.selection, AppOption::DiffMode);
+		popup.move_selection(false);
+		assert_eq!(popup.selection, AppOption::DiffIgnoreWhitespaces);
+		popup.move_selection(true);
+		assert_eq!(popup.selection, AppOption::DiffMode);
+	}
+
+	#[test]
+	fn diff_mode_option_switches_to_unified() {
+		let env = Environment::test_env();
+		let mut popup = OptionsPopup::new(&env);
+		popup.move_selection(false);
+
+		popup.switch_option(true);
+
+		assert_eq!(
+			env.options.borrow().diff_mode(),
+			DiffMode::Unified
+		);
 	}
 }

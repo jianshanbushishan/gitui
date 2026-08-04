@@ -134,6 +134,8 @@ pub enum InternalEvent {
 	Pull(String),
 	///
 	OptionSwitched(AppOption),
+	/// A diff component changed the shared display mode via its shortcut.
+	DiffModeChanged,
 	///
 	OpenFuzzyFinder(Vec<String>, FuzzyFinderTarget),
 	///
@@ -141,7 +143,7 @@ pub enum InternalEvent {
 	///
 	OpenContentSearch(Vec<String>),
 	///
-	ContentSearchSelected(String, usize),
+	ContentSearchSelected(String, usize, Vec<usize>),
 	///
 	FuzzyFinderChanged(usize, String, FuzzyFinderTarget),
 	///

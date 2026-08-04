@@ -13,14 +13,15 @@ use crate::{
 	popups::{
 		AppOption, BlameFilePopup, BranchListPopup,
 		CheckoutOptionPopup, CommitPopup, CompareCommitsPopup,
-		ConfirmPopup, CreateBranchPopup, CreateRemotePopup,
-		ExternalEditorPopup, FetchPopup, FileRevlogPopup,
-		FuzzyFindPopup, GotoLinePopup, HelpPopup, InspectCommitPopup,
-		LogSearchPopupPopup, MsgPopup, OptionsPopup, PullPopup,
-		PushPopup, PushTagsPopup, RemoteListPopup, RenameBranchPopup,
-		RenameRemotePopup, ResetPopup, RevisionFilesPopup,
-		StashMsgPopup, SubmodulesListPopup, TagCommitPopup,
-		TagListPopup, UpdateRemoteUrlPopup, ContentSearchPopup,
+		ConfirmPopup, ContentSearchPopup, CreateBranchPopup,
+		CreateRemotePopup, ExternalEditorPopup, FetchPopup,
+		FileRevlogPopup, FuzzyFindPopup, GotoLinePopup, HelpPopup,
+		InspectCommitPopup, LogSearchPopupPopup, MsgPopup,
+		OptionsPopup, PullPopup, PushPopup, PushTagsPopup,
+		RemoteListPopup, RenameBranchPopup, RenameRemotePopup,
+		ResetPopup, RevisionFilesPopup, StashMsgPopup,
+		SubmodulesListPopup, TagCommitPopup, TagListPopup,
+		UpdateRemoteUrlPopup,
 	},
 	queue::{
 		Action, AppTabs, InternalEvent, NeedsUpdate, Queue,
@@ -437,6 +438,8 @@ impl App {
 		}
 
 		self.files_tab.update_async(ev)?;
+		self.fuzzy_find_popup.update(ev);
+		self.content_search_popup.update(ev);
 		self.blame_file_popup.update_async(ev)?;
 		self.revision_files_popup.update(ev)?;
 		self.tags_popup.update(ev);
@@ -873,15 +876,25 @@ impl App {
 				flags
 					.insert(NeedsUpdate::ALL | NeedsUpdate::COMMANDS);
 			}
-			InternalEvent::ContentSearchSelected(query, line) => {
+			InternalEvent::ContentSearchSelected(
+				query,
+				line,
+				matching_lines,
+			) => {
 				if self.revision_files_popup.is_visible() {
-					self.revision_files_popup.content_search_selected(
-						query.clone(),
-						line,
-					)?;
+					self.revision_files_popup
+						.content_search_selected(
+							&query,
+							line,
+							&matching_lines,
+						);
 				}
 				if self.files_tab.is_visible() {
-					self.files_tab.content_search_selected(query, line);
+					self.files_tab.content_search_selected(
+						&query,
+						line,
+						&matching_lines,
+					);
 				}
 				flags
 					.insert(NeedsUpdate::ALL | NeedsUpdate::COMMANDS);
@@ -891,6 +904,12 @@ impl App {
 					AppOption::StatusShowUntracked => {
 						self.status_tab.update()?;
 					}
+					AppOption::DiffMode => {
+						self.status_tab.sync_diff_mode();
+						self.file_revlog_popup.sync_diff_mode();
+						self.inspect_commit_popup.sync_diff_mode();
+						self.compare_commits_popup.sync_diff_mode();
+					}
 					AppOption::DiffContextLines
 					| AppOption::DiffIgnoreWhitespaces
 					| AppOption::DiffInterhunkLines => {
@@ -898,6 +917,13 @@ impl App {
 					}
 				}
 
+				flags.insert(NeedsUpdate::ALL);
+			}
+			InternalEvent::DiffModeChanged => {
+				self.status_tab.sync_diff_mode();
+				self.file_revlog_popup.sync_diff_mode();
+				self.inspect_commit_popup.sync_diff_mode();
+				self.compare_commits_popup.sync_diff_mode();
 				flags.insert(NeedsUpdate::ALL);
 			}
 			InternalEvent::FuzzyFinderChanged(
@@ -1228,10 +1254,12 @@ impl App {
 			if i > 0 {
 				quick_spans.push(pad.clone());
 			}
-			quick_spans.push(Span::styled(name.as_str(), quick_style));
+			quick_spans
+				.push(Span::styled(name.as_str(), quick_style));
 		}
 		quick_spans.push(pad);
-		let quick_len: usize = quick_spans.iter().map(Span::width).sum();
+		let quick_len: usize =
+			quick_spans.iter().map(Span::width).sum();
 
 		let areas = Layout::default()
 			.direction(Direction::Horizontal)

@@ -42,11 +42,12 @@ use std::{
 	cell::{Cell, RefCell},
 	cmp,
 	path::Path,
+	sync::Arc,
 };
 
 /// Diff display mode
 #[derive(
-	Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize,
+	Default, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize,
 )]
 pub enum DiffMode {
 	Unified,
@@ -154,12 +155,14 @@ pub struct DiffComponent {
 	is_immutable: bool,
 	options: SharedOptions,
 	diff_mode: DiffMode,
-	delta_line_level_bgs: RefCell<Vec<Option<Color>>>,
-	delta_line_hunks: RefCell<Vec<usize>>,
-	delta_line_positions: RefCell<Vec<Option<DiffLinePosition>>>,
+	delta_line_level_bgs: RefCell<Arc<[Option<Color>]>>,
+	delta_line_hunks: RefCell<Arc<[usize]>>,
+	delta_line_positions: RefCell<Arc<[Option<DiffLinePosition>]>>,
 	last_delta_width: Cell<u16>,
-	delta_display_lines: RefCell<Vec<Line<'static>>>,
+	delta_display_lines: RefCell<Arc<[Line<'static>]>>,
 	async_delta: AsyncDelta,
+	/// Cached aggregate additions/deletions for the current diff.
+	line_stats: (usize, usize),
 }
 
 impl DiffComponent {
@@ -183,12 +186,13 @@ impl DiffComponent {
 			repo: env.repo.clone(),
 			options: env.options.clone(),
 			diff_mode: env.options.borrow().diff_mode(),
-			delta_line_level_bgs: RefCell::new(Vec::new()),
-			delta_line_hunks: RefCell::new(Vec::new()),
-			delta_line_positions: RefCell::new(Vec::new()),
+			delta_line_level_bgs: RefCell::new(Arc::default()),
+			delta_line_hunks: RefCell::new(Arc::default()),
+			delta_line_positions: RefCell::new(Arc::default()),
 			last_delta_width: Cell::new(0),
-			delta_display_lines: RefCell::new(Vec::new()),
+			delta_display_lines: RefCell::new(Arc::default()),
 			async_delta: AsyncDelta::new(&env.sender_git),
+			line_stats: (0, 0),
 		}
 	}
 	///
@@ -206,11 +210,12 @@ impl DiffComponent {
 	pub fn clear(&mut self, pending: bool) {
 		self.current = Current::default();
 		self.diff = None;
-		self.delta_line_level_bgs.borrow_mut().clear();
-		self.delta_line_hunks.borrow_mut().clear();
-		self.delta_line_positions.borrow_mut().clear();
-		self.delta_display_lines.borrow_mut().clear();
+		*self.delta_line_level_bgs.borrow_mut() = Arc::default();
+		*self.delta_line_hunks.borrow_mut() = Arc::default();
+		*self.delta_line_positions.borrow_mut() = Arc::default();
+		*self.delta_display_lines.borrow_mut() = Arc::default();
 		self.longest_line.set(0);
+		self.line_stats = (0, 0);
 		self.vertical_scroll.reset();
 		self.horizontal_scroll.reset();
 		self.selection = Selection::Single(0);
@@ -230,6 +235,17 @@ impl DiffComponent {
 		let hash = hash(&diff);
 
 		if self.current.hash != hash {
+			self.line_stats = diff
+				.hunks
+				.iter()
+				.flat_map(|hunk| hunk.lines.iter())
+				.fold((0, 0), |(added, deleted), line| {
+					match line.line_type {
+						DiffLineType::Add => (added + 1, deleted),
+						DiffLineType::Delete => (added, deleted + 1),
+						_ => (added, deleted),
+					}
+				});
 			let reset_selection = self.current.path != path;
 
 			self.current = Current {
@@ -945,7 +961,7 @@ impl DiffComponent {
 	}
 
 	/// Check if the `delta` binary is available on PATH
-	fn is_delta_available() -> bool {
+	pub(crate) fn is_delta_available() -> bool {
 		std::process::Command::new("delta")
 			.arg("--version")
 			.stdout(std::process::Stdio::null())
@@ -1079,28 +1095,42 @@ impl DiffComponent {
 
 	/// Cycle: `Unified` → `DeltaSideBySide` → `Unified`
 	pub fn toggle_diff_mode(&mut self) {
-		self.diff_mode = match self.diff_mode {
+		let next = match self.diff_mode {
 			DiffMode::Unified => DiffMode::DeltaSideBySide,
 			DiffMode::DeltaSideBySide => DiffMode::Unified,
 		};
 
-		if self.is_delta_preview() && !Self::is_delta_available() {
-			self.diff_mode = DiffMode::Unified;
+		if next == DiffMode::DeltaSideBySide
+			&& !Self::is_delta_available()
+		{
 			self.queue.push(InternalEvent::ShowErrorMsg(
 				"delta not found. Install delta for enhanced diff preview."
 					.to_string(),
 			));
+			return;
 		}
 
-		self.options.borrow_mut().set_diff_mode(self.diff_mode);
+		self.options.borrow_mut().set_diff_mode(next);
+		self.sync_diff_mode();
+		self.queue.push(InternalEvent::DiffModeChanged);
+	}
 
-		if self.is_delta_preview() {
+	/// Apply the persisted diff mode to this component and refresh its
+	/// rendered representation when the mode changed elsewhere.
+	pub fn sync_diff_mode(&mut self) {
+		let mode = self.options.borrow().diff_mode();
+		if self.diff_mode == mode {
+			return;
+		}
+		self.diff_mode = mode;
+
+		if self.is_delta_preview() && self.diff.is_some() {
 			self.request_delta();
-		} else {
-			self.delta_line_level_bgs.borrow_mut().clear();
-			self.delta_line_hunks.borrow_mut().clear();
-			self.delta_line_positions.borrow_mut().clear();
-			self.delta_display_lines.borrow_mut().clear();
+		} else if !self.is_delta_preview() {
+			*self.delta_line_level_bgs.borrow_mut() = Arc::default();
+			*self.delta_line_hunks.borrow_mut() = Arc::default();
+			*self.delta_line_positions.borrow_mut() = Arc::default();
+			*self.delta_display_lines.borrow_mut() = Arc::default();
 		}
 	}
 
@@ -1277,25 +1307,12 @@ impl DrawableComponent for DiffComponent {
 				)
 			});
 
-		let line_stats =
-			self.diff.as_ref().map_or_else(String::new, |diff| {
-				let (added, deleted) = diff
-					.hunks
-					.iter()
-					.flat_map(|hunk| hunk.lines.iter())
-					.fold((0, 0), |(a, d), line| {
-						match line.line_type {
-							DiffLineType::Add => (a + 1, d),
-							DiffLineType::Delete => (a, d + 1),
-							_ => (a, d),
-						}
-					});
-				if added == 0 && deleted == 0 {
-					String::new()
-				} else {
-					format!(" (+{added} -{deleted})")
-				}
-			});
+		let (added, deleted) = self.line_stats;
+		let line_stats = if added == 0 && deleted == 0 {
+			String::new()
+		} else {
+			format!(" (+{added} -{deleted})")
+		};
 
 		let title = format!(
 			"{}{}{}{}",
@@ -1313,7 +1330,8 @@ impl DrawableComponent for DiffComponent {
 			&& self.is_delta_pending()
 			&& self.delta_display_lines.borrow().is_empty();
 
-		if self.is_delta_preview() && !self.pending && !delta_pending {
+		if self.is_delta_preview() && !self.pending && !delta_pending
+		{
 			self.draw_delta(f, r, &title, current_height);
 		} else {
 			let txt = if self.pending || delta_pending {
@@ -1621,6 +1639,18 @@ mod tests {
 	use std::io::Write;
 	use std::rc::Rc;
 	use tempfile::NamedTempFile;
+
+	#[test]
+	fn sync_diff_mode_applies_persisted_option() {
+		let env = Environment::test_env();
+		let mut diff = DiffComponent::new(&env, false);
+		assert_eq!(diff.diff_mode, DiffMode::DeltaSideBySide);
+
+		env.options.borrow_mut().set_diff_mode(DiffMode::Unified);
+		diff.sync_diff_mode();
+
+		assert_eq!(diff.diff_mode, DiffMode::Unified);
+	}
 
 	/// Build a `FileDiff` by running `git diff` against a real repo.
 	fn make_filediff(

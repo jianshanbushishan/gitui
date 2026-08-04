@@ -64,10 +64,15 @@ impl FilesTab {
 
 	pub fn content_search_selected(
 		&mut self,
-		query: String,
+		query: &str,
 		line: usize,
+		matching_lines: &[usize],
 	) {
-		self.files.content_search_selected(query, line);
+		self.files.content_search_selected(
+			query,
+			line,
+			matching_lines,
+		);
 	}
 }
 

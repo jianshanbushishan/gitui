@@ -1,12 +1,14 @@
-use anyhow::Result;
-use crossbeam_channel::{unbounded, Sender};
+use crossbeam_channel::bounded;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use notify_debouncer_mini::{new_debouncer, DebounceEventResult};
+use notify_debouncer_mini::{
+	new_debouncer, DebounceEventResult, Debouncer,
+};
 use scopetime::scope_time;
-use std::{path::Path, thread, time::Duration};
+use std::{path::Path, time::Duration};
 
 pub struct RepoWatcher {
 	receiver: crossbeam_channel::Receiver<()>,
+	_debouncer: Debouncer<RecommendedWatcher>,
 }
 
 impl RepoWatcher {
@@ -16,67 +18,42 @@ impl RepoWatcher {
 			RecommendedWatcher::kind()
 		);
 
-		let (tx, rx) = std::sync::mpsc::channel();
+		scope_time!("create_watcher");
+		let (out_tx, out_rx) = bounded(1);
+		let timeout = Duration::from_secs(2);
+		let mut debouncer = new_debouncer(
+			timeout,
+			move |result: DebounceEventResult| match result {
+				Ok(events) => {
+					log::debug!("notify events: {}", events.len());
+					for (idx, event) in events.iter().enumerate() {
+						log::debug!("notify [{idx}]: {event:?}");
+					}
+					if !events.is_empty() {
+						// One pending refresh is enough; subsequent events are
+						// represented by the same repository snapshot.
+						let _ = out_tx.try_send(());
+					}
+				}
+				Err(error) => {
+					log::error!("notify receive error: {error}");
+				}
+			},
+		)
+		.expect("Watch create error");
+		debouncer
+			.watcher()
+			.watch(Path::new(workdir), RecursiveMode::Recursive)
+			.expect("Watch error");
 
-		let workdir = workdir.to_string();
-
-		thread::spawn(move || {
-			let timeout = Duration::from_secs(2);
-			create_watcher(timeout, tx, &workdir);
-		});
-
-		let (out_tx, out_rx) = unbounded();
-
-		thread::spawn(move || {
-			if let Err(e) = Self::forwarder(&rx, &out_tx) {
-				//maybe we need to restart the forwarder now?
-				log::error!("notify receive error: {e}");
-			}
-		});
-
-		Self { receiver: out_rx }
+		Self {
+			receiver: out_rx,
+			_debouncer: debouncer,
+		}
 	}
 
 	///
 	pub fn receiver(&self) -> crossbeam_channel::Receiver<()> {
 		self.receiver.clone()
 	}
-
-	fn forwarder(
-		receiver: &std::sync::mpsc::Receiver<DebounceEventResult>,
-		sender: &Sender<()>,
-	) -> Result<()> {
-		loop {
-			let ev = receiver.recv()?;
-
-			if let Ok(ev) = ev {
-				log::debug!("notify events: {}", ev.len());
-
-				for (idx, ev) in ev.iter().enumerate() {
-					log::debug!("notify [{idx}]: {ev:?}");
-				}
-
-				if !ev.is_empty() {
-					sender.send(())?;
-				}
-			}
-		}
-	}
-}
-
-fn create_watcher(
-	timeout: Duration,
-	tx: std::sync::mpsc::Sender<DebounceEventResult>,
-	workdir: &str,
-) {
-	scope_time!("create_watcher");
-
-	let mut bouncer =
-		new_debouncer(timeout, tx).expect("Watch create error");
-	bouncer
-		.watcher()
-		.watch(Path::new(&workdir), RecursiveMode::Recursive)
-		.expect("Watch error");
-
-	std::mem::forget(bouncer);
 }

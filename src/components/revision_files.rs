@@ -255,10 +255,15 @@ impl RevisionFilesComponent {
 	/// Forward a content-search selection to the preview pane.
 	pub fn content_search_selected(
 		&mut self,
-		query: String,
+		query: &str,
 		line: usize,
+		matching_lines: &[usize],
 	) {
-		self.current_file.set_search_result(query, line);
+		self.current_file.set_search_result(
+			query,
+			line,
+			matching_lines,
+		);
 	}
 
 	pub fn find_file(&mut self, file: &Path) {
@@ -668,7 +673,7 @@ impl Component for RevisionFilesComponent {
 					self.open_finder();
 				} else {
 					// preview pane focused: open in-content search
-					self.current_file.start_search()?;
+					self.current_file.start_search();
 				}
 				return Ok(EventState::Consumed);
 			} else if key_match(key, self.key_config.keys.edit_file) {
@@ -676,7 +681,10 @@ impl Component for RevisionFilesComponent {
 					self.selected_file_path_with_prefix()
 				{
 					self.queue.push(
-						InternalEvent::OpenExternalEditor(Some(file), None),
+						InternalEvent::OpenExternalEditor(
+							Some(file),
+							None,
+						),
 					);
 					return Ok(EventState::Consumed);
 				}

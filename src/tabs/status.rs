@@ -15,13 +15,15 @@ use crate::{
 };
 use anyhow::Result;
 use asyncgit::{
+	asyncjob::AsyncSingleJob,
 	cached,
 	sync::{
-		self, status::StatusType, RepoPath, RepoPathRef, RepoState,
+		self, diff::DiffOptions, RepoPath, RepoPathRef, RepoState,
 	},
 	sync::{BranchCompare, CommitId},
-	AsyncDiff, AsyncGitNotification, AsyncLineStats, AsyncStatus,
-	DiffParams, DiffType, LineStats, StatusItem, StatusParams,
+	AsyncBranchCompareJob, AsyncDiff, AsyncGitNotification,
+	AsyncLineStats, AsyncStatusPair, DiffParams, DiffType, LineStats,
+	StatusItem,
 };
 use crossterm::event::Event;
 use itertools::Itertools;
@@ -73,12 +75,17 @@ pub struct Status {
 	remotes: RemoteStatus,
 	git_diff: AsyncDiff,
 	git_state: RepoState,
-	git_status_workdir: AsyncStatus,
-	git_status_stage: AsyncStatus,
+	changes_fetcher: AsyncStatusPair,
 	/// background `(+.. -..)` line-count computation; never blocks
 	/// the UI thread. See [`AsyncLineStats`].
 	git_line_stats: AsyncLineStats,
+	git_branch_compare: AsyncSingleJob<AsyncBranchCompareJob>,
 	git_branch_state: Option<BranchCompare>,
+	/// Branch for which `git_branch_state` (including an error/None result)
+	/// was resolved.
+	git_branch_state_branch: Option<String>,
+	line_stats_dirty: bool,
+	line_stats_options: DiffOptions,
 	/// (added, deleted) line counts across all staged files,
 	/// shown on the Staged pane's top border.
 	staged_line_stats: (usize, usize),
@@ -200,11 +207,7 @@ impl Status {
 				repo_clone.clone(),
 				&env.sender_git,
 			),
-			git_status_workdir: AsyncStatus::new(
-				repo_clone.clone(),
-				env.sender_git.clone(),
-			),
-			git_status_stage: AsyncStatus::new(
+			changes_fetcher: AsyncStatusPair::new(
 				repo_clone,
 				env.sender_git.clone(),
 			),
@@ -212,8 +215,14 @@ impl Status {
 				env.repo.borrow().clone(),
 				&env.sender_git,
 			),
+			git_branch_compare: AsyncSingleJob::new(
+				env.sender_git.clone(),
+			),
 			git_action_executed: false,
 			git_branch_state: None,
+			git_branch_state_branch: None,
+			line_stats_dirty: false,
+			line_stats_options: DiffOptions::default(),
 			staged_line_stats: (0, 0),
 			unstaged_line_stats: (0, 0),
 			git_branch_name: cached::BranchName::new(
@@ -441,33 +450,26 @@ impl Status {
 
 	///
 	pub fn update(&mut self) -> Result<()> {
-		let _ = self.git_branch_name.lookup().ok();
-
 		if self.is_visible() {
+			let previous_branch = self.git_branch_name.last();
+			let current_branch = self.git_branch_name.lookup().ok();
+			if current_branch != previous_branch {
+				self.request_branch_compare();
+			}
 			let config =
 				self.options.borrow().status_show_untracked();
+			let diff_options = self.options.borrow().diff_options();
 
 			self.git_diff.refresh()?;
-			self.git_status_workdir.fetch(&StatusParams::new(
-				StatusType::WorkingDir,
-				config,
-			))?;
-			self.git_status_stage.fetch(&StatusParams::new(
-				StatusType::Stage,
-				config,
-			))?;
+			self.changes_fetcher.fetch(config)?;
 
-			// Kick off a background line-stats recompute (no-op if the
-			// options + generation are unchanged). Result lands via
-			// the `LineStats` notification — never blocks UI thread.
-			let _ = self
-				.git_line_stats
-				.fetch(self.options.borrow().diff_options());
+			if diff_options != self.line_stats_options {
+				self.line_stats_options = diff_options;
+				self.request_line_stats()?;
+			}
 
 			self.git_state = sync::repo_state(&self.repo.borrow())
 				.unwrap_or(RepoState::Clean);
-
-			self.branch_compare();
 		}
 
 		Ok(())
@@ -476,9 +478,9 @@ impl Status {
 	///
 	pub fn anything_pending(&self) -> bool {
 		self.git_diff.is_pending()
-			|| self.git_status_stage.is_pending()
-			|| self.git_status_workdir.is_pending()
+			|| self.changes_fetcher.is_pending()
 			|| self.git_line_stats.is_pending()
+			|| self.git_branch_compare.is_pending()
 	}
 
 	fn check_remotes(&mut self) {
@@ -506,15 +508,27 @@ impl Status {
 		match ev {
 			AsyncGitNotification::Diff => self.update_diff()?,
 			AsyncGitNotification::Delta => self.diff.apply_delta(),
-			AsyncGitNotification::Status => self.update_status()?,
+			AsyncGitNotification::StatusPairChanged => {
+				self.update_status(true)?;
+			}
+			AsyncGitNotification::StatusPairUnchanged => {
+				self.update_status(false)?;
+			}
 			AsyncGitNotification::LineStats => {
 				self.update_line_stats();
+				if self.line_stats_dirty {
+					self.line_stats_dirty = false;
+					self.request_line_stats()?;
+				}
 			}
 			AsyncGitNotification::Branches => self.check_remotes(),
 			AsyncGitNotification::Push
 			| AsyncGitNotification::Pull
 			| AsyncGitNotification::CommitFiles => {
-				self.branch_compare();
+				self.request_branch_compare();
+			}
+			AsyncGitNotification::BranchCompare => {
+				self.update_branch_compare();
 			}
 			_ => (),
 		}
@@ -523,32 +537,35 @@ impl Status {
 	}
 
 	pub fn get_files_changes(&self) -> Result<Vec<StatusItem>> {
-		Ok(self.git_status_stage.last()?.items)
+		Ok(self.changes_fetcher.last()?.staged.to_vec())
 	}
 
-	fn update_status(&mut self) -> Result<()> {
-		let stage_status = self.git_status_stage.last()?;
-		self.index.set_items(&stage_status.items)?;
+	fn update_status(&mut self, changed: bool) -> Result<()> {
+		// Status equality only covers paths and status kinds. A file that
+		// remains `Modified` can still have different line counts.
+		self.request_line_stats()?;
 
-		// line stats are computed off the UI thread by
-		// `git_line_stats`; they arrive via the `LineStats`
-		// notification -> `update_line_stats()`, not here.
+		if !changed {
+			return Ok(());
+		}
 
-		let workdir_status = self.git_status_workdir.last()?;
-		self.index_wd.set_items(&workdir_status.items)?;
+		let status = self.changes_fetcher.last()?;
+		self.index.set_items(&status.staged)?;
+		self.index_wd.set_items(&status.workdir)?;
 
 		self.update_diff()?;
+		self.request_branch_compare();
 
 		if self.git_action_executed {
 			self.git_action_executed = false;
 
 			if self.focus == Focus::WorkDir
-				&& workdir_status.items.is_empty()
-				&& !stage_status.items.is_empty()
+				&& status.workdir.is_empty()
+				&& !status.staged.is_empty()
 			{
 				self.switch_focus(Focus::Stage)?;
 			} else if self.focus == Focus::Stage
-				&& stage_status.items.is_empty()
+				&& status.staged.is_empty()
 			{
 				self.switch_focus(Focus::WorkDir)?;
 			}
@@ -610,6 +627,11 @@ impl Status {
 		}
 
 		Ok(())
+	}
+
+	/// Apply a diff mode changed through the options popup.
+	pub fn sync_diff_mode(&mut self) {
+		self.diff.sync_diff_mode();
 	}
 
 	fn request_diff(
@@ -678,18 +700,49 @@ impl Status {
 			.push(InternalEvent::ConfirmAction(Action::UndoCommit));
 	}
 
-	fn branch_compare(&mut self) {
-		self.git_branch_state =
-			self.git_branch_name.last().and_then(|branch| {
-				sync::branch_compare_upstream(
-					&self.repo.borrow(),
-					branch.as_str(),
-				)
-				.ok()
-			});
+	fn request_branch_compare(&self) {
+		if let Some(branch) = self.git_branch_name.last() {
+			self.git_branch_compare.spawn(
+				AsyncBranchCompareJob::new(
+					self.repo.borrow().clone(),
+					branch,
+				),
+			);
+		}
+	}
+
+	fn request_line_stats(&mut self) -> Result<()> {
+		if self.git_line_stats.is_pending() {
+			self.line_stats_dirty = true;
+		} else {
+			let _ =
+				self.git_line_stats.fetch(self.line_stats_options)?;
+		}
+		Ok(())
+	}
+
+	fn update_branch_compare(&mut self) {
+		if let Some(job) = self.git_branch_compare.take_last() {
+			if let Some((branch, result)) = job.result() {
+				// A queued comparison can finish after the user switched
+				// branches. Never apply that stale result to the new branch.
+				if self.git_branch_name.last().as_deref()
+					== Some(branch.as_str())
+				{
+					self.git_branch_state = result.ok();
+					self.git_branch_state_branch = Some(branch);
+				}
+			}
+		}
 	}
 
 	fn can_push(&self) -> bool {
+		let Some(branch) = self.git_branch_name.last() else {
+			return false;
+		};
+		if self.git_branch_state_branch.as_ref() != Some(&branch) {
+			return false;
+		}
 		let is_ahead = self
 			.git_branch_state
 			.as_ref()
@@ -698,9 +751,12 @@ impl Status {
 		is_ahead && self.remotes.has_remote_for_push
 	}
 
-	const fn can_fetch(&self) -> bool {
+	fn can_fetch(&self) -> bool {
 		self.remotes.has_remote_for_fetch
 			&& self.git_branch_state.is_some()
+			&& self.git_branch_name.last().is_some_and(|branch| {
+				self.git_branch_state_branch.as_ref() == Some(&branch)
+			})
 	}
 
 	fn can_abort_merge(&self) -> bool {
@@ -885,7 +941,9 @@ impl Component for Status {
 
 			out.push(
 				CommandInfo::new(
-					strings::commands::diff_toggle_mode(&self.key_config),
+					strings::commands::diff_toggle_mode(
+						&self.key_config,
+					),
 					true,
 					true,
 				)

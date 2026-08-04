@@ -290,6 +290,11 @@ impl CompareCommitsPopup {
 		Ok(())
 	}
 
+	/// Apply a diff mode changed through the options popup.
+	pub fn sync_diff_mode(&mut self) {
+		self.diff.sync_diff_mode();
+	}
+
 	fn update(&mut self) -> Result<()> {
 		self.details.set_commits(
 			self.get_ids().map(CommitFilesParams::from),

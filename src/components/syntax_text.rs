@@ -30,7 +30,12 @@ use ratatui::{
 	widgets::{Block, Borders, Wrap},
 	Frame,
 };
-use std::{borrow::Cow, cell::Cell, path::Path};
+use std::{
+	borrow::Cow,
+	cell::{Cell, RefCell},
+	path::Path,
+	sync::Arc,
+};
 
 /// A source line index that contains at least one match for the query.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -45,7 +50,7 @@ pub struct SyntaxTextComponent {
 	async_highlighting: AsyncSingleJob<AsyncSyntaxJob>,
 	syntax_progress: Option<ProgressPercent>,
 	key_config: SharedKeyConfig,
-	paragraph_state: Cell<ParagraphState>,
+	paragraph_state: RefCell<ParagraphState>,
 	focused: bool,
 	theme: SharedTheme,
 	/// in-content search state
@@ -57,18 +62,25 @@ pub struct SyntaxTextComponent {
 	/// inner width (sans borders) of the preview area from the last draw,
 	/// used to map source lines to wrapped visual rows for search jumping.
 	render_width: Cell<u16>,
+	/// Plain source lines shared by popup search and in-preview navigation.
+	source_lines_cache: RefCell<Option<Arc<[String]>>>,
+	/// Source-line to wrapped-row offsets, cached for the current width.
+	visual_offsets_cache: RefCell<Option<(u16, Arc<[usize]>)>>,
+	/// Cached owned ratatui text; rebuilt only when content/search changes.
+	render_cache: RefCell<Option<(u64, Text<'static>)>>,
+	render_generation: Cell<u64>,
 }
 
 impl SyntaxTextComponent {
 	///
 	pub fn new(env: &Environment) -> Self {
-		SyntaxTextComponent {
+		Self {
 			async_highlighting: AsyncSingleJob::new(
 				env.sender_app.clone(),
 			),
 			syntax_progress: None,
 			current_file: None,
-			paragraph_state: Cell::new(ParagraphState::default()),
+			paragraph_state: RefCell::new(ParagraphState::default()),
 			focused: false,
 			key_config: env.key_config.clone(),
 			theme: env.theme.clone(),
@@ -78,6 +90,10 @@ impl SyntaxTextComponent {
 			search_matches: Vec::new(),
 			search_cursor: 0,
 			render_width: Cell::new(0),
+			source_lines_cache: RefCell::new(None),
+			visual_offsets_cache: RefCell::new(None),
+			render_cache: RefCell::new(None),
+			render_generation: Cell::new(1),
 		}
 	}
 
@@ -94,6 +110,7 @@ impl SyntaxTextComponent {
 				}
 				SyntaxHighlightProgress::Done => {
 					self.syntax_progress = None;
+					let mut content_changed = false;
 					if let Some(job) =
 						self.async_highlighting.take_last()
 					{
@@ -103,9 +120,13 @@ impl SyntaxTextComponent {
 							if let Some(syntax) = job.result() {
 								if syntax.path() == Path::new(path) {
 									*content = Either::Left(syntax);
+									content_changed = true;
 								}
 							}
 						}
+					}
+					if content_changed {
+						self.invalidate_content_caches();
 					}
 				}
 			}
@@ -120,6 +141,7 @@ impl SyntaxTextComponent {
 	///
 	pub fn clear(&mut self) {
 		self.current_file = None;
+		self.invalidate_content_caches();
 		self.reset_search();
 	}
 
@@ -128,67 +150,90 @@ impl SyntaxTextComponent {
 		self.search_query.clear();
 		self.search_matches.clear();
 		self.search_cursor = 0;
+		self.invalidate_render_cache();
+	}
+
+	fn invalidate_render_cache(&self) {
+		self.render_generation
+			.set(self.render_generation.get().wrapping_add(1));
+	}
+
+	fn invalidate_content_caches(&self) {
+		*self.source_lines_cache.borrow_mut() = None;
+		*self.visual_offsets_cache.borrow_mut() = None;
+		self.invalidate_render_cache();
+	}
+
+	fn rebuild_render_cache(&self) {
+		let generation = self.render_generation.get();
+		if self
+			.render_cache
+			.borrow()
+			.as_ref()
+			.is_some_and(|(cached, _)| *cached == generation)
+		{
+			return;
+		}
+
+		let mut text = self.current_file.as_ref().map_or_else(
+			|| Text::from(""),
+			|(_, content)| match content {
+				Either::Left(syn) => syn.to_owned_text(),
+				Either::Right(s) => Text::from(s.clone()),
+			},
+		);
+		if !self.search_query.is_empty() {
+			highlight_search(
+				&mut text,
+				&self.search_query,
+				self.search_matches
+					.get(self.search_cursor)
+					.map(|m| m.line),
+			);
+		}
+		*self.render_cache.borrow_mut() = Some((generation, text));
 	}
 
 	/// Whether a content search is currently active (has matches).
-	pub fn has_search(&self) -> bool {
+	pub const fn has_search(&self) -> bool {
 		!self.search_matches.is_empty()
 	}
 
 	/// Open the content-search popup (fires an `InternalEvent` which the
 	/// app turns into a `ContentSearchPopup`). The popup sends back the
 	/// selected line via [`set_search_result`].
-	pub fn start_search(&mut self) -> Result<()> {
+	pub fn start_search(&self) {
 		let lines = self.file_lines();
 		self.queue.push(InternalEvent::OpenContentSearch(lines));
-		Ok(())
 	}
 
 	/// Called by the app when the user picks a line in the content-search
 	/// popup. Sets the highlight query, (re)computes matches, and scrolls
 	/// the picked line into view.
-	pub fn set_search_result(&mut self, query: String, line: usize) {
-		self.run_search(&query);
-		if let Some(pos) = self
-			.search_matches
-			.iter()
-			.position(|m| m.line >= line)
-		{
-			self.search_cursor = pos;
-		} else {
-			self.search_cursor = 0;
-		}
-		self.scroll_to_current_match();
-	}
-
-	/// Recompute `search_matches` from the current file text.
-	fn run_search(&mut self, query: &str) {
+	pub fn set_search_result(
+		&mut self,
+		query: &str,
+		line: usize,
+		matching_lines: &[usize],
+	) {
 		self.search_query.clear();
 		self.search_query.push_str(query);
 		self.search_matches.clear();
-
-		if query.is_empty() {
-			return;
-		}
-
-		let needle = query.to_lowercase();
-		for (line_idx, line) in self.file_lines().into_iter().enumerate() {
-			if line.to_lowercase().contains(needle.as_str()) {
-				self.search_matches.push(SearchMatch { line: line_idx });
-			}
-		}
-
-		// position the cursor at/after the current scroll line
-		let current_scroll = self.paragraph_state.get().scroll().y as usize;
-		if let Some(pos) = self
-			.search_matches
-			.iter()
-			.position(|m| self.line_to_visual(m.line) >= current_scroll)
+		self.search_matches.extend(
+			matching_lines
+				.iter()
+				.copied()
+				.map(|line| SearchMatch { line }),
+		);
+		if let Some(pos) =
+			self.search_matches.iter().position(|m| m.line >= line)
 		{
 			self.search_cursor = pos;
 		} else {
 			self.search_cursor = 0;
 		}
+		self.invalidate_render_cache();
+		self.scroll_to_current_match();
 	}
 
 	/// Move to the next/previous match and scroll it into view.
@@ -202,44 +247,88 @@ impl SyntaxTextComponent {
 		} else {
 			(self.search_cursor + len - 1) % len
 		};
+		self.invalidate_render_cache();
 		self.scroll_to_current_match();
 	}
 
 	/// The source lines of the currently loaded file as plain `String`s
 	/// (search works on the plain text regardless of syntax highlighting).
 	pub fn file_lines(&self) -> Vec<String> {
-		self.current_file.as_ref().map_or_else(
-			Vec::new,
-			|(_, content)| match content {
-				Either::Left(syn) => syn.source_lines(),
-				Either::Right(s) => s.lines().map(ToString::to_string).collect(),
-			},
-		)
+		self.source_lines().iter().cloned().collect()
+	}
+
+	fn source_lines(&self) -> Arc<[String]> {
+		if let Some(lines) = self.source_lines_cache.borrow().as_ref()
+		{
+			return Arc::clone(lines);
+		}
+		let lines: Arc<[String]> =
+			self.current_file.as_ref().map_or_else(
+				Arc::default,
+				|(_, content)| match content {
+					Either::Left(syn) => syn.source_lines().into(),
+					Either::Right(s) => s
+						.lines()
+						.map(ToString::to_string)
+						.collect::<Vec<_>>()
+						.into(),
+				},
+			);
+		*self.source_lines_cache.borrow_mut() =
+			Some(Arc::clone(&lines));
+		lines
+	}
+
+	fn visual_offsets(&self) -> Arc<[usize]> {
+		let width = self.render_width.get().max(1);
+		if let Some((cached_width, offsets)) =
+			self.visual_offsets_cache.borrow().as_ref()
+		{
+			if *cached_width == width {
+				return Arc::clone(offsets);
+			}
+		}
+
+		let width = usize::from(width);
+		let mut visual = 0_usize;
+		let offsets: Arc<[usize]> = self
+			.source_lines()
+			.iter()
+			.map(|line| {
+				let offset = visual;
+				let line_width =
+					unicode_width::UnicodeWidthStr::width(
+						line.as_str(),
+					);
+				visual = visual.saturating_add(
+					line_width.div_ceil(width).max(1),
+				);
+				offset
+			})
+			.collect::<Vec<_>>()
+			.into();
+		*self.visual_offsets_cache.borrow_mut() = Some((
+			width.try_into().unwrap_or(u16::MAX),
+			Arc::clone(&offsets),
+		));
+		offsets
 	}
 
 	/// Approximate source-line-index -> wrapped visual row index.
 	/// `ParagraphState.scroll.y` is in post-wrap rows because of `.wrap()`.
 	fn line_to_visual(&self, source_line: usize) -> usize {
-		let width = self.render_width.get().max(1) as usize;
-		let lines = self.file_lines();
-		let mut visual = 0_usize;
-		for (i, line) in lines.iter().enumerate() {
-			if i == source_line {
-				break;
-			}
-			if width == 0 {
-				visual += 1;
-			} else {
-				let line_w = unicode_width::UnicodeWidthStr::width(line.as_str());
-				visual += line_w.div_ceil(width).max(1);
-			}
-		}
-		visual
+		self.visual_offsets()
+			.get(source_line)
+			.copied()
+			.unwrap_or_default()
 	}
 
 	fn scroll_to_current_match(&self) {
 		if let Some(m) = self.search_matches.get(self.search_cursor) {
-			let target = self.line_to_visual(m.line) as u16;
+			let target = self
+				.line_to_visual(m.line)
+				.try_into()
+				.unwrap_or(u16::MAX);
 			self.set_scroll(target);
 		}
 	}
@@ -255,6 +344,7 @@ impl SyntaxTextComponent {
 		self.async_highlighting.cancel();
 		self.syntax_progress = None;
 		self.current_file = Some((path, Either::Left(content)));
+		self.invalidate_content_caches();
 		self.reset_search();
 	}
 
@@ -266,6 +356,7 @@ impl SyntaxTextComponent {
 			.is_some_and(|(current_file, _)| current_file == &path);
 
 		if !already_loaded {
+			self.invalidate_content_caches();
 			self.reset_search();
 			//TODO: fetch file content async as well
 			match sync::tree_file_content(&self.repo.borrow(), item) {
@@ -311,7 +402,7 @@ impl SyntaxTextComponent {
 	}
 
 	fn scroll(&self, nav: MoveSelection) -> bool {
-		let state = self.paragraph_state.get();
+		let state = self.paragraph_state.borrow();
 
 		let new_scroll_pos = match nav {
 			MoveSelection::Down => state.scroll().y.saturating_add(1),
@@ -331,11 +422,12 @@ impl SyntaxTextComponent {
 			_ => state.scroll().y,
 		};
 
+		drop(state);
 		self.set_scroll(new_scroll_pos)
 	}
 
 	fn set_scroll(&self, pos: u16) -> bool {
-		let mut state = self.paragraph_state.get();
+		let mut state = self.paragraph_state.borrow_mut();
 
 		let new_scroll_pos = pos.min(
 			state
@@ -351,8 +443,6 @@ impl SyntaxTextComponent {
 			x: 0,
 			y: new_scroll_pos,
 		});
-		self.paragraph_state.set(state);
-
 		true
 	}
 }
@@ -363,21 +453,11 @@ impl DrawableComponent for SyntaxTextComponent {
 		let inner_width = area.width.saturating_sub(2);
 		self.render_width.set(inner_width);
 
-		let mut text = self.current_file.as_ref().map_or_else(
-			|| Text::from(""),
-			|(_, content)| match content {
-				Either::Left(syn) => syn.into(),
-				Either::Right(s) => Text::from(s.as_str()),
-			},
-		);
-
-		if !self.search_query.is_empty() {
-			highlight_search(
-				&mut text,
-				&self.search_query,
-				self.search_matches.get(self.search_cursor).map(|m| m.line),
-			);
-		}
+		self.rebuild_render_cache();
+		let render_cache = self.render_cache.borrow();
+		let (generation, text) = render_cache
+			.as_ref()
+			.expect("render cache initialized above");
 
 		let title = format!(
 			"{}{}",
@@ -390,8 +470,9 @@ impl DrawableComponent for SyntaxTextComponent {
 				.unwrap_or_default()
 		);
 
-		let content = StatefulParagraph::new(text)
+		let content = StatefulParagraph::borrowed(text)
 			.wrap(Wrap { trim: false })
+			.layout_key(*generation)
 			.block(
 				Block::default()
 					.title(title)
@@ -399,13 +480,19 @@ impl DrawableComponent for SyntaxTextComponent {
 					.border_style(self.theme.title(self.focused())),
 			);
 
-		let mut state = self.paragraph_state.get();
+		let mut state = self.paragraph_state.borrow_mut();
 
 		f.render_stateful_widget(content, area, &mut state);
 
-		self.paragraph_state.set(state);
-
-		self.set_scroll(state.scroll().y);
+		let max_scroll = state
+			.lines()
+			.saturating_sub(state.height().saturating_sub(2));
+		if state.scroll().y > max_scroll {
+			state.set_scroll(ScrollPos {
+				x: 0,
+				y: max_scroll,
+			});
+		}
 
 		if self.focused() {
 			ui::draw_scrollbar(
@@ -483,13 +570,12 @@ fn split_and_highlight(
 	let content_chars: Vec<char> = content.chars().collect();
 	let content_lower: String =
 		content_chars.iter().collect::<String>().to_lowercase();
-	let content_lower_chars: Vec<char> =
-		content_lower.chars().collect();
 	let needle_lower: String = needle.to_lowercase();
-	let needle_lower_chars: Vec<char> = needle_lower.chars().collect();
+	let needle_lower_chars: Vec<char> =
+		needle_lower.chars().collect();
 	let needle_len = needle_lower_chars.len();
 
-	if needle_len == 0 || needle_len > content_lower_chars.len() {
+	if needle_len == 0 || needle_len > content_lower.chars().count() {
 		out.push(Span::styled(
 			Cow::Owned(content.to_string()),
 			base_style,
@@ -507,11 +593,10 @@ fn split_and_highlight(
 
 	while i + needle_len <= content_chars.len() {
 		// compare the lowercased window against the lowercased needle
-		let lower_window: String =
-			content_chars[i..i + needle_len]
-				.iter()
-				.collect::<String>()
-				.to_lowercase();
+		let lower_window: String = content_chars[i..i + needle_len]
+			.iter()
+			.collect::<String>()
+			.to_lowercase();
 
 		if lower_window.chars().collect::<Vec<_>>()
 			== needle_lower_chars
@@ -582,7 +667,8 @@ impl Component for SyntaxTextComponent {
 		if let Event::Key(key) = event {
 			// n/p jump between search matches once a search is active
 			if !self.search_matches.is_empty() {
-				if key_match(key, self.key_config.keys.diff_hunk_next) {
+				if key_match(key, self.key_config.keys.diff_hunk_next)
+				{
 					self.move_match(true);
 					return Ok(EventState::Consumed);
 				} else if key_match(

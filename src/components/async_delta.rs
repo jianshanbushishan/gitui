@@ -52,10 +52,42 @@ impl Hash for DeltaParams {
 /// Built on the worker thread so the main thread only does assignment.
 #[derive(Clone)]
 pub struct ProcessedDelta {
-	pub display_lines: Vec<Line<'static>>,
-	pub display_hunks: Vec<usize>,
-	pub display_positions: Vec<Option<DiffLinePosition>>,
-	pub line_level_bgs: Vec<Option<Color>>,
+	pub display_lines: Arc<[Line<'static>]>,
+	pub display_hunks: Arc<[usize]>,
+	pub display_positions: Arc<[Option<DiffLinePosition>]>,
+	pub line_level_bgs: Arc<[Option<Color>]>,
+}
+
+impl ProcessedDelta {
+	fn estimated_size(&self) -> usize {
+		let text_bytes = self
+			.display_lines
+			.iter()
+			.flat_map(|line| line.spans.iter())
+			.map(|span| span.content.len())
+			.sum::<usize>();
+		text_bytes
+			.saturating_add(
+				self.display_lines.len().saturating_mul(
+					std::mem::size_of::<Line<'static>>(),
+				),
+			)
+			.saturating_add(
+				self.display_hunks
+					.len()
+					.saturating_mul(std::mem::size_of::<usize>()),
+			)
+			.saturating_add(
+				self.display_positions.len().saturating_mul(
+					std::mem::size_of::<Option<DiffLinePosition>>(),
+				),
+			)
+			.saturating_add(
+				self.line_level_bgs.len().saturating_mul(
+					std::mem::size_of::<Option<Color>>(),
+				),
+			)
+	}
 }
 
 /// Hashed key for cache entries.
@@ -64,21 +96,24 @@ type CacheKey = u64;
 struct Entry {
 	key: CacheKey,
 	result: ProcessedDelta,
+	weight: usize,
 }
 
-/// LRU cache for rendered delta output. Capacity 50.
+/// LRU cache for rendered delta output, bounded by estimated bytes.
 /// On hit, the entry is moved to the back (most-recent).
 /// On miss+insert when full, the front (least-recent) is evicted.
 struct LruCache {
 	entries: VecDeque<Entry>,
-	capacity: usize,
+	max_weight: usize,
+	current_weight: usize,
 }
 
 impl LruCache {
-	fn new(capacity: usize) -> Self {
+	const fn new(max_weight: usize) -> Self {
 		Self {
-			entries: VecDeque::with_capacity(capacity),
-			capacity,
+			entries: VecDeque::new(),
+			max_weight,
+			current_weight: 0,
 		}
 	}
 
@@ -90,15 +125,35 @@ impl LruCache {
 	}
 
 	fn insert(&mut self, key: CacheKey, result: ProcessedDelta) {
+		let weight = result.estimated_size();
 		if let Some(pos) =
 			self.entries.iter().position(|e| e.key == key)
 		{
-			self.entries.remove(pos);
+			if let Some(old) = self.entries.remove(pos) {
+				self.current_weight =
+					self.current_weight.saturating_sub(old.weight);
+			}
 		}
-		if self.entries.len() >= self.capacity {
-			self.entries.pop_front();
+		if weight > self.max_weight {
+			return;
 		}
-		self.entries.push_back(Entry { key, result });
+		while self.current_weight.saturating_add(weight)
+			> self.max_weight
+		{
+			if let Some(old) = self.entries.pop_front() {
+				self.current_weight =
+					self.current_weight.saturating_sub(old.weight);
+			} else {
+				break;
+			}
+		}
+		self.current_weight =
+			self.current_weight.saturating_add(weight);
+		self.entries.push_back(Entry {
+			key,
+			result,
+			weight,
+		});
 	}
 }
 
@@ -109,8 +164,10 @@ pub struct AsyncDelta {
 	cache: Arc<Mutex<LruCache>>,
 	/// Keys of in-flight requests, to dedupe rapid re-requests.
 	in_flight: Arc<Mutex<HashSet<CacheKey>>>,
-	/// The most recently completed result, with its key.
-	/// `take_if_matches` consumes this if the key matches.
+	/// Key currently wanted by the preview.
+	latest_requested: Arc<AtomicU64>,
+	/// Completed value for the latest requested key. This also carries
+	/// oversized results which are intentionally not retained by the LRU.
 	last_completed: Arc<Mutex<Option<(CacheKey, ProcessedDelta)>>>,
 	pending_count: Arc<AtomicU64>,
 }
@@ -119,8 +176,11 @@ impl AsyncDelta {
 	pub fn new(sender: &Sender<AsyncGitNotification>) -> Self {
 		Self {
 			sender: sender.clone(),
-			cache: Arc::new(Mutex::new(LruCache::new(50))),
+			cache: Arc::new(Mutex::new(LruCache::new(
+				32 * 1024 * 1024,
+			))),
 			in_flight: Arc::new(Mutex::new(HashSet::new())),
+			latest_requested: Arc::new(AtomicU64::new(0)),
 			last_completed: Arc::new(Mutex::new(None)),
 			pending_count: Arc::new(AtomicU64::new(0)),
 		}
@@ -144,6 +204,7 @@ impl AsyncDelta {
 		diff: Option<FileDiff>,
 	) -> Option<ProcessedDelta> {
 		let key = hash_params(&params);
+		self.latest_requested.store(key, Ordering::Release);
 
 		// Cache hit?
 		{
@@ -164,6 +225,7 @@ impl AsyncDelta {
 
 		let cache = Arc::clone(&self.cache);
 		let in_flight = Arc::clone(&self.in_flight);
+		let latest_requested = Arc::clone(&self.latest_requested);
 		let last_completed = Arc::clone(&self.last_completed);
 		let sender = self.sender.clone();
 		let pending_count = Arc::clone(&self.pending_count);
@@ -182,8 +244,10 @@ impl AsyncDelta {
 				if let Ok(mut cache) = cache.lock() {
 					cache.insert(key, processed.clone());
 				}
-				if let Ok(mut last) = last_completed.lock() {
-					*last = Some((key, processed));
+				if latest_requested.load(Ordering::Acquire) == key {
+					if let Ok(mut last) = last_completed.lock() {
+						*last = Some((key, processed));
+					}
 				}
 			}
 			pending_count.fetch_sub(1, Ordering::Relaxed);
@@ -220,24 +284,22 @@ impl AsyncDelta {
 		self.pending_count.load(Ordering::Relaxed) > 0
 	}
 
-	/// Consume the most recently completed result if its key matches
-	/// `expected`. Returns `None` on mismatch (stale) or if nothing
-	/// has completed since the last call.
+	/// Return the completed result for `expected`, if available. Looking up
+	/// by key avoids out-of-order jobs overwriting one shared result slot.
 	pub fn take_if_matches(
 		&self,
 		expected: &DeltaParams,
 	) -> Option<ProcessedDelta> {
 		let expected_key = hash_params(expected);
-		let mut last = self.last_completed.lock().ok()?;
-		match last.take() {
-			Some((key, result)) if key == expected_key => {
-				Some(result)
-			}
-			other => {
-				*last = other;
-				None
+		if let Ok(mut last) = self.last_completed.lock() {
+			if last
+				.as_ref()
+				.is_some_and(|(key, _)| *key == expected_key)
+			{
+				return last.take().map(|(_, result)| result);
 			}
 		}
+		self.cache.lock().ok()?.get(expected_key).cloned()
 	}
 }
 
@@ -455,8 +517,10 @@ fn run_delta(
 	// logic uses them as structural markers. Expand only the finished output
 	// so Windows/crossterm cannot reduce xterm's fixed 256-color palette to
 	// the nearest configurable ANSI color.
-	expand_indexed_colors(&mut processed.display_lines);
-	for bg in &mut processed.line_level_bgs {
+	expand_indexed_colors(Arc::make_mut(
+		&mut processed.display_lines,
+	));
+	for bg in Arc::make_mut(&mut processed.line_level_bgs) {
 		*bg = bg.map(expanded_color);
 	}
 	Some(processed)
@@ -572,10 +636,10 @@ fn rebuild(
 	// Side-by-side: display lines = raw lines (no wrapping)
 	if side_by_side || panel_width == 0 {
 		return ProcessedDelta {
-			display_lines: raw_lines,
-			display_hunks: hunk_map,
-			display_positions: pos_map,
-			line_level_bgs,
+			display_lines: raw_lines.into(),
+			display_hunks: hunk_map.into(),
+			display_positions: pos_map.into(),
+			line_level_bgs: line_level_bgs.into(),
 		};
 	}
 
@@ -619,10 +683,10 @@ fn rebuild(
 	}
 
 	ProcessedDelta {
-		display_lines,
-		display_hunks,
-		display_positions,
-		line_level_bgs,
+		display_lines: display_lines.into(),
+		display_hunks: display_hunks.into(),
+		display_positions: display_positions.into(),
+		line_level_bgs: line_level_bgs.into(),
 	}
 }
 
@@ -863,9 +927,14 @@ pub fn pad_line_bg(
 
 #[cfg(test)]
 mod tests {
-	use super::{run_delta, DeltaParams};
+	use super::{
+		hash_params, run_delta, AsyncDelta, DeltaParams, LruCache,
+		ProcessedDelta,
+	};
 	use asyncgit::sync::RepoPath;
-	use std::fs;
+	use crossbeam_channel::unbounded;
+	use ratatui::text::Line;
+	use std::{fs, sync::Arc};
 	use tempfile::TempDir;
 
 	/// Build a repo with one committed file, then delete the file
@@ -916,6 +985,57 @@ mod tests {
 			side_by_side: false,
 			diff_hash: 0,
 		}
+	}
+
+	fn cached_result(text: &str) -> ProcessedDelta {
+		ProcessedDelta {
+			display_lines: vec![Line::from(text.to_string())].into(),
+			display_hunks: vec![0].into(),
+			display_positions: vec![None].into(),
+			line_level_bgs: vec![None].into(),
+		}
+	}
+
+	#[test]
+	fn lru_cache_is_weight_bounded_and_results_are_shared() {
+		let first = cached_result("first");
+		let shared = first.clone();
+		assert!(Arc::ptr_eq(
+			&first.display_lines,
+			&shared.display_lines
+		));
+
+		let mut cache = LruCache::new(first.estimated_size() + 1);
+		cache.insert(1, first);
+		cache.insert(2, cached_result("second"));
+
+		assert!(cache.get(1).is_none());
+		assert!(cache.get(2).is_some());
+	}
+
+	#[test]
+	fn completed_results_are_selected_by_requested_key() {
+		let (sender, _receiver) = unbounded();
+		let delta = AsyncDelta::new(&sender);
+		let current =
+			make_params("current.txt", asyncgit::DiffType::WorkDir);
+		let stale =
+			make_params("stale.txt", asyncgit::DiffType::WorkDir);
+		{
+			let mut cache = delta.cache.lock().unwrap();
+			cache.insert(
+				hash_params(&current),
+				cached_result("current"),
+			);
+			// Simulate an older job completing after the current job.
+			cache.insert(hash_params(&stale), cached_result("stale"));
+		}
+
+		let result = delta.take_if_matches(&current).unwrap();
+		assert_eq!(
+			result.display_lines[0].spans[0].content,
+			"current"
+		);
 	}
 
 	/// `git diff <path>` for a deleted file used to fail with an

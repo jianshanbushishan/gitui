@@ -322,6 +322,11 @@ impl InspectCommitPopup {
 		Ok(())
 	}
 
+	/// Apply a diff mode changed through the options popup.
+	pub fn sync_diff_mode(&mut self) {
+		self.diff.sync_diff_mode();
+	}
+
 	fn update(&mut self) -> Result<()> {
 		if let Some(request) = &self.open_request {
 			self.details.set_commits(
