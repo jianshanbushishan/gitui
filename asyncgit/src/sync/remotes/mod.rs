@@ -88,8 +88,11 @@ pub fn get_remotes(repo_path: &RepoPath) -> Result<Vec<String>> {
 
 	let repo = repo(repo_path)?;
 	let remotes = repo.remotes()?;
-	let remotes: Vec<String> =
-		remotes.iter().flatten().map(String::from).collect();
+	let remotes: Vec<String> = remotes
+		.iter()
+		.filter_map(|r| r.ok().flatten())
+		.map(String::from)
+		.collect();
 
 	Ok(remotes)
 }
@@ -102,7 +105,7 @@ pub fn get_remote_url(
 	let repo = repo(repo_path)?;
 	let remote = repo.find_remote(remote_name)?.clone();
 	let url = remote.url();
-	if let Some(u) = url {
+	if let Ok(u) = url {
 		return Ok(Some(u.to_string()));
 	}
 	Ok(None)
@@ -240,9 +243,11 @@ pub(crate) fn get_default_remote_in_repo(
 	let remotes = repo.remotes()?;
 
 	// if `origin` exists return that
-	let found_origin = remotes
-		.iter()
-		.any(|r| r.is_some_and(|r| r == DEFAULT_REMOTE_NAME));
+	let found_origin = remotes.iter().any(|r| {
+		r.ok()
+			.flatten()
+			.is_some_and(|r| r == DEFAULT_REMOTE_NAME)
+	});
 	if found_origin {
 		return Ok(DEFAULT_REMOTE_NAME.into());
 	}
@@ -252,7 +257,7 @@ pub(crate) fn get_default_remote_in_repo(
 		let first_remote = remotes
 			.iter()
 			.next()
-			.flatten()
+			.and_then(|r| r.ok().flatten())
 			.map(String::from)
 			.ok_or_else(|| {
 				Error::Generic("no remote found".into())
@@ -305,7 +310,7 @@ pub fn fetch_all(
 	let remotes = repo
 		.remotes()?
 		.iter()
-		.flatten()
+		.filter_map(|r| r.ok().flatten())
 		.map(String::from)
 		.collect::<Vec<_>>();
 	let remotes_count = remotes.len();

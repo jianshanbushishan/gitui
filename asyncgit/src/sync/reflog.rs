@@ -177,7 +177,11 @@ pub fn get_reflog(repo_path: &RepoPath) -> Result<Vec<ReflogEntry>> {
 					Some(CommitId::new(entry.id_old()))
 				};
 
-				let message = entry.message().unwrap_or_default();
+				let message = entry
+					.message()
+					.ok()
+					.flatten()
+					.unwrap_or_default();
 				let action = ReflogAction::from_message(message);
 
 				// Get committer info
@@ -185,13 +189,16 @@ pub fn get_reflog(repo_path: &RepoPath) -> Result<Vec<ReflogEntry>> {
 				let committer_name = committer
 					.name()
 					.map(String::from)
+					.ok()
 					.unwrap_or_default();
 
 				// Get commit subject by looking up the commit
 				let commit_subject = repo
 					.find_commit(entry.id_new())
 					.ok()
-					.and_then(|c| c.summary().map(String::from))
+					.and_then(|c| {
+						c.summary().ok().flatten().map(String::from)
+					})
 					.unwrap_or_default();
 
 				entries.push(ReflogEntry {

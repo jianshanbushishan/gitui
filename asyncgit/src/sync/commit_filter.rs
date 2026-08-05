@@ -188,7 +188,11 @@ pub fn filter_commit_by_search(
 				.fields
 				.contains(SearchFields::MESSAGE_SUMMARY)
 				.then(|| {
-					commit.summary().map(|msg| filter.match_text(msg))
+					commit
+						.summary()
+						.ok()
+						.flatten()
+						.map(|msg| filter.match_text(msg))
 				})
 				.flatten()
 				.unwrap_or_default();
@@ -198,7 +202,11 @@ pub fn filter_commit_by_search(
 				.fields
 				.contains(SearchFields::MESSAGE_BODY)
 				.then(|| {
-					commit.body().map(|msg| filter.match_text(msg))
+					commit
+						.body()
+						.ok()
+						.flatten()
+						.map(|msg| filter.match_text(msg))
 				})
 				.flatten()
 				.unwrap_or_default();
@@ -242,13 +250,13 @@ pub fn filter_commit_by_search(
 						|| commit_ref.author(),
 						|mm| get_author_of_commit(commit_ref, mm),
 					);
-					[author.email(), author.name()].iter().any(
-						|opt_haystack| {
+					[author.email().ok(), author.name().ok()]
+						.iter()
+						.any(|opt_haystack| {
 							opt_haystack.is_some_and(|haystack| {
 								filter_ref.match_text(haystack)
 							})
-						},
-					)
+						})
 				})
 			} else {
 				false

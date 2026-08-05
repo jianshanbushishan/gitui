@@ -168,6 +168,6 @@ pub fn register_tracing_logging() -> bool {
 
 ///
 #[cfg(not(feature = "trace-libgit"))]
-pub fn register_tracing_logging() -> bool {
+pub const fn register_tracing_logging() -> bool {
 	true
 }
