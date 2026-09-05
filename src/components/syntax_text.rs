@@ -17,7 +17,7 @@ use crate::{
 use anyhow::Result;
 use asyncgit::{
 	asyncjob::AsyncSingleJob,
-	sync::{self, RepoPathRef, TreeFile},
+	sync::{self, CommitId, RepoPathRef, TreeFile},
 	ProgressPercent,
 };
 use crossterm::event::Event;
@@ -30,6 +30,7 @@ use ratatui::{
 	widgets::{Block, Borders, Wrap},
 	Frame,
 };
+use ratatui_image::{protocol::StatefulProtocol, StatefulImage};
 use std::{
 	borrow::Cow,
 	cell::{Cell, RefCell},
@@ -46,7 +47,7 @@ struct SearchMatch {
 pub struct SyntaxTextComponent {
 	repo: RepoPathRef,
 	queue: Queue,
-	current_file: Option<(String, Either<ui::SyntaxText, String>)>,
+	current_file: Option<(String, PreviewContent)>,
 	async_highlighting: AsyncSingleJob<AsyncSyntaxJob>,
 	syntax_progress: Option<ProgressPercent>,
 	key_config: SharedKeyConfig,
@@ -69,6 +70,12 @@ pub struct SyntaxTextComponent {
 	/// Cached owned ratatui text; rebuilt only when content/search changes.
 	render_cache: RefCell<Option<(u64, Text<'static>)>>,
 	render_generation: Cell<u64>,
+	content_hash: Option<u64>,
+}
+
+enum PreviewContent {
+	Text(Either<ui::SyntaxText, String>),
+	Image(RefCell<StatefulProtocol>),
 }
 
 impl SyntaxTextComponent {
@@ -94,6 +101,7 @@ impl SyntaxTextComponent {
 			visual_offsets_cache: RefCell::new(None),
 			render_cache: RefCell::new(None),
 			render_generation: Cell::new(1),
+			content_hash: None,
 		}
 	}
 
@@ -114,8 +122,10 @@ impl SyntaxTextComponent {
 					if let Some(job) =
 						self.async_highlighting.take_last()
 					{
-						if let Some((path, content)) =
-							self.current_file.as_mut()
+						if let Some((
+							path,
+							PreviewContent::Text(content),
+						)) = self.current_file.as_mut()
 						{
 							if let Some(syntax) = job.result() {
 								if syntax.path() == Path::new(path) {
@@ -141,6 +151,7 @@ impl SyntaxTextComponent {
 	///
 	pub fn clear(&mut self) {
 		self.current_file = None;
+		self.content_hash = None;
 		self.invalidate_content_caches();
 		self.reset_search();
 	}
@@ -178,8 +189,13 @@ impl SyntaxTextComponent {
 		let mut text = self.current_file.as_ref().map_or_else(
 			|| Text::from(""),
 			|(_, content)| match content {
-				Either::Left(syn) => syn.to_owned_text(),
-				Either::Right(s) => Text::from(s.clone()),
+				PreviewContent::Text(Either::Left(syn)) => {
+					syn.to_owned_text()
+				}
+				PreviewContent::Text(Either::Right(s)) => {
+					Text::from(s.clone())
+				}
+				PreviewContent::Image(_) => Text::default(),
 			},
 		);
 		if !self.search_query.is_empty() {
@@ -266,12 +282,15 @@ impl SyntaxTextComponent {
 			self.current_file.as_ref().map_or_else(
 				Arc::default,
 				|(_, content)| match content {
-					Either::Left(syn) => syn.source_lines().into(),
-					Either::Right(s) => s
+					PreviewContent::Text(Either::Left(syn)) => {
+						syn.source_lines().into()
+					}
+					PreviewContent::Text(Either::Right(s)) => s
 						.lines()
 						.map(ToString::to_string)
 						.collect::<Vec<_>>()
 						.into(),
+					PreviewContent::Image(_) => Arc::default(),
 				},
 			);
 		*self.source_lines_cache.borrow_mut() =
@@ -343,9 +362,43 @@ impl SyntaxTextComponent {
 	) {
 		self.async_highlighting.cancel();
 		self.syntax_progress = None;
-		self.current_file = Some((path, Either::Left(content)));
+		self.current_file =
+			Some((path, PreviewContent::Text(Either::Left(content))));
+		self.content_hash = None;
 		self.invalidate_content_caches();
 		self.reset_search();
+	}
+
+	/// Load a newly added file from the source represented by its Status
+	/// pane. Staged files come from the index; unstaged files come from the
+	/// worktree.
+	pub fn load_status_file(&mut self, path: String, staged: bool) {
+		let result = {
+			let repo = self.repo.borrow();
+			sync::status_file_bytes(&repo, Path::new(&path), staged)
+		};
+		match result {
+			Ok(bytes) => self.load_bytes(path, &bytes),
+			Err(error) => self.load_error(
+				path,
+				format!("error loading file: {error}"),
+			),
+		}
+	}
+
+	/// Load a file exactly as it exists in a commit tree.
+	pub fn load_commit_file(&mut self, path: String, commit: CommitId) {
+		let result = {
+			let repo = self.repo.borrow();
+			sync::commit_file_bytes(&repo, commit, Path::new(&path))
+		};
+		match result {
+			Ok(bytes) => self.load_bytes(path, &bytes),
+			Err(error) => self.load_error(
+				path,
+				format!("error loading file: {error}"),
+			),
+		}
 	}
 
 	///
@@ -356,49 +409,103 @@ impl SyntaxTextComponent {
 			.is_some_and(|(current_file, _)| current_file == &path);
 
 		if !already_loaded {
-			self.invalidate_content_caches();
-			self.reset_search();
 			//TODO: fetch file content async as well
-			match sync::tree_file_content(&self.repo.borrow(), item) {
-				Ok(content) => {
-					let content = tabs_to_spaces(content);
-					self.syntax_progress =
-						Some(ProgressPercent::empty());
-					self.async_highlighting.spawn(
-						AsyncSyntaxJob::new(
-							content.clone(),
-							path.clone(),
-							self.theme.get_syntax(),
-						)
-						.with_line_numbers(true),
-					);
-
-					// When `bat` is available the async job will produce a
-					// highlighted result shortly. Show a blank placeholder
-					// instead of the plain content so the pane does not
-					// flash from plain text to the colored bat output.
-					// Without `bat` the syntect fallback still colors the
-					// text, but the plain placeholder gives instant
-					// feedback while that runs.
-					let placeholder = if ui::bat_available() {
-						String::new()
-					} else {
-						content
-					};
-
-					self.current_file =
-						Some((path, Either::Right(placeholder)));
-				}
-				Err(e) => {
-					self.current_file = Some((
-						path,
-						Either::Right(format!(
-							"error loading file: {e}"
-						)),
-					));
-				}
+			let result = {
+				let repo = self.repo.borrow();
+				sync::tree_file_bytes(&repo, item)
+			};
+			match result {
+				Ok(bytes) => self.load_bytes(path, &bytes),
+				Err(error) => self.load_error(
+					path,
+					format!("error loading file: {error}"),
+				),
 			}
 		}
+	}
+
+	fn load_bytes(&mut self, path: String, bytes: &[u8]) {
+		let content_hash = asyncgit::hash(bytes);
+		if self.content_hash == Some(content_hash)
+			&& self
+				.current_file
+				.as_ref()
+				.is_some_and(|(current, _)| current == &path)
+		{
+			return;
+		}
+
+		if let Ok(image) = ui::image_protocol(bytes) {
+			self.async_highlighting.cancel();
+			self.syntax_progress = None;
+			self.current_file = Some((
+				path,
+				PreviewContent::Image(RefCell::new(image)),
+			));
+			self.invalidate_content_caches();
+			self.reset_search();
+			self.content_hash = Some(content_hash);
+			return;
+		}
+
+		// Match Git's usual binary-file heuristic closely enough to avoid
+		// dumping arbitrary control bytes into the terminal when the file is
+		// neither a supported image nor text.
+		if bytes.iter().take(8_000).any(|byte| *byte == 0) {
+			self.load_error(path, "binary file".to_string());
+			self.content_hash = Some(content_hash);
+			return;
+		}
+
+		let content = tabs_to_spaces(
+			String::from_utf8_lossy(bytes).into_owned(),
+		);
+		self.load_source(path, content);
+		self.content_hash = Some(content_hash);
+	}
+
+	fn load_source(&mut self, path: String, content: String) {
+		self.invalidate_content_caches();
+		self.reset_search();
+		self.syntax_progress = Some(ProgressPercent::empty());
+		self.async_highlighting.spawn(
+			AsyncSyntaxJob::new(
+				content.clone(),
+				path.clone(),
+				self.theme.get_syntax(),
+			)
+			.with_line_numbers(true),
+		);
+
+		// Avoid a plain-to-highlighted flash while bat is running. The
+		// built-in syntect fallback still shows the source immediately.
+		let placeholder = if ui::bat_available() {
+			String::new()
+		} else {
+			content
+		};
+		self.current_file = Some((
+			path,
+			PreviewContent::Text(Either::Right(placeholder)),
+		));
+	}
+
+	fn load_error(&mut self, path: String, message: String) {
+		self.async_highlighting.cancel();
+		self.syntax_progress = None;
+		self.current_file = Some((
+			path,
+			PreviewContent::Text(Either::Right(message)),
+		));
+		self.content_hash = None;
+		self.invalidate_content_caches();
+		self.reset_search();
+	}
+
+	fn is_image(&self) -> bool {
+		self.current_file.as_ref().is_some_and(|(_, content)| {
+			matches!(content, PreviewContent::Image(_))
+		})
 	}
 
 	fn scroll(&self, nav: MoveSelection) -> bool {
@@ -453,12 +560,6 @@ impl DrawableComponent for SyntaxTextComponent {
 		let inner_width = area.width.saturating_sub(2);
 		self.render_width.set(inner_width);
 
-		self.rebuild_render_cache();
-		let render_cache = self.render_cache.borrow();
-		let (generation, text) = render_cache
-			.as_ref()
-			.expect("render cache initialized above");
-
 		let title = format!(
 			"{}{}",
 			self.current_file
@@ -469,16 +570,40 @@ impl DrawableComponent for SyntaxTextComponent {
 				.map(|p| format!(" ({}%)", p.progress))
 				.unwrap_or_default()
 		);
+		let block = Block::default()
+			.title(title)
+			.borders(Borders::ALL)
+			.border_style(self.theme.title(self.focused()));
+
+		if let Some((_, PreviewContent::Image(image))) =
+			self.current_file.as_ref()
+		{
+			let inner = block.inner(area);
+			f.render_widget(block, area);
+			let mut image = image.borrow_mut();
+			f.render_stateful_widget(
+				StatefulImage::default(),
+				inner,
+				&mut *image,
+			);
+			if let Some(Err(error)) = image.last_encoding_result() {
+				log::error!(
+					"terminal image rendering failed: {error}"
+				);
+			}
+			return Ok(());
+		}
+
+		self.rebuild_render_cache();
+		let render_cache = self.render_cache.borrow();
+		let (generation, text) = render_cache
+			.as_ref()
+			.expect("render cache initialized above");
 
 		let content = StatefulParagraph::borrowed(text)
 			.wrap(Wrap { trim: false })
 			.layout_key(*generation)
-			.block(
-				Block::default()
-					.title(title)
-					.borders(Borders::ALL)
-					.border_style(self.theme.title(self.focused())),
-			);
+			.block(block);
 
 		let mut state = self.paragraph_state.borrow_mut();
 
@@ -647,7 +772,7 @@ impl Component for SyntaxTextComponent {
 		out: &mut Vec<CommandInfo>,
 		force_all: bool,
 	) -> CommandBlocking {
-		if self.focused() || force_all {
+		if (self.focused() || force_all) && !self.is_image() {
 			out.push(
 				CommandInfo::new(
 					strings::commands::scroll(&self.key_config),
@@ -664,6 +789,9 @@ impl Component for SyntaxTextComponent {
 		&mut self,
 		event: &crossterm::event::Event,
 	) -> Result<EventState> {
+		if self.is_image() {
+			return Ok(EventState::NotConsumed);
+		}
 		if let Event::Key(key) = event {
 			// n/p jump between search matches once a search is active
 			if !self.search_matches.is_empty() {
@@ -700,5 +828,48 @@ impl Component for SyntaxTextComponent {
 	/// focus/unfocus this component depending on param
 	fn focus(&mut self, focus: bool) {
 		self.focused = focus;
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::SyntaxTextComponent;
+	use crate::{app::Environment, components::DrawableComponent};
+	use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
+	use ratatui::{backend::TestBackend, Terminal};
+	use std::io::Cursor;
+
+	#[test]
+	fn renders_image_with_terminal_fallback() {
+		let source = DynamicImage::ImageRgb8(RgbImage::from_pixel(
+			4,
+			4,
+			Rgb([20, 120, 220]),
+		));
+		let mut encoded = Cursor::new(Vec::new());
+		source.write_to(&mut encoded, ImageFormat::Png).unwrap();
+
+		let env = Environment::test_env();
+		let mut component = SyntaxTextComponent::new(&env);
+		component.load_bytes(
+			"preview.png".to_string(),
+			encoded.get_ref(),
+		);
+		assert!(component.is_image());
+
+		let backend = TestBackend::new(20, 10);
+		let mut terminal = Terminal::new(backend).unwrap();
+		terminal
+			.draw(|frame| {
+				component.draw(frame, frame.area()).unwrap();
+			})
+			.unwrap();
+
+		assert!(terminal
+			.backend()
+			.buffer()
+			.content
+			.iter()
+			.any(|cell| cell.symbol().contains('\u{2580}')));
 	}
 }

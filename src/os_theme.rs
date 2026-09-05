@@ -17,7 +17,10 @@ use std::sync::OnceLock;
 /// The OS color scheme as detected at launch.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ColorScheme {
+	// constructed only by the Windows-only detection below
+	#[cfg_attr(not(windows), allow(dead_code))]
 	Light,
+	#[cfg_attr(not(windows), allow(dead_code))]
 	Dark,
 	/// Detection is unavailable (non-Windows) or the value could not be
 	/// read. Callers fall back to current behavior (no forced theme).

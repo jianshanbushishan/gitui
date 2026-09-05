@@ -91,6 +91,61 @@ pub fn tree_file_content(
 	Ok(content)
 }
 
+/// Return the raw bytes stored for a file in a commit tree.
+///
+/// Unlike [`tree_file_content`], this also supports binary blobs. It is used
+/// by previews that can decode an image directly instead of treating every
+/// binary file as opaque.
+pub fn tree_file_bytes(
+	repo_path: &RepoPath,
+	file: &TreeFile,
+) -> Result<Vec<u8>> {
+	let repo = repo(repo_path)?;
+	let blob = repo.find_blob(file.id)?;
+	Ok(blob.content().to_vec())
+}
+
+/// Return the raw bytes for `path` as stored in `commit`.
+pub fn commit_file_bytes(
+	repo_path: &RepoPath,
+	commit: CommitId,
+	path: &Path,
+) -> Result<Vec<u8>> {
+	let repo = repo(repo_path)?;
+	let commit = repo.find_commit(commit.into())?;
+	let tree = commit.tree()?;
+	let entry = tree.get_path(path)?;
+	let blob = repo.find_blob(entry.id())?;
+	Ok(blob.content().to_vec())
+}
+
+/// Return the bytes represented by a status entry.
+///
+/// Staged content is read from the index blob, while unstaged/untracked
+/// content is read from the worktree. Keeping those sources distinct matters
+/// when a newly staged file is edited again before it is committed.
+pub fn status_file_bytes(
+	repo_path: &RepoPath,
+	path: &Path,
+	staged: bool,
+) -> Result<Vec<u8>> {
+	let repo = repo(repo_path)?;
+	if staged {
+		let index = repo.index()?;
+		let entry = index.get_path(path, 0).ok_or_else(|| {
+			Error::Generic(format!(
+				"file is not present in the index: {}",
+				path.display()
+			))
+		})?;
+		let blob = repo.find_blob(entry.id)?;
+		Ok(blob.content().to_vec())
+	} else {
+		let workdir = repo.workdir().ok_or(Error::NoWorkDir)?;
+		Ok(std::fs::read(workdir.join(path))?)
+	}
+}
+
 ///
 fn tree_recurse(
 	repo: &Repository,
@@ -246,6 +301,51 @@ mod tests {
 				&PathBuf::from("afolder/file")
 			),
 			Ordering::Greater
+		);
+	}
+
+	#[test]
+	fn status_file_bytes_distinguishes_index_and_worktree() {
+		let (_td, repo) = repo_init().unwrap();
+		let root = repo.path().parent().unwrap();
+		let repo_path: &RepoPath =
+			&root.as_os_str().to_str().unwrap().into();
+		let path = Path::new("new.txt");
+
+		std::fs::write(root.join(path), b"staged version").unwrap();
+		crate::sync::stage_add_file(repo_path, path).unwrap();
+		std::fs::write(root.join(path), b"worktree version").unwrap();
+
+		assert_eq!(
+			status_file_bytes(repo_path, path, true).unwrap(),
+			b"staged version"
+		);
+		assert_eq!(
+			status_file_bytes(repo_path, path, false).unwrap(),
+			b"worktree version"
+		);
+	}
+
+	#[test]
+	fn commit_file_bytes_reads_selected_commit() {
+		let (_td, repo) = repo_init().unwrap();
+		let root = repo.path().parent().unwrap();
+		let repo_path: &RepoPath =
+			&root.as_os_str().to_str().unwrap().into();
+		let commit = write_commit_file(
+			&repo,
+			"new.txt",
+			"committed version",
+			"add file",
+		);
+
+		std::fs::write(root.join("new.txt"), b"worktree version")
+			.unwrap();
+
+		assert_eq!(
+			commit_file_bytes(repo_path, commit, Path::new("new.txt"))
+				.unwrap(),
+			b"committed version"
 		);
 	}
 }

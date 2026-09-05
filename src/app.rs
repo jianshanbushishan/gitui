@@ -421,6 +421,8 @@ impl App {
 		ev: AsyncNotification,
 	) -> Result<()> {
 		log::trace!("update_async: {ev:?}");
+		self.status_tab.update_async(ev);
+		self.inspect_commit_popup.update_async(ev);
 
 		if let AsyncNotification::Git(ev) = ev {
 			self.status_tab.update_git(ev)?;

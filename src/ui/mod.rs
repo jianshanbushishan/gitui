@@ -1,3 +1,4 @@
+mod image;
 mod reflow;
 mod scrollbar;
 mod scrolllist;
@@ -6,6 +7,9 @@ pub mod style;
 mod syntax_text;
 
 use filetreelist::MoveSelection;
+pub use image::{
+	init_terminal_image_support, protocol as image_protocol,
+};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 pub use scrollbar::{draw_scrollbar, Orientation};
 pub use scrolllist::{draw_list, draw_list_block};

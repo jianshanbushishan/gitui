@@ -1,17 +1,17 @@
 use crate::{
-	accessors,
 	app::Environment,
 	components::{
 		command_pump, event_pump, visibility_blocking,
 		ChangesComponent, CommandBlocking, CommandInfo, Component,
 		DiffComponent, DrawableComponent, EventState,
-		FileTreeItemKind,
+		FileTreeItemKind, SyntaxTextComponent,
 	},
 	keys::{key_match, SharedKeyConfig},
 	options::SharedOptions,
 	queue::{Action, InternalEvent, NeedsUpdate, Queue, ResetItem},
 	strings, try_or_popup,
 	ui::style::Theme,
+	AsyncNotification,
 };
 use anyhow::Result;
 use asyncgit::{
@@ -23,7 +23,7 @@ use asyncgit::{
 	sync::{BranchCompare, CommitId},
 	AsyncBranchCompareJob, AsyncDiff, AsyncGitNotification,
 	AsyncLineStats, AsyncStatusPair, DiffParams, DiffType, LineStats,
-	StatusItem,
+	StatusItem, StatusItemType,
 };
 use crossterm::event::Event;
 use itertools::Itertools;
@@ -64,6 +64,16 @@ struct RemoteStatus {
 	has_remote_for_push: bool,
 }
 
+const fn uses_full_file_preview(status: StatusItemType) -> bool {
+	matches!(status, StatusItemType::New)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RightPane {
+	Diff,
+	File,
+}
+
 pub struct Status {
 	repo: RepoPathRef,
 	visible: bool,
@@ -72,6 +82,9 @@ pub struct Status {
 	index: ChangesComponent,
 	index_wd: ChangesComponent,
 	diff: DiffComponent,
+	file_preview: SyntaxTextComponent,
+	right_pane: RightPane,
+	preview_key: Option<(String, bool)>,
 	remotes: RemoteStatus,
 	git_diff: AsyncDiff,
 	git_state: RepoState,
@@ -161,7 +174,11 @@ impl DrawableComponent for Status {
 
 		self.index_wd.draw(f, left_chunks[0])?;
 		self.index.draw(f, left_chunks[1])?;
-		self.diff.draw(f, chunks[1])?;
+		if self.right_pane == RightPane::File {
+			self.file_preview.draw(f, chunks[1])?;
+		} else {
+			self.diff.draw(f, chunks[1])?;
+		}
 		self.draw_branch_state(f, &left_chunks);
 
 		if repo_unclean {
@@ -175,7 +192,23 @@ impl DrawableComponent for Status {
 }
 
 impl Status {
-	accessors!(self, [index, index_wd, diff]);
+	fn components(&self) -> Vec<&dyn Component> {
+		let right: &dyn Component = if self.right_pane == RightPane::File {
+			&self.file_preview
+		} else {
+			&self.diff
+		};
+		vec![&self.index, &self.index_wd, right]
+	}
+
+	fn components_mut(&mut self) -> Vec<&mut dyn Component> {
+		let right: &mut dyn Component = if self.right_pane == RightPane::File {
+			&mut self.file_preview
+		} else {
+			&mut self.diff
+		};
+		vec![&mut self.index, &mut self.index_wd, right]
+	}
 
 	///
 	pub fn new(env: &Environment) -> Self {
@@ -203,6 +236,9 @@ impl Status {
 				false,
 			),
 			diff: DiffComponent::new(env, false),
+			file_preview: SyntaxTextComponent::new(env),
+			right_pane: RightPane::Diff,
+			preview_key: None,
 			git_diff: AsyncDiff::new(
 				repo_clone.clone(),
 				&env.sender_git,
@@ -404,26 +440,31 @@ impl Status {
 			match self.focus {
 				Focus::WorkDir => {
 					self.set_diff_target(DiffTarget::WorkingDir);
-					self.diff.focus(false);
 				}
 				Focus::Stage => {
 					self.set_diff_target(DiffTarget::Stage);
-					self.diff.focus(false);
 				}
 				Focus::Diff => {
 					self.index.focus(false);
 					self.index_wd.focus(false);
-
-					self.diff.focus(true);
 				}
 			}
 
 			self.update_diff()?;
+			self.sync_right_focus();
 
 			return Ok(true);
 		}
 
 		Ok(false)
+	}
+
+	fn sync_right_focus(&mut self) {
+		let right_focused = self.focus == Focus::Diff;
+		self.diff
+			.focus(right_focused && self.right_pane == RightPane::Diff);
+		self.file_preview
+			.focus(right_focused && self.right_pane == RightPane::File);
 	}
 
 	fn set_diff_target(&mut self, target: DiffTarget) {
@@ -434,7 +475,7 @@ impl Status {
 		self.index.focus_select(is_stage);
 	}
 
-	pub fn selected_path(&self) -> Option<(String, bool)> {
+	fn selected_status_item(&self) -> Option<(StatusItem, bool)> {
 		let (idx, is_stage) = match self.diff_target {
 			DiffTarget::Stage => (&self.index, true),
 			DiffTarget::WorkingDir => (&self.index_wd, false),
@@ -442,7 +483,7 @@ impl Status {
 
 		if let Some(item) = idx.selection() {
 			if let FileTreeItemKind::File(i) = item.kind {
-				return Some((i.path, is_stage));
+				return Some((i, is_stage));
 			}
 		}
 		None
@@ -481,6 +522,13 @@ impl Status {
 			|| self.changes_fetcher.is_pending()
 			|| self.git_line_stats.is_pending()
 			|| self.git_branch_compare.is_pending()
+			|| self.file_preview.any_work_pending()
+	}
+
+	/// Forward application-level async notifications to the full-file
+	/// preview used for newly added files.
+	pub fn update_async(&mut self, ev: AsyncNotification) {
+		self.file_preview.update(ev);
 	}
 
 	fn check_remotes(&mut self) {
@@ -506,7 +554,9 @@ impl Status {
 		}
 
 		match ev {
-			AsyncGitNotification::Diff => self.update_diff()?,
+			AsyncGitNotification::Diff => {
+				self.update_diff_inner(true)?;
+			}
 			AsyncGitNotification::Delta => self.diff.apply_delta(),
 			AsyncGitNotification::StatusPairChanged => {
 				self.update_status(true)?;
@@ -588,7 +638,15 @@ impl Status {
 
 	///
 	pub fn update_diff(&mut self) -> Result<()> {
-		if let Some((path, is_stage)) = self.selected_path() {
+		self.update_diff_inner(false)
+	}
+
+	fn update_diff_inner(
+		&mut self,
+		refresh_preview: bool,
+	) -> Result<()> {
+		if let Some((item, is_stage)) = self.selected_status_item() {
+			let path = item.path;
 			let diff_type = if is_stage {
 				DiffType::Stage
 			} else {
@@ -600,6 +658,34 @@ impl Status {
 				diff_type: diff_type.clone(),
 				options: self.options.borrow().diff_options(),
 			};
+
+			if uses_full_file_preview(item.status) {
+				let preview_key = (path.clone(), is_stage);
+				let needs_load = refresh_preview
+					|| self.preview_key.as_ref()
+						!= Some(&preview_key);
+				self.right_pane = RightPane::File;
+				self.sync_right_focus();
+				if needs_load {
+					self.file_preview.clear();
+					self.file_preview
+						.load_status_file(path, is_stage);
+					self.preview_key = Some(preview_key);
+				}
+
+				// Retain the existing async diff request as a cheap content
+				// change detector. A changed result reloads the full preview,
+				// but the patch itself is never shown for a new file.
+				let _ = self.git_diff.request(diff_params)?;
+				return Ok(());
+			}
+
+			if self.right_pane == RightPane::File {
+				self.right_pane = RightPane::Diff;
+				self.preview_key = None;
+				self.file_preview.clear();
+				self.sync_right_focus();
+			}
 
 			if self.diff.current() == (path.clone(), is_stage) {
 				// we are already showing a diff of the right file
@@ -623,6 +709,10 @@ impl Status {
 				self.request_diff(diff_params, path, is_stage)?;
 			}
 		} else {
+			self.right_pane = RightPane::Diff;
+			self.preview_key = None;
+			self.file_preview.clear();
+			self.sync_right_focus();
 			self.diff.clear(false);
 		}
 
@@ -846,6 +936,22 @@ impl Status {
 	}
 }
 
+#[cfg(test)]
+mod tests {
+	use super::uses_full_file_preview;
+	use asyncgit::StatusItemType;
+
+	#[test]
+	fn only_new_status_items_use_full_file_preview() {
+		assert!(uses_full_file_preview(StatusItemType::New));
+		assert!(!uses_full_file_preview(StatusItemType::Modified));
+		assert!(!uses_full_file_preview(StatusItemType::Deleted));
+		assert!(!uses_full_file_preview(StatusItemType::Renamed));
+		assert!(!uses_full_file_preview(StatusItemType::Typechange));
+		assert!(!uses_full_file_preview(StatusItemType::Conflicted));
+	}
+}
+
 impl Component for Status {
 	fn commands(
 		&self,
@@ -860,6 +966,14 @@ impl Component for Status {
 				force_all,
 				self.components().as_slice(),
 			);
+
+			if self.right_pane == RightPane::File {
+				out.push(CommandInfo::new(
+					strings::commands::edit_item(&self.key_config),
+					self.preview_key.is_some(),
+					self.focus == Focus::Diff || force_all,
+				));
+			}
 
 			out.push(
 				CommandInfo::new(
@@ -1097,6 +1211,19 @@ impl Component for Status {
 					self.key_config.keys.view_submodules,
 				) {
 					self.queue.push(InternalEvent::ViewSubmodules);
+					Ok(EventState::Consumed)
+				} else if self.right_pane == RightPane::File
+					&& self.focus == Focus::Diff
+					&& key_match(k, self.key_config.keys.edit_file)
+				{
+					if let Some((path, _)) = &self.preview_key {
+						self.queue.push(
+							InternalEvent::OpenExternalEditor(
+								Some(path.clone()),
+								None,
+							),
+						);
+					}
 					Ok(EventState::Consumed)
 				} else if key_match(
 					k,

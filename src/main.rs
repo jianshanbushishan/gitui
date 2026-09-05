@@ -195,8 +195,8 @@ fn main() -> Result<()> {
 	defer! {
 		shutdown_terminal();
 	}
-
 	set_panic_handler()?;
+	ui::init_terminal_image_support();
 
 	let mut terminal =
 		start_terminal(io::stdout(), &cliargs.repo_path)?;
