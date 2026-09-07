@@ -414,10 +414,10 @@ impl DrawableComponent for Revlog {
 		let area = if self.is_in_search_mode() {
 			Layout::default()
 				.direction(Direction::Vertical)
-				.constraints(
-					[Constraint::Min(1), Constraint::Length(3)]
-						.as_ref(),
-				)
+				.constraints([
+					Constraint::Min(1),
+					Constraint::Length(3),
+				])
 				.split(area)
 		} else {
 			Rc::new([area])
@@ -428,13 +428,10 @@ impl DrawableComponent for Revlog {
 
 		let chunks = Layout::default()
 			.direction(Direction::Horizontal)
-			.constraints(
-				[
-					Constraint::Percentage(left_ratio),
-					Constraint::Percentage(right_ratio),
-				]
-				.as_ref(),
-			)
+			.constraints([
+				Constraint::Percentage(left_ratio),
+				Constraint::Percentage(right_ratio),
+			])
 			.split(area[0]);
 
 		if self.commit_details.is_visible() {

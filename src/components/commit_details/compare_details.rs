@@ -103,10 +103,10 @@ impl DrawableComponent for CompareDetailsComponent {
 	fn draw(&self, f: &mut Frame, rect: Rect) -> Result<()> {
 		let chunks = Layout::default()
 			.direction(Direction::Vertical)
-			.constraints(
-				[Constraint::Length(5), Constraint::Length(5)]
-					.as_ref(),
-			)
+			.constraints([
+				Constraint::Length(5),
+				Constraint::Length(5),
+			])
 			.split(rect);
 
 		if let Some(data) = &self.data {

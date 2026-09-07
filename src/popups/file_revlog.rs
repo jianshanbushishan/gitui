@@ -498,13 +498,10 @@ impl DrawableComponent for FileRevlogPopup {
 
 			let chunks = Layout::default()
 				.direction(Direction::Horizontal)
-				.constraints(
-					[
-						Constraint::Percentage(percentages.0),
-						Constraint::Percentage(percentages.1),
-					]
-					.as_ref(),
-				)
+				.constraints([
+					Constraint::Percentage(percentages.0),
+					Constraint::Percentage(percentages.1),
+				])
 				.split(area);
 
 			f.render_widget(Clear, area);
@@ -661,7 +658,9 @@ impl Component for FileRevlogPopup {
 			));
 			out.push(
 				CommandInfo::new(
-					strings::commands::diff_toggle_mode(&self.key_config),
+					strings::commands::diff_toggle_mode(
+						&self.key_config,
+					),
 					true,
 					true,
 				)

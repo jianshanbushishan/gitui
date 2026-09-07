@@ -90,8 +90,7 @@ pub fn tags_missing_remote(
 	let mut local_tags = tags
 		.iter()
 		.filter_map(|tag| {
-			tag.ok().flatten()
-				.map(|tag| format!("refs/tags/{tag}"))
+			tag.ok().flatten().map(|tag| format!("refs/tags/{tag}"))
 		})
 		.collect::<HashSet<_>>();
 	let remote_tags =

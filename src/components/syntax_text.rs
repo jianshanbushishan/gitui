@@ -839,6 +839,19 @@ mod tests {
 	use ratatui::{backend::TestBackend, Terminal};
 	use std::io::Cursor;
 
+	/// ratatui-image 11 blends tiny upscaled images towards the
+	/// background, so cells no longer carry the exact source pixel
+	/// color. A blue-dominant background proves the halfblocks
+	/// fallback rendered image-derived content.
+	fn is_image_derived_blue(cell: &ratatui::buffer::Cell) -> bool {
+		match cell.bg {
+			ratatui::style::Color::Rgb(r, g, b) => {
+				b > r && b > g && b >= 16
+			}
+			_ => false,
+		}
+	}
+
 	#[test]
 	fn renders_image_with_terminal_fallback() {
 		let source = DynamicImage::ImageRgb8(RgbImage::from_pixel(
@@ -865,12 +878,13 @@ mod tests {
 					component.draw(frame, frame.area()).unwrap();
 				})
 				.unwrap();
-			if terminal.backend().buffer().content.iter().any(
-				|cell| {
-					cell.bg
-						== ratatui::style::Color::Rgb(20, 120, 220)
-				},
-			) {
+			if terminal
+				.backend()
+				.buffer()
+				.content
+				.iter()
+				.any(is_image_derived_blue)
+			{
 				break;
 			}
 			assert!(std::time::Instant::now() < deadline);
@@ -882,8 +896,7 @@ mod tests {
 			.buffer()
 			.content
 			.iter()
-			.any(|cell| cell.bg
-				== ratatui::style::Color::Rgb(20, 120, 220)));
+			.any(|cell| is_image_derived_blue(cell)));
 	}
 
 	#[test]

@@ -1319,7 +1319,7 @@ impl DrawableComponent for DiffComponent {
 			strings::title_diff(&self.key_config),
 			self.current.path,
 			line_stats,
-			&hunk_info,
+			hunk_info,
 		);
 
 		// Show "Loading..." only when we have no delta output at all
@@ -1633,8 +1633,10 @@ mod tests {
 	use super::*;
 	use crate::app::Environment;
 	use crate::components::async_delta::wrap_line as delta_wrap_line;
+	use crate::queue::InternalEvent;
 	use crate::ui::style::Theme;
 	use asyncgit::sync::RepoPath;
+	use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 	use ratatui::style::{Color, Style};
 	use std::io::Write;
 	use std::rc::Rc;
@@ -2653,5 +2655,31 @@ mod tests {
 			None,
 			"hunk header has no new_lineno"
 		);
+	}
+
+	#[test]
+	fn diff_component_opens_editor_for_current_file() {
+		let env = Environment::test_env();
+		let mut diff = DiffComponent::new(&env, false);
+
+		diff.focus(true);
+		diff.current.path = String::from("src/main.rs");
+
+		let event = Event::Key(KeyEvent::new(
+			KeyCode::Char('e'),
+			KeyModifiers::empty(),
+		));
+
+		assert!(matches!(
+			diff.event(&event).unwrap(),
+			EventState::Consumed
+		));
+
+		let event = env.queue.pop();
+		assert!(matches!(
+			event,
+			Some(InternalEvent::OpenExternalEditor(Some(path), _))
+				if path == "src/main.rs"
+		));
 	}
 }

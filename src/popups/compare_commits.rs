@@ -50,13 +50,10 @@ impl DrawableComponent for CompareCommitsPopup {
 
 			let chunks = Layout::default()
 				.direction(Direction::Horizontal)
-				.constraints(
-					[
-						Constraint::Percentage(percentages.0),
-						Constraint::Percentage(percentages.1),
-					]
-					.as_ref(),
-				)
+				.constraints([
+					Constraint::Percentage(percentages.0),
+					Constraint::Percentage(percentages.1),
+				])
 				.split(rect);
 
 			f.render_widget(Clear, rect);
@@ -106,7 +103,9 @@ impl Component for CompareCommitsPopup {
 
 			out.push(
 				CommandInfo::new(
-					strings::commands::diff_toggle_mode(&self.key_config),
+					strings::commands::diff_toggle_mode(
+						&self.key_config,
+					),
 					true,
 					true,
 				)

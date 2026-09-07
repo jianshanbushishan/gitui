@@ -201,7 +201,7 @@ impl DrawableComponent for CommitDetailsComponent {
 
 		let chunks = Layout::default()
 			.direction(Direction::Vertical)
-			.constraints(constraints.as_ref())
+			.constraints(constraints)
 			.split(rect);
 
 		if self.is_compare() {

@@ -443,6 +443,13 @@ pub fn copy_success(s: &str) -> String {
 	s.to_string()
 }
 
+pub const fn normalize_branch_name_char(c: char) -> char {
+	match c {
+		' ' => '-',
+		c => c,
+	}
+}
+
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum CheckoutOptions {
 	KeepLocalChanges,
@@ -564,8 +571,7 @@ pub mod commands {
 		CommandText::new(
 			format!(
 				"Next [{}]",
-				key_config
-					.get_hint(key_config.keys.diff_hunk_next),
+				key_config.get_hint(key_config.keys.diff_hunk_next),
 			),
 			"next search match",
 			CMD_GROUP_GENERAL,
@@ -575,8 +581,7 @@ pub mod commands {
 		CommandText::new(
 			format!(
 				"Prev [{}]",
-				key_config
-					.get_hint(key_config.keys.diff_hunk_prev),
+				key_config.get_hint(key_config.keys.diff_hunk_prev),
 			),
 			"previous search match",
 			CMD_GROUP_GENERAL,
@@ -2040,5 +2045,21 @@ pub mod commands {
 			"Go to the given line",
 			CMD_GROUP_GENERAL,
 		)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn test_spaces_are_replaced_by_dashes_in_branch_name() {
+		let input = "feature/auto replace spaces in branch name";
+		let output: String =
+			input.chars().map(normalize_branch_name_char).collect();
+		assert_eq!(
+			output,
+			"feature/auto-replace-spaces-in-branch-name"
+		);
 	}
 }

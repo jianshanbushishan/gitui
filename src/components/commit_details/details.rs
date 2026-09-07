@@ -350,10 +350,10 @@ impl DrawableComponent for DetailsComponent {
 
 		let chunks = Layout::default()
 			.direction(Direction::Vertical)
-			.constraints(
-				[Constraint::Length(info_len), Constraint::Min(10)]
-					.as_ref(),
-			)
+			.constraints([
+				Constraint::Length(info_len),
+				Constraint::Min(10),
+			])
 			.split(rect);
 
 		// We have to take the border into account which is one

@@ -259,14 +259,11 @@ impl App {
 
 		let chunks_main = Layout::default()
 			.direction(Direction::Vertical)
-			.constraints(
-				[
-					Constraint::Length(2),
-					Constraint::Min(2),
-					Constraint::Length(self.cmdbar.borrow().height()),
-				]
-				.as_ref(),
-			)
+			.constraints([
+				Constraint::Length(2),
+				Constraint::Min(2),
+				Constraint::Length(self.cmdbar.borrow().height()),
+			])
 			.split(fsize);
 
 		self.cmdbar.borrow().draw(f, chunks_main[2]);

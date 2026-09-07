@@ -4,7 +4,7 @@ use image::{DynamicImage, ImageReader};
 use once_cell::sync::OnceCell;
 use ratatui::{
 	buffer::Buffer,
-	layout::Rect,
+	layout::{Rect, Size},
 	widgets::{Paragraph, Widget},
 };
 use ratatui_image::{
@@ -283,9 +283,7 @@ fn worker(
 				picker
 					.new_protocol(
 						image,
-						Rect::new(
-							0,
-							0,
+						Size::new(
 							request.key.width,
 							request.key.height,
 						),

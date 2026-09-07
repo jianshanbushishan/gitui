@@ -124,10 +124,10 @@ impl DrawableComponent for Status {
 		let rects = if repo_unclean {
 			Layout::default()
 				.direction(Direction::Vertical)
-				.constraints(
-					[Constraint::Min(1), Constraint::Length(3)]
-						.as_ref(),
-				)
+				.constraints([
+					Constraint::Min(1),
+					Constraint::Length(3),
+				])
 				.split(rect)
 		} else {
 			std::rc::Rc::new([rect])
@@ -138,20 +138,17 @@ impl DrawableComponent for Status {
 
 		let chunks = Layout::default()
 			.direction(Direction::Horizontal)
-			.constraints(
-				if self.focus == Focus::Diff {
-					[
-						Constraint::Percentage(0),
-						Constraint::Percentage(100),
-					]
-				} else {
-					[
-						Constraint::Percentage(left_ratio),
-						Constraint::Percentage(right_ratio),
-					]
-				}
-				.as_ref(),
-			)
+			.constraints(if self.focus == Focus::Diff {
+				[
+					Constraint::Percentage(0),
+					Constraint::Percentage(100),
+				]
+			} else {
+				[
+					Constraint::Percentage(left_ratio),
+					Constraint::Percentage(right_ratio),
+				]
+			})
 			.split(rects[0]);
 
 		let left_chunks = Layout::default()
@@ -167,8 +164,7 @@ impl DrawableComponent for Status {
 						Constraint::Percentage(40),
 						Constraint::Percentage(60),
 					]
-				}
-				.as_ref(),
+				},
 			)
 			.split(chunks[0]);
 
@@ -193,20 +189,22 @@ impl DrawableComponent for Status {
 
 impl Status {
 	fn components(&self) -> Vec<&dyn Component> {
-		let right: &dyn Component = if self.right_pane == RightPane::File {
-			&self.file_preview
-		} else {
-			&self.diff
-		};
+		let right: &dyn Component =
+			if self.right_pane == RightPane::File {
+				&self.file_preview
+			} else {
+				&self.diff
+			};
 		vec![&self.index, &self.index_wd, right]
 	}
 
 	fn components_mut(&mut self) -> Vec<&mut dyn Component> {
-		let right: &mut dyn Component = if self.right_pane == RightPane::File {
-			&mut self.file_preview
-		} else {
-			&mut self.diff
-		};
+		let right: &mut dyn Component =
+			if self.right_pane == RightPane::File {
+				&mut self.file_preview
+			} else {
+				&mut self.diff
+			};
 		vec![&mut self.index, &mut self.index_wd, right]
 	}
 
@@ -461,10 +459,12 @@ impl Status {
 
 	fn sync_right_focus(&mut self) {
 		let right_focused = self.focus == Focus::Diff;
-		self.diff
-			.focus(right_focused && self.right_pane == RightPane::Diff);
-		self.file_preview
-			.focus(right_focused && self.right_pane == RightPane::File);
+		self.diff.focus(
+			right_focused && self.right_pane == RightPane::Diff,
+		);
+		self.file_preview.focus(
+			right_focused && self.right_pane == RightPane::File,
+		);
 	}
 
 	fn set_diff_target(&mut self, target: DiffTarget) {

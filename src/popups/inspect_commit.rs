@@ -8,8 +8,7 @@ use crate::{
 	keys::{key_match, SharedKeyConfig},
 	options::SharedOptions,
 	queue::{InternalEvent, Queue, StackablePopupOpen},
-	strings,
-	AsyncNotification,
+	strings, AsyncNotification,
 };
 use anyhow::Result;
 use asyncgit::{
@@ -92,13 +91,10 @@ impl DrawableComponent for InspectCommitPopup {
 
 			let chunks = Layout::default()
 				.direction(Direction::Horizontal)
-				.constraints(
-					[
-						Constraint::Percentage(percentages.0),
-						Constraint::Percentage(percentages.1),
-					]
-					.as_ref(),
-				)
+				.constraints([
+					Constraint::Percentage(percentages.0),
+					Constraint::Percentage(percentages.1),
+				])
 				.split(rect);
 
 			f.render_widget(Clear, rect);
@@ -168,7 +164,9 @@ impl Component for InspectCommitPopup {
 
 			out.push(
 				CommandInfo::new(
-					strings::commands::diff_toggle_mode(&self.key_config),
+					strings::commands::diff_toggle_mode(
+						&self.key_config,
+					),
 					true,
 					true,
 				)
@@ -276,20 +274,22 @@ impl Component for InspectCommitPopup {
 
 impl InspectCommitPopup {
 	fn components(&self) -> Vec<&dyn Component> {
-		let right: &dyn Component = if self.right_pane == RightPane::File {
-			&self.file_preview
-		} else {
-			&self.diff
-		};
+		let right: &dyn Component =
+			if self.right_pane == RightPane::File {
+				&self.file_preview
+			} else {
+				&self.diff
+			};
 		vec![right, &self.details]
 	}
 
 	fn components_mut(&mut self) -> Vec<&mut dyn Component> {
-		let right: &mut dyn Component = if self.right_pane == RightPane::File {
-			&mut self.file_preview
-		} else {
-			&mut self.diff
-		};
+		let right: &mut dyn Component =
+			if self.right_pane == RightPane::File {
+				&mut self.file_preview
+			} else {
+				&mut self.diff
+			};
 		vec![right, &mut self.details]
 	}
 
@@ -369,10 +369,8 @@ impl InspectCommitPopup {
 							!= Some(&preview_key)
 						{
 							self.file_preview.clear();
-							self.file_preview.load_commit_file(
-								f.path,
-								commit_id,
-							);
+							self.file_preview
+								.load_commit_file(f.path, commit_id);
 							self.preview_key = Some(preview_key);
 						}
 						return Ok(());

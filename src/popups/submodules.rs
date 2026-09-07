@@ -74,18 +74,18 @@ impl DrawableComponent for SubmodulesListPopup {
 
 			let chunks_vertical = Layout::default()
 				.direction(Direction::Vertical)
-				.constraints(
-					[Constraint::Min(1), Constraint::Length(5)]
-						.as_ref(),
-				)
+				.constraints([
+					Constraint::Min(1),
+					Constraint::Length(5),
+				])
 				.split(area);
 
 			let chunks = Layout::default()
 				.direction(Direction::Horizontal)
-				.constraints(
-					[Constraint::Min(40), Constraint::Length(60)]
-						.as_ref(),
-				)
+				.constraints([
+					Constraint::Min(40),
+					Constraint::Length(60),
+				])
 				.split(chunks_vertical[0]);
 
 			self.draw_list(f, chunks[0])?;

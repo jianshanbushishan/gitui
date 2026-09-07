@@ -144,16 +144,12 @@ impl DrawableComponent for Stashing {
 	) -> Result<()> {
 		let chunks = Layout::default()
 			.direction(Direction::Horizontal)
-			.constraints(
-				[Constraint::Min(1), Constraint::Length(22)].as_ref(),
-			)
+			.constraints([Constraint::Min(1), Constraint::Length(22)])
 			.split(rect);
 
 		let right_chunks = Layout::default()
 			.direction(Direction::Vertical)
-			.constraints(
-				[Constraint::Length(4), Constraint::Min(1)].as_ref(),
-			)
+			.constraints([Constraint::Length(4), Constraint::Min(1)])
 			.split(chunks[1]);
 
 		f.render_widget(

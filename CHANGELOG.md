@@ -143,6 +143,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * selected row keeps its background on non-highlighted commits while a search is active
 * `g`/`G` (home/end) now work in search-highlighted commit list instead of being a no-op when the cursor is on a non-matching commit
 * `j`/`k` in the log search popup now type into the search box instead of moving the option cursor
+* support ssh-agent and external sign binaries for ssh commit signing ([#2464](https://github.com/gitui-org/gitui/pull/2464))
+* support x509 commit signing [[@kaden-l-nelson](https://github.com/kaden-l-nelson)] ([#2514](https://github.com/gitui-org/gitui/issues/2514))
+
+### Changed
+* use [tombi](https://github.com/tombi-toml/tombi) for all toml file formatting
+* open the external editor from the status diff view [[@WaterWhisperer](https://github.com/WaterWhisperer)] ([#2805](https://github.com/gitui-org/gitui/issues/2805))
+* automatically convert spaces to dashes when creating or renaming a branch [[@pbouillon]](https//pbouillon.github.io)] ([#2916](https://github.com/gitui-org/gitui/pull/2916))
+* support rewording non-HEAD commits when `commit.gpgsign` is enabled (gpg format only) [[@guerinoni](https://github.com/guerinoni)] ([#2959](https://github.com/gitui-org/gitui/pull/2959))
+
+### Fixes
+* crash when opening submodule ([#2895](https://github.com/gitui-org/gitui/issues/2895))
+* when staging the last file in a directory, the first item after the directory is no longer skipped [[@Tillerino](https://github.com/Tillerino)] ([#2748](https://github.com/gitui-org/gitui/issues/2748))
+* index-out-of-bounds panic when unstaging lines near the end of a diff ([#2953](https://github.com/gitui-org/gitui/issues/2953))
 
 ## [0.28.1] - 2026-03-21
 
@@ -176,6 +189,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * add "go to line" command for the blame view [[@andrea-berling](https://github.com/andrea-berling)] ([#2262](https://github.com/extrawurst/gitui/pull/2262))
 * add `--file` cli flag to open the files tab with the given file already selected [[@laktak](https://github.com/laktak)] ([#2510](https://github.com/gitui-org/gitui/issues/2510))
 * add the ability to specify a custom keybinding/symbols file via the cli [[@0x61nas](https://github.com/0x61nas)] ([#2731](https://github.com/gitui-org/gitui/pull/2731))
+* add mise alternative method installation [[@jylenhof](https://github.com/jylenhof)] ([#2817](https://github.com/gitui-org/gitui/pull/2817))
+* ssh commit signing with ssh-agents and external signers [[@chirpcel](https://github.com/chirpcel)] ([#2188](https://github.com/extrawurst/gitui/issues/2188))
 
 ### Changed
 * execute git-hooks directly if possible (on *nix) else use sh instead of bash (without reading SHELL variable) [[@Joshix](https://github.com/Joshix-1)] ([#2483](https://github.com/extrawurst/gitui/pull/2483))

@@ -88,10 +88,10 @@ impl DrawableComponent for BranchListPopup {
 
 			let chunks = Layout::default()
 				.direction(Direction::Vertical)
-				.constraints(
-					[Constraint::Length(2), Constraint::Min(1)]
-						.as_ref(),
-				)
+				.constraints([
+					Constraint::Length(2),
+					Constraint::Min(1),
+				])
 				.split(area);
 
 			self.draw_tabs(f, chunks[0]);

@@ -1,10 +1,10 @@
 mod blame_file;
 mod branchlist;
-mod content_search;
 mod checkout_option;
 mod commit;
 mod compare_commits;
 mod confirm;
+mod content_search;
 mod copy_path;
 mod create_branch;
 mod create_remote;
@@ -34,11 +34,11 @@ mod update_remote_url;
 
 pub use blame_file::{BlameFileOpen, BlameFilePopup};
 pub use branchlist::BranchListPopup;
-pub use content_search::ContentSearchPopup;
 pub use checkout_option::CheckoutOptionPopup;
 pub use commit::CommitPopup;
 pub use compare_commits::CompareCommitsPopup;
 pub use confirm::ConfirmPopup;
+pub use content_search::ContentSearchPopup;
 pub use copy_path::CopyPathPopup;
 pub use create_branch::CreateBranchPopup;
 pub use create_remote::CreateRemotePopup;

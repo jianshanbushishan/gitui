@@ -325,13 +325,10 @@ impl DrawableComponent for ContentSearchPopup {
 			} else {
 				Layout::default()
 					.direction(Direction::Vertical)
-					.constraints(
-						[
-							Constraint::Length(3),
-							Constraint::Percentage(100),
-						]
-						.as_ref(),
-					)
+					.constraints([
+						Constraint::Length(3),
+						Constraint::Percentage(100),
+					])
 					.split(area)[0]
 			};
 
@@ -349,13 +346,10 @@ impl DrawableComponent for ContentSearchPopup {
 
 			let chunks = Layout::default()
 				.direction(Direction::Vertical)
-				.constraints(
-					[
-						Constraint::Length(1),
-						Constraint::Percentage(100),
-					]
-					.as_ref(),
-				)
+				.constraints([
+					Constraint::Length(1),
+					Constraint::Percentage(100),
+				])
 				.split(area.inner(Margin {
 					horizontal: 1,
 					vertical: 1,

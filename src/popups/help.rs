@@ -54,10 +54,10 @@ impl DrawableComponent for HelpPopup {
 				.vertical_margin(1)
 				.horizontal_margin(1)
 				.direction(Direction::Vertical)
-				.constraints(
-					[Constraint::Min(1), Constraint::Length(1)]
-						.as_ref(),
-				)
+				.constraints([
+					Constraint::Min(1),
+					Constraint::Length(1),
+				])
 				.split(area);
 
 			f.render_widget(

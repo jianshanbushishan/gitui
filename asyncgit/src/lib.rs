@@ -84,7 +84,9 @@ pub use crate::{
 	reflog::{AsyncReflog, FetchStatus as ReflogFetchStatus},
 	remote_progress::{RemoteProgress, RemoteProgressState},
 	revlog::{AsyncLog, FetchStatus},
-	status::{AsyncStatus, AsyncStatusPair, StatusPair, StatusParams},
+	status::{
+		AsyncStatus, AsyncStatusPair, StatusPair, StatusParams,
+	},
 	sync::{
 		diff::{DiffLine, DiffLineType, FileDiff},
 		remotes::push::PushType,

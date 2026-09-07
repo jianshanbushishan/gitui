@@ -514,13 +514,10 @@ impl DrawableComponent for RevisionFilesComponent {
 
 			let chunks = Layout::default()
 				.direction(Direction::Horizontal)
-				.constraints(
-					[
-						Constraint::Percentage(left_ratio),
-						Constraint::Percentage(right_ratio),
-					]
-					.as_ref(),
-				)
+				.constraints([
+					Constraint::Percentage(left_ratio),
+					Constraint::Percentage(right_ratio),
+				])
 				.split(area);
 
 			self.draw_tree(f, chunks[0])?;

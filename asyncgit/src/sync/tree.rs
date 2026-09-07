@@ -343,8 +343,12 @@ mod tests {
 			.unwrap();
 
 		assert_eq!(
-			commit_file_bytes(repo_path, commit, Path::new("new.txt"))
-				.unwrap(),
+			commit_file_bytes(
+				repo_path,
+				commit,
+				Path::new("new.txt")
+			)
+			.unwrap(),
 			b"committed version"
 		);
 	}

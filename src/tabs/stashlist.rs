@@ -185,13 +185,10 @@ impl DrawableComponent for StashList {
 
 			let chunks = Layout::default()
 				.direction(Direction::Horizontal)
-				.constraints(
-					[
-						Constraint::Percentage(left_ratio),
-						Constraint::Percentage(right_ratio),
-					]
-					.as_ref(),
-				)
+				.constraints([
+					Constraint::Percentage(left_ratio),
+					Constraint::Percentage(right_ratio),
+				])
 				.split(rect);
 
 			self.list.draw(f, chunks[0])?;
