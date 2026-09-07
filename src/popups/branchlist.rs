@@ -139,6 +139,11 @@ impl Component for BranchListPopup {
 					"switch branch error:",
 					self.switch_to_selected_branch()
 				);
+			} else if key_match(
+				e,
+				self.key_config.keys.branch_view_log,
+			) {
+				self.view_selected_history();
 			} else if key_match(e, self.key_config.keys.create_branch)
 				&& self.local
 			{
@@ -351,6 +356,18 @@ impl BranchListPopup {
 
 	const fn valid_selection(&self) -> bool {
 		!self.branches.is_empty()
+	}
+
+	fn view_selected_history(&mut self) {
+		if let Some(branch) =
+			self.branches.get(usize::from(self.selection))
+		{
+			self.queue.push(InternalEvent::ViewBranchLog {
+				reference: branch.reference.clone(),
+				name: branch.name.clone(),
+			});
+			self.hide();
+		}
 	}
 
 	fn merge_branch(&mut self) -> Result<()> {
@@ -701,6 +718,12 @@ impl BranchListPopup {
 		let selection_is_cur_branch = self.selection_is_cur_branch();
 
 		out.push(CommandInfo::new(
+			strings::commands::branch_view_log(&self.key_config),
+			self.valid_selection(),
+			true,
+		));
+
+		out.push(CommandInfo::new(
 			strings::commands::scroll(&self.key_config),
 			true,
 			true,
@@ -794,5 +817,119 @@ impl BranchListPopup {
 			true,
 			self.has_remotes,
 		));
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use asyncgit::sync::RepoPath;
+	use crossterm::event::{KeyCode, KeyModifiers};
+
+	#[test]
+	fn view_history_preserves_head_for_local_and_remote_branches() {
+		let (dir, repo) = git2_testing::repo_init();
+		let head = repo.head().unwrap();
+		let head_name = head.name().unwrap().to_string();
+		let head_id = head.target().unwrap();
+		let commit = head.peel_to_commit().unwrap();
+		repo.branch("feature", &commit, false).unwrap();
+		repo.reference(
+			"refs/remotes/origin/feature",
+			head_id,
+			false,
+			"test remote history",
+		)
+		.unwrap();
+
+		for (local, name, reference) in [
+			(true, "feature", "refs/heads/feature"),
+			(false, "origin/feature", "refs/remotes/origin/feature"),
+		] {
+			let env = Environment::test_env();
+			*env.repo.borrow_mut() =
+				RepoPath::Path(dir.path().into());
+			let mut popup = BranchListPopup::new(&env);
+			popup.local = local;
+			popup.open().unwrap();
+			let selection = popup
+				.branches
+				.iter()
+				.position(|branch| branch.name == name)
+				.unwrap();
+			popup
+				.set_selection(selection.try_into().unwrap())
+				.unwrap();
+
+			popup
+				.event(&Event::Key(KeyEvent::new(
+					KeyCode::Char('v'),
+					KeyModifiers::NONE,
+				)))
+				.unwrap();
+
+			assert!(!popup.is_visible());
+			assert!(matches!(env.queue.pop(),
+				Some(InternalEvent::ViewBranchLog {
+					reference: actual_reference, name: actual_name,
+				}) if actual_reference == reference && actual_name == name
+			));
+			assert!(env.queue.pop().is_none());
+			let head_after = repo.head().unwrap();
+			assert_eq!(head_after.name().unwrap(), head_name);
+			assert_eq!(head_after.target(), Some(head_id));
+		}
+	}
+
+	#[test]
+	fn view_history_with_no_branches_does_nothing() {
+		let env = Environment::test_env();
+		let mut popup = BranchListPopup::new(&env);
+		popup.show().unwrap();
+
+		popup
+			.event(&Event::Key(KeyEvent::new(
+				KeyCode::Char('v'),
+				KeyModifiers::NONE,
+			)))
+			.unwrap();
+
+		assert!(popup.is_visible());
+		assert!(env.queue.pop().is_none());
+	}
+
+	#[test]
+	fn enter_still_checks_out_selected_local_branch() {
+		let (dir, repo) = git2_testing::repo_init();
+		let commit = repo.head().unwrap().peel_to_commit().unwrap();
+		repo.branch("feature", &commit, false).unwrap();
+		let env = Environment::test_env();
+		*env.repo.borrow_mut() = RepoPath::Path(dir.path().into());
+		let mut popup = BranchListPopup::new(&env);
+		popup.open().unwrap();
+		let selection = popup
+			.branches
+			.iter()
+			.position(|branch| branch.name == "feature")
+			.unwrap();
+		popup.set_selection(selection.try_into().unwrap()).unwrap();
+
+		popup
+			.event(&Event::Key(KeyEvent::new(
+				KeyCode::Enter,
+				KeyModifiers::NONE,
+			)))
+			.unwrap();
+
+		assert_eq!(
+			repo.head().unwrap().name().unwrap(),
+			"refs/heads/feature"
+		);
+		assert!(!popup.is_visible());
+		assert!(matches!(
+			env.queue.pop(),
+			Some(InternalEvent::Update(_))
+		));
+		assert!(env.queue.pop().is_none());
 	}
 }

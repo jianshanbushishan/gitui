@@ -126,6 +126,8 @@ pub enum InternalEvent {
 	RenameBranch(String, String),
 	///
 	SelectBranch,
+	/// Browse a branch's history without checking it out.
+	ViewBranchLog { reference: String, name: String },
 	///
 	OpenExternalEditor(Option<String>, Option<u32>),
 	///

@@ -83,6 +83,8 @@ impl CommitDetailsComponent {
 		if params.is_none() {
 			self.single_details.set_commit(None, None);
 			self.compare_details.set_commits(None);
+			self.file_tree.set_commit(None);
+			self.file_tree.clear()?;
 		}
 
 		self.commit = params;

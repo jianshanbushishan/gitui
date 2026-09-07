@@ -41,7 +41,17 @@ pub struct LogWalker<'a> {
 impl<'a> LogWalker<'a> {
 	///
 	pub fn new(repo: &'a Repository, limit: usize) -> Result<Self> {
-		let c = repo.head()?.peel_to_commit()?;
+		let start = repo.head()?.peel_to_commit()?.id().into();
+		Self::from_commit(repo, limit, start)
+	}
+
+	/// Walk from an already resolved commit, independently of HEAD.
+	pub fn from_commit(
+		repo: &'a Repository,
+		limit: usize,
+		start: CommitId,
+	) -> Result<Self> {
+		let c = repo.find_commit(start.into())?;
 
 		let mut commits = BinaryHeap::with_capacity(10);
 		commits.push(TimeOrderedCommit(c));
@@ -129,13 +139,21 @@ impl<'a> LogWalkerWithoutFilter<'a> {
 		repo: &'a mut gix::Repository,
 		limit: usize,
 	) -> Result<Self> {
+		let start = repo.head()?.peel_to_commit()?.id.into();
+		Self::from_commit(repo, limit, start)
+	}
+
+	/// Walk from an already resolved commit, independently of HEAD.
+	pub fn from_commit(
+		repo: &'a mut gix::Repository,
+		limit: usize,
+		start: CommitId,
+	) -> Result<Self> {
 		// This seems to be an object cache size that yields optimal performance. There’s no specific
 		// reason this is 2^14, so benchmarking might reveal that there’s better values.
 		repo.object_cache_size_if_unset(2_usize.pow(14));
 
-		let commit = repo.head()?.peel_to_commit()?;
-
-		let tips = [commit.id];
+		let tips: [gix::ObjectId; 1] = [start.into()];
 
 		let platform = repo
 			.rev_walk(tips)

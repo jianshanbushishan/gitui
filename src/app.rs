@@ -809,6 +809,18 @@ impl App {
 			InternalEvent::SelectBranch => {
 				self.select_branch_popup.open()?;
 			}
+			InternalEvent::ViewBranchLog { reference, name } => {
+				match self.revlog.view_branch(reference, name) {
+					Ok(()) => self.switch_to_tab(&AppTabs::Log)?,
+					Err(error) => {
+						self.queue.push(InternalEvent::ShowErrorMsg(
+							error.to_string(),
+						));
+					}
+				}
+				flags
+					.insert(NeedsUpdate::ALL | NeedsUpdate::COMMANDS);
+			}
 			InternalEvent::ViewSubmodules => {
 				self.submodule_popup.open()?;
 			}

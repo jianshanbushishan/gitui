@@ -96,6 +96,8 @@ Everything in this section is added or changed on top of upstream gitui (the for
 
 #### Revlog & commit details
 
+- In **Logs**, press `b` to open the branch popup, then `v` (**View history**) to browse a selected local or remote branch without checking it out; `Enter` still checks out the branch. Remote history uses the remote-tracking refs already available locally.
+- The log title shows `viewing` while browsing another branch. `Esc` clears an active search first, then returns to `HEAD` history. Navigation, commit details, diffs, copying and search remain available; reset, reword, revert, checkout, tag and push actions in the log are disabled in this mode.
 - Commit details has a 3-way focus cycle `Info → Message → Files`; `y` copies the commit hash, the full commit message, or the whole author/date/sha/tags block, depending on which pane is focused.
 - The Info pane is focusable with its own scrollbar and shows tags inline on one line; the author column keeps a stable fixed width; focused Files/Message panes show scrollbars when content overflows.
 - Log search: `Ctrl+N`/`Ctrl+P` jump between matches with viewport centering, `j`/`k`/`g`/`G` move freely instead of being locked to matches, and the search status shows the cursor's position in the match range. Filename search is disabled by default for speed, and per-thread mailmap caching speeds up huge/NFS repositories.

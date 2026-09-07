@@ -66,6 +66,7 @@ pub struct Revlog {
 	commit_details: CommitDetailsComponent,
 	list: CommitList,
 	git_log: AsyncLog,
+	viewing_branch: Option<String>,
 	search: LogSearch,
 	git_tags: AsyncTags,
 	git_local_branches: AsyncSingleJob<AsyncBranchesJob>,
@@ -95,6 +96,7 @@ impl Revlog {
 				None,
 			),
 			search: LogSearch::Off,
+			viewing_branch: None,
 			git_tags: AsyncTags::new(
 				env.repo.borrow().clone(),
 				&env.sender_git,
@@ -130,8 +132,18 @@ impl Revlog {
 	///
 	pub fn update(&mut self) -> Result<()> {
 		if self.is_visible() {
-			if self.git_log.fetch()? == FetchStatus::Started {
-				self.list.clear();
+			match self.git_log.fetch() {
+				Ok(FetchStatus::Started) => self.list.clear(),
+				Ok(_) => (),
+				Err(error) if self.viewing_branch.is_some() => {
+					self.queue.push(InternalEvent::ShowErrorMsg(
+						format!(
+						"Cannot load branch history: {error}. Returning to HEAD."
+					),
+					));
+					self.return_to_head()?;
+				}
+				Err(error) => return Err(error.into()),
 			}
 
 			self.list
@@ -150,6 +162,54 @@ impl Revlog {
 			}
 		}
 
+		Ok(())
+	}
+
+	/// Browse a full branch reference without changing HEAD or the worktree.
+	pub fn view_branch(
+		&mut self,
+		reference: String,
+		name: String,
+	) -> Result<()> {
+		let git_log = AsyncLog::new(
+			self.repo.borrow().clone(),
+			&self.sender,
+			None,
+		)
+		.with_reference(reference);
+		// Validate and start loading before replacing the currently displayed log.
+		git_log.fetch()?;
+		self.replace_log(git_log, Some(name))
+	}
+
+	fn return_to_head(&mut self) -> Result<()> {
+		let git_log = AsyncLog::new(
+			self.repo.borrow().clone(),
+			&self.sender,
+			None,
+		);
+		git_log.fetch()?;
+		self.replace_log(git_log, None)
+	}
+
+	fn replace_log(
+		&mut self,
+		git_log: AsyncLog,
+		branch: Option<String>,
+	) -> Result<()> {
+		self.cancel_search();
+		self.search = LogSearch::Off;
+		// Each loader owns separate result buffers, so a previous walk cannot
+		// append commits to the new history even if its notification arrives late.
+		self.git_log = git_log;
+		let title = branch.as_ref().map_or_else(
+			|| strings::log_title(&self.key_config),
+			|name| format!("Log: {name} (viewing)"),
+		);
+		self.viewing_branch = branch;
+		self.list.reset_history(title);
+		self.commit_details.set_commits(None, None)?;
+		self.commit_details.focus_details();
 		Ok(())
 	}
 
@@ -404,6 +464,34 @@ impl Revlog {
 		self.is_in_search_mode() && !self.is_search_pending()
 	}
 
+	fn exit_commands(
+		&self,
+		out: &mut Vec<CommandInfo>,
+		force_all: bool,
+	) {
+		out.push(
+			CommandInfo::new(
+				strings::commands::log_return_head(&self.key_config),
+				self.viewing_branch.is_some()
+					&& !self.is_in_search_mode(),
+				self.visible || force_all,
+			)
+			.order(order::PRIORITY),
+		);
+
+		out.push(
+			CommandInfo::new(
+				strings::commands::log_close_search(&self.key_config),
+				true,
+				(self.visible
+					&& (self.can_close_search()
+						|| self.is_search_pending()))
+					|| force_all,
+			)
+			.order(order::PRIORITY),
+		);
+	}
+
 	fn can_start_search(&self) -> bool {
 		!self.git_log.is_pending() && !self.is_search_pending()
 	}
@@ -455,6 +543,16 @@ impl Component for Revlog {
 	#[allow(clippy::too_many_lines)]
 	fn event(&mut self, ev: &Event) -> Result<EventState> {
 		if self.visible {
+			// CommitList handles checkout directly; intercept it before routing.
+			if let Event::Key(k) = ev {
+				if self.viewing_branch.is_some()
+					&& key_match(
+						k,
+						self.key_config.keys.log_checkout_commit,
+					) {
+					return Ok(EventState::Consumed);
+				}
+			}
 			let event_used = self.list.event(ev)?;
 
 			if event_used.is_consumed() {
@@ -476,6 +574,19 @@ impl Component for Revlog {
 			}
 
 			if let Event::Key(k) = ev {
+				if self.viewing_branch.is_some()
+					&& [
+						self.key_config.keys.push,
+						self.key_config.keys.log_tag_commit,
+						self.key_config.keys.status_reset_item,
+						self.key_config.keys.log_reset_commit,
+						self.key_config.keys.log_reword_commit,
+					]
+					.iter()
+					.any(|binding| key_match(k, *binding))
+				{
+					return Ok(EventState::Consumed);
+				}
 				if key_match(k, self.key_config.keys.enter) {
 					self.commit_details.toggle_visible()?;
 					if self.commit_details.is_visible() {
@@ -492,6 +603,9 @@ impl Component for Revlog {
 					} else if self.can_close_search() {
 						self.list.set_highlighting(None);
 						self.search = LogSearch::Off;
+					} else if self.viewing_branch.is_some() {
+						self.return_to_head()?;
+						self.update()?;
 					}
 					return Ok(EventState::Consumed);
 				} else if key_match(k, self.key_config.keys.copy) {
@@ -645,17 +759,7 @@ impl Component for Revlog {
 			self.list.commands(out, force_all);
 		}
 
-		out.push(
-			CommandInfo::new(
-				strings::commands::log_close_search(&self.key_config),
-				true,
-				(self.visible
-					&& (self.can_close_search()
-						|| self.is_search_pending()))
-					|| force_all,
-			)
-			.order(order::PRIORITY),
-		);
+		self.exit_commands(out, force_all);
 
 		out.push(CommandInfo::new(
 			strings::commands::log_details_toggle(&self.key_config),
@@ -704,13 +808,15 @@ impl Component for Revlog {
 
 		out.push(CommandInfo::new(
 			strings::commands::log_tag_commit(&self.key_config),
-			self.selected_commit().is_some(),
+			self.selected_commit().is_some()
+				&& self.viewing_branch.is_none(),
 			self.visible || force_all,
 		));
 
 		out.push(CommandInfo::new(
 			strings::commands::log_checkout_commit(&self.key_config),
-			self.selected_commit().is_some(),
+			self.selected_commit().is_some()
+				&& self.viewing_branch.is_none(),
 			self.visible || force_all,
 		));
 
@@ -722,7 +828,7 @@ impl Component for Revlog {
 
 		out.push(CommandInfo::new(
 			strings::commands::push_tags(&self.key_config),
-			true,
+			self.viewing_branch.is_none(),
 			self.visible || force_all,
 		));
 
@@ -734,18 +840,21 @@ impl Component for Revlog {
 
 		out.push(CommandInfo::new(
 			strings::commands::revert_commit(&self.key_config),
-			self.selected_commit().is_some(),
+			self.selected_commit().is_some()
+				&& self.viewing_branch.is_none(),
 			(self.visible && !self.is_search_pending()) || force_all,
 		));
 
 		out.push(CommandInfo::new(
 			strings::commands::log_reset_commit(&self.key_config),
-			self.selected_commit().is_some(),
+			self.selected_commit().is_some()
+				&& self.viewing_branch.is_none(),
 			(self.visible && !self.is_search_pending()) || force_all,
 		));
 		out.push(CommandInfo::new(
 			strings::commands::log_reword_commit(&self.key_config),
-			self.selected_commit().is_some(),
+			self.selected_commit().is_some()
+				&& self.viewing_branch.is_none(),
 			(self.visible && !self.is_search_pending()) || force_all,
 		));
 		out.push(CommandInfo::new(
@@ -782,5 +891,215 @@ impl Component for Revlog {
 		self.update()?;
 
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::keys::GituiKeyEvent;
+	use crossbeam_channel::{unbounded, Receiver};
+	use std::time::Instant;
+
+	fn fixture() -> (
+		tempfile::TempDir,
+		Environment,
+		Receiver<AsyncGitNotification>,
+		CommitId,
+		CommitId,
+	) {
+		let (dir, repo) = git2_testing::repo_init();
+		let parent = repo.head().unwrap().peel_to_commit().unwrap();
+		let tree = parent.tree().unwrap();
+		let signature = repo.signature().unwrap();
+		let head = repo
+			.commit(
+				Some("HEAD"),
+				&signature,
+				&signature,
+				"current branch",
+				&tree,
+				&[&parent],
+			)
+			.unwrap();
+		repo.reference(
+			"refs/heads/feature",
+			parent.id(),
+			false,
+			"test",
+		)
+		.unwrap();
+		let branch = repo
+			.commit(
+				Some("refs/heads/feature"),
+				&signature,
+				&signature,
+				"feature only",
+				&tree,
+				&[&parent],
+			)
+			.unwrap();
+		let mut env = Environment::test_env();
+		*env.repo.borrow_mut() = dir.path().to_str().unwrap().into();
+		let (sender, receiver) = unbounded();
+		env.sender_git = sender;
+		(dir, env, receiver, head.into(), branch.into())
+	}
+
+	fn finish_loading(log: &mut Revlog) {
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while log.git_log.is_pending() {
+			assert!(
+				Instant::now() < deadline,
+				"log did not finish loading"
+			);
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		log.update().unwrap();
+	}
+
+	fn press(log: &mut Revlog, key: GituiKeyEvent) {
+		assert!(log
+			.event(&Event::Key((&key).into()))
+			.unwrap()
+			.is_consumed());
+	}
+
+	#[test]
+	fn branch_history_clears_marks_and_search_before_returning_to_head(
+	) {
+		let (_dir, env, _receiver, head, branch) = fixture();
+		let mut log = Revlog::new(&env);
+		log.visible = true;
+		log.update().unwrap();
+		finish_loading(&mut log);
+		assert_eq!(log.selected_commit(), Some(head));
+		press(&mut log, env.key_config.keys.log_mark_commit);
+		assert_eq!(log.list.marked_count(), 1);
+		log.search = LogSearch::Results(LogSearchResult {
+			options: LogFilterSearchOptions::default(),
+			duration: Duration::ZERO,
+		});
+
+		log.view_branch(
+			"refs/heads/feature".into(),
+			"feature".into(),
+		)
+		.unwrap();
+		assert!(!log.is_in_search_mode());
+		assert_eq!(log.list.marked_count(), 0);
+		assert!(log.list.copy_items().is_empty());
+		finish_loading(&mut log);
+		assert_eq!(log.selected_commit(), Some(branch));
+		assert!(!log.list.copy_items().contains(&head));
+		assert_eq!(sync::get_head(&env.repo.borrow()).unwrap(), head);
+
+		log.search = LogSearch::Results(LogSearchResult {
+			options: LogFilterSearchOptions::default(),
+			duration: Duration::ZERO,
+		});
+		press(&mut log, env.key_config.keys.exit_popup);
+		assert!(!log.is_in_search_mode());
+		assert!(log.viewing_branch.is_some());
+		press(&mut log, env.key_config.keys.exit_popup);
+		finish_loading(&mut log);
+		assert!(log.viewing_branch.is_none());
+		assert_eq!(log.selected_commit(), Some(head));
+		assert!(!log.list.copy_items().contains(&branch));
+	}
+
+	#[test]
+	fn branch_history_blocks_mutations_but_keeps_inspection() {
+		let (_dir, env, _receiver, head, branch) = fixture();
+		let mut log = Revlog::new(&env);
+		log.visible = true;
+		log.view_branch(
+			"refs/heads/feature".into(),
+			"feature".into(),
+		)
+		.unwrap();
+		finish_loading(&mut log);
+		assert_eq!(log.selected_commit(), Some(branch));
+		env.queue.clear();
+		for key in [
+			env.key_config.keys.log_checkout_commit,
+			env.key_config.keys.log_reset_commit,
+			env.key_config.keys.log_reword_commit,
+			env.key_config.keys.status_reset_item,
+			env.key_config.keys.log_tag_commit,
+			env.key_config.keys.push,
+		] {
+			press(&mut log, key);
+			assert!(env.queue.pop().is_none());
+			assert_eq!(
+				sync::get_head(&env.repo.borrow()).unwrap(),
+				head
+			);
+		}
+		let mut commands = Vec::new();
+		log.commands(&mut commands, false);
+		for text in [
+			strings::commands::log_checkout_commit(&env.key_config),
+			strings::commands::log_reset_commit(&env.key_config),
+			strings::commands::log_reword_commit(&env.key_config),
+			strings::commands::revert_commit(&env.key_config),
+			strings::commands::log_tag_commit(&env.key_config),
+			strings::commands::push_tags(&env.key_config),
+		] {
+			assert!(
+				!commands
+					.iter()
+					.find(|c| c.text == text)
+					.unwrap()
+					.enabled
+			);
+		}
+		press(&mut log, env.key_config.keys.open_file_tree);
+		assert!(matches!(
+			env.queue.pop(),
+			Some(InternalEvent::OpenPopup(
+				StackablePopupOpen::FileTree(_)
+			))
+		));
+		press(&mut log, env.key_config.keys.exit_popup);
+		finish_loading(&mut log);
+		env.queue.clear();
+		press(&mut log, env.key_config.keys.log_reword_commit);
+		assert!(
+			matches!(env.queue.pop(), Some(InternalEvent::RewordCommit(id)) if id == head)
+		);
+	}
+
+	#[test]
+	fn invalid_branch_preserves_history_and_deleted_branch_returns_to_head(
+	) {
+		let (_dir, env, _receiver, head, branch) = fixture();
+		let mut log = Revlog::new(&env);
+		log.visible = true;
+		log.view_branch(
+			"refs/heads/feature".into(),
+			"feature".into(),
+		)
+		.unwrap();
+		finish_loading(&mut log);
+		assert!(log
+			.view_branch(
+				"refs/heads/missing".into(),
+				"missing".into()
+			)
+			.is_err());
+		assert_eq!(log.viewing_branch.as_deref(), Some("feature"));
+		assert_eq!(log.selected_commit(), Some(branch));
+		sync::delete_branch(&env.repo.borrow(), "refs/heads/feature")
+			.unwrap();
+		env.queue.clear();
+		log.update().unwrap();
+		assert!(log.viewing_branch.is_none());
+		assert!(matches!(
+			env.queue.pop(),
+			Some(InternalEvent::ShowErrorMsg(_))
+		));
+		finish_loading(&mut log);
+		assert_eq!(log.selected_commit(), Some(head));
 	}
 }

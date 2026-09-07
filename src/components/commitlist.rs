@@ -102,6 +102,20 @@ impl CommitList {
 		self.commits.clear();
 	}
 
+	/// Start browsing a different history with no previous selection or marks.
+	pub fn reset_history(&mut self, title: String) {
+		self.clear();
+		self.items = ItemBatch::default();
+		self.title = title.into_boxed_str();
+		self.selection = 0;
+		self.highlights = None;
+		self.highlighted_selection = None;
+		self.clear_marked();
+		self.scroll_top.set(0);
+		self.center_next_scroll.set(false);
+		self.scroll_state = (Instant::now(), 0_f32);
+	}
+
 	///
 	pub fn copy_items(&self) -> Vec<CommitId> {
 		self.commits.iter().copied().collect_vec()

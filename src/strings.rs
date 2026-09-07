@@ -1714,6 +1714,19 @@ pub mod commands {
 		)
 	}
 
+	pub fn log_return_head(
+		key_config: &SharedKeyConfig,
+	) -> CommandText {
+		CommandText::new(
+			format!(
+				"Back to HEAD [{}]",
+				key_config.get_hint(key_config.keys.exit_popup)
+			),
+			"return to the checked-out history",
+			CMD_GROUP_LOG,
+		)
+	}
+
 	pub fn reset_commit(key_config: &SharedKeyConfig) -> CommandText {
 		CommandText::new(
 			format!(
@@ -1901,6 +1914,19 @@ pub mod commands {
 				key_config.get_hint(key_config.keys.enter),
 			),
 			"checkout branch",
+			CMD_GROUP_BRANCHES,
+		)
+	}
+
+	pub fn branch_view_log(
+		key_config: &SharedKeyConfig,
+	) -> CommandText {
+		CommandText::new(
+			format!(
+				"View history [{}]",
+				key_config.get_hint(key_config.keys.branch_view_log)
+			),
+			"view branch history without checking it out",
 			CMD_GROUP_BRANCHES,
 		)
 	}
