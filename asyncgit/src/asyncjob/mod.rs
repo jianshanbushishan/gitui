@@ -67,20 +67,28 @@ pub trait AsyncJob: Send + Sync + Clone {
 /// It keeps overwriting the next job until it is actually taken to be processed
 #[derive(Debug, Clone)]
 pub struct AsyncSingleJob<J: AsyncJob> {
-	next: Arc<Mutex<Option<J>>>,
+	queue: Arc<Mutex<JobQueue<J>>>,
 	last: Arc<Mutex<Option<J>>>,
 	progress: Arc<RwLock<J::Progress>>,
 	sender: Sender<J::Notification>,
-	pending: Arc<Mutex<()>>,
+}
+
+#[derive(Debug)]
+struct JobQueue<J> {
+	next: Option<J>,
+	/// Includes a worker waiting for a thread-pool slot.
+	pending: bool,
 }
 
 impl<J: 'static + AsyncJob> AsyncSingleJob<J> {
 	///
 	pub fn new(sender: Sender<J::Notification>) -> Self {
 		Self {
-			next: Arc::new(Mutex::new(None)),
+			queue: Arc::new(Mutex::new(JobQueue {
+				next: None,
+				pending: false,
+			})),
 			last: Arc::new(Mutex::new(None)),
-			pending: Arc::new(Mutex::new(())),
 			progress: Arc::new(RwLock::new(J::Progress::default())),
 			sender,
 		}
@@ -88,19 +96,14 @@ impl<J: 'static + AsyncJob> AsyncSingleJob<J> {
 
 	///
 	pub fn is_pending(&self) -> bool {
-		self.pending.try_lock().is_err()
+		self.queue.lock().map_or(true, |queue| queue.pending)
 	}
 
 	/// makes sure `next` is cleared and returns `true` if it actually canceled something
 	pub fn cancel(&self) -> bool {
-		if let Ok(mut next) = self.next.lock() {
-			if next.is_some() {
-				*next = None;
-				return true;
-			}
-		}
-
-		false
+		self.queue
+			.lock()
+			.is_ok_and(|mut queue| queue.next.take().is_some())
 	}
 
 	/// take out last finished job
@@ -110,10 +113,22 @@ impl<J: 'static + AsyncJob> AsyncSingleJob<J> {
 
 	/// spawns `task` if nothing is running currently,
 	/// otherwise schedules as `next` overwriting if `next` was set before.
-	/// return `true` if the new task gets started right away.
+	/// Returns `true` if a worker was scheduled. Queued work can still be
+	/// replaced or cancelled before that worker starts.
 	pub fn spawn(&self, task: J) -> bool {
-		self.schedule_next(task);
-		self.check_for_job()
+		let Ok(mut queue) = self.queue.lock() else {
+			return false;
+		};
+		queue.next = Some(task);
+		if queue.pending {
+			return false;
+		}
+		queue.pending = true;
+		drop(queue);
+
+		let worker = self.clone();
+		rayon_core::spawn(move || worker.run_jobs());
+		true
 	}
 
 	///
@@ -121,182 +136,232 @@ impl<J: 'static + AsyncJob> AsyncSingleJob<J> {
 		self.progress.read().ok().map(|d| (*d).clone())
 	}
 
-	fn check_for_job(&self) -> bool {
-		if self.is_pending() {
-			return false;
-		}
-
-		if let Some(task) = self.take_next() {
-			let self_clone = (*self).clone();
-			rayon_core::spawn(move || {
-				if let Err(e) = self_clone.run_job(task) {
-					log::error!("async job error: {e}");
-				}
-			});
-
-			return true;
-		}
-
-		false
-	}
-
-	fn run_job(&self, mut task: J) -> Result<()> {
-		//limit the pending scope
-		{
-			let _pending = self.pending.lock()?;
-
-			let notification = task.run(RunParams {
-				progress: self.progress.clone(),
-				sender: self.sender.clone(),
-			})?;
-
-			if let Ok(mut last) = self.last.lock() {
-				*last = Some(task);
+	fn run_jobs(&self) {
+		let mut next = self.take_next();
+		while let Some(task) = next {
+			let result = self.run_job(task);
+			// Publish the idle state before notifying consumers that gate
+			// take_last() on is_pending(). Otherwise they can miss completion.
+			next = self.take_next();
+			if let Err(error) = result.and_then(|notification| {
+				self.sender.send(notification)?;
+				Ok(())
+			}) {
+				log::error!("async job error: {error}");
 			}
-
-			self.sender.send(notification)?;
-		}
-
-		self.check_for_job();
-
-		Ok(())
-	}
-
-	fn schedule_next(&self, task: J) {
-		if let Ok(mut next) = self.next.lock() {
-			*next = Some(task);
 		}
 	}
 
 	fn take_next(&self) -> Option<J> {
-		self.next.lock().map_or(None, |mut next| next.take())
+		let mut queue = self.queue.lock().ok()?;
+		let task = queue.next.take();
+		if task.is_none() {
+			// Atomic with spawn(), so a new request cannot lose its worker.
+			queue.pending = false;
+		}
+		task
+	}
+
+	fn run_job(&self, mut task: J) -> Result<J::Notification> {
+		let notification = task.run(RunParams {
+			progress: self.progress.clone(),
+			sender: self.sender.clone(),
+		})?;
+		*self.last.lock()? = Some(task);
+
+		Ok(notification)
 	}
 }
 
 #[cfg(test)]
 mod test {
 	use super::*;
-	use crossbeam_channel::unbounded;
-	use pretty_assertions::assert_eq;
-	use std::{
-		sync::atomic::{AtomicBool, AtomicU32, Ordering},
-		thread,
-		time::Duration,
-	};
+	use crossbeam_channel::{unbounded, Receiver};
+	use std::time::{Duration, Instant};
+
+	const TIMEOUT: Duration = Duration::from_secs(10);
 
 	#[derive(Clone)]
 	struct TestJob {
-		v: Arc<AtomicU32>,
-		finish: Arc<AtomicBool>,
-		value_to_add: u32,
+		value: u32,
+		started: Sender<u32>,
+		release: Receiver<()>,
+		fail: bool,
 	}
-
-	type TestNotification = ();
 
 	impl AsyncJob for TestJob {
-		type Notification = TestNotification;
+		type Notification = u32;
 		type Progress = ();
 
-		fn run(
-			&mut self,
-			_params: RunParams<Self::Notification, Self::Progress>,
-		) -> Result<Self::Notification> {
-			println!("[job] wait");
-
-			while !self.finish.load(Ordering::SeqCst) {
-				std::thread::yield_now();
+		fn run(&mut self, _: RunParams<u32, ()>) -> Result<u32> {
+			self.started.send(self.value)?;
+			self.release.recv_timeout(TIMEOUT).map_err(|error| {
+				crate::Error::Generic(error.to_string())
+			})?;
+			if self.fail {
+				return Err(crate::Error::Generic(
+					"test failure".into(),
+				));
 			}
-
-			println!("[job] sleep");
-
-			thread::sleep(Duration::from_millis(100));
-
-			println!("[job] done sleeping");
-
-			let res =
-				self.v.fetch_add(self.value_to_add, Ordering::SeqCst);
-
-			println!("[job] value: {res}");
-
-			Ok(())
+			Ok(self.value)
 		}
-	}
-
-	#[test]
-	fn test_overwrite() {
-		let (sender, receiver) = unbounded();
-
-		let job: AsyncSingleJob<TestJob> =
-			AsyncSingleJob::new(sender);
-
-		let task = TestJob {
-			v: Arc::new(AtomicU32::new(1)),
-			finish: Arc::new(AtomicBool::new(false)),
-			value_to_add: 1,
-		};
-
-		assert!(job.spawn(task.clone()));
-		task.finish.store(true, Ordering::SeqCst);
-		thread::sleep(Duration::from_millis(10));
-
-		for _ in 0..5 {
-			println!("spawn");
-			assert!(!job.spawn(task.clone()));
-		}
-
-		println!("recv");
-		receiver.recv().unwrap();
-		receiver.recv().unwrap();
-		assert!(receiver.is_empty());
-
-		assert_eq!(
-			task.v.load(std::sync::atomic::Ordering::SeqCst),
-			3
-		);
 	}
 
 	fn wait_for_job(job: &AsyncSingleJob<TestJob>) {
+		let deadline = Instant::now() + TIMEOUT;
 		while job.is_pending() {
-			thread::sleep(Duration::from_millis(10));
+			assert!(
+				Instant::now() < deadline,
+				"worker did not become idle"
+			);
+			std::thread::yield_now();
 		}
 	}
 
 	#[test]
-	fn test_cancel() {
-		let (sender, receiver) = unbounded();
+	fn queued_requests_only_run_latest() {
+		let pool = rayon_core::ThreadPoolBuilder::new()
+			.num_threads(1)
+			.build()
+			.unwrap();
+		let (sender, finished) = unbounded();
+		let (started_tx, started) = unbounded();
+		let (release, release_rx) = unbounded();
+		let job = AsyncSingleJob::new(sender);
+		release.send(()).unwrap();
+		// A single worker cannot start the queued job until this closure
+		// returns, so this covers a busy pool without timing assumptions.
+		pool.install(|| {
+			for value in 1..=20 {
+				assert_eq!(
+					job.spawn(TestJob {
+						value,
+						started: started_tx.clone(),
+						release: release_rx.clone(),
+						fail: false,
+					}),
+					value == 1
+				);
+				assert!(job.is_pending());
+			}
+			assert!(started.is_empty());
+		});
+		assert_eq!(started.recv_timeout(TIMEOUT).unwrap(), 20);
+		assert_eq!(finished.recv_timeout(TIMEOUT).unwrap(), 20);
+		assert!(!job.is_pending());
+		wait_for_job(&job);
+		assert!(started.is_empty());
+		assert!(finished.is_empty());
+	}
 
-		let job: AsyncSingleJob<TestJob> =
-			AsyncSingleJob::new(sender);
+	#[test]
+	fn cancel_before_worker_starts() {
+		let pool = rayon_core::ThreadPoolBuilder::new()
+			.num_threads(1)
+			.build()
+			.unwrap();
+		let (sender, finished) = unbounded();
+		let (started_tx, started) = unbounded();
+		let (_release, release_rx) = unbounded();
+		let job = AsyncSingleJob::new(sender);
+		pool.install(|| {
+			assert!(job.spawn(TestJob {
+				value: 1,
+				started: started_tx,
+				release: release_rx,
+				fail: false,
+			}));
+			assert!(job.is_pending());
+			assert!(job.cancel());
+			assert!(!job.cancel());
+		});
+		wait_for_job(&job);
+		assert!(started.is_empty());
+		assert!(finished.is_empty());
+		assert!(job.take_last().is_none());
+	}
 
-		let task = TestJob {
-			v: Arc::new(AtomicU32::new(1)),
-			finish: Arc::new(AtomicBool::new(false)),
-			value_to_add: 1,
+	#[test]
+	fn running_job_keeps_only_latest_successor() {
+		let (sender, finished) = unbounded();
+		let (started_tx, started) = unbounded();
+		let (release, release_rx) = unbounded();
+		let job = AsyncSingleJob::new(sender);
+		let mut task = TestJob {
+			value: 1,
+			started: started_tx,
+			release: release_rx,
+			fail: false,
 		};
-
 		assert!(job.spawn(task.clone()));
-		task.finish.store(true, Ordering::SeqCst);
-		thread::sleep(Duration::from_millis(10));
-
-		for _ in 0..5 {
-			println!("spawn");
+		assert_eq!(started.recv_timeout(TIMEOUT).unwrap(), 1);
+		for value in 2..=20 {
+			task.value = value;
 			assert!(!job.spawn(task.clone()));
 		}
-
-		println!("cancel");
-		assert!(job.cancel());
-
-		task.finish.store(true, Ordering::SeqCst);
-
+		release.send(()).unwrap();
+		assert_eq!(finished.recv_timeout(TIMEOUT).unwrap(), 1);
+		assert_eq!(started.recv_timeout(TIMEOUT).unwrap(), 20);
+		release.send(()).unwrap();
+		assert_eq!(finished.recv_timeout(TIMEOUT).unwrap(), 20);
 		wait_for_job(&job);
+		assert_eq!(job.take_last().unwrap().value, 20);
+		assert!(started.is_empty());
+		assert!(finished.is_empty());
+	}
 
-		println!("recv");
-		receiver.recv().unwrap();
-		println!("received");
+	#[test]
+	fn cancel_successor_and_restart_idle_worker() {
+		let (sender, finished) = unbounded();
+		let (started_tx, started) = unbounded();
+		let (release, release_rx) = unbounded();
+		let job = AsyncSingleJob::new(sender);
+		let mut task = TestJob {
+			value: 1,
+			started: started_tx,
+			release: release_rx,
+			fail: false,
+		};
+		assert!(job.spawn(task.clone()));
+		assert_eq!(started.recv_timeout(TIMEOUT).unwrap(), 1);
+		task.value = 2;
+		assert!(!job.spawn(task.clone()));
+		assert!(job.cancel());
+		release.send(()).unwrap();
+		assert_eq!(finished.recv_timeout(TIMEOUT).unwrap(), 1);
+		wait_for_job(&job);
+		assert!(started.is_empty());
+		task.value = 3;
+		assert!(job.spawn(task));
+		assert_eq!(started.recv_timeout(TIMEOUT).unwrap(), 3);
+		release.send(()).unwrap();
+		assert_eq!(finished.recv_timeout(TIMEOUT).unwrap(), 3);
+		wait_for_job(&job);
+	}
 
-		assert_eq!(
-			task.v.load(std::sync::atomic::Ordering::SeqCst),
-			2
-		);
+	#[test]
+	fn failed_job_does_not_strand_successor() {
+		let (sender, finished) = unbounded();
+		let (started_tx, started) = unbounded();
+		let (release, release_rx) = unbounded();
+		let job = AsyncSingleJob::new(sender);
+		let mut task = TestJob {
+			value: 1,
+			started: started_tx,
+			release: release_rx,
+			fail: true,
+		};
+		assert!(job.spawn(task.clone()));
+		assert_eq!(started.recv_timeout(TIMEOUT).unwrap(), 1);
+		task.value = 2;
+		task.fail = false;
+		assert!(!job.spawn(task));
+		release.send(()).unwrap();
+		assert_eq!(started.recv_timeout(TIMEOUT).unwrap(), 2);
+		release.send(()).unwrap();
+		assert_eq!(finished.recv_timeout(TIMEOUT).unwrap(), 2);
+		wait_for_job(&job);
+		assert_eq!(job.take_last().unwrap().value, 2);
+		assert!(finished.is_empty());
 	}
 }

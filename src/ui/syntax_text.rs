@@ -319,6 +319,7 @@ pub struct AsyncSyntaxJob {
 	state: Arc<Mutex<Option<JobState>>>,
 	syntax: String,
 	line_numbers: bool,
+	generation: u64,
 }
 
 impl AsyncSyntaxJob {
@@ -333,6 +334,7 @@ impl AsyncSyntaxJob {
 			))))),
 			syntax,
 			line_numbers: false,
+			generation: 0,
 		}
 	}
 
@@ -341,6 +343,16 @@ impl AsyncSyntaxJob {
 	pub const fn with_line_numbers(mut self, enable: bool) -> Self {
 		self.line_numbers = enable;
 		self
+	}
+
+	/// Identify the exact source revision, including same-path reloads.
+	pub const fn with_generation(mut self, generation: u64) -> Self {
+		self.generation = generation;
+		self
+	}
+
+	pub const fn generation(&self) -> u64 {
+		self.generation
 	}
 
 	///

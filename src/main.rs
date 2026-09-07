@@ -142,6 +142,8 @@ pub enum AsyncAppNotification {
 	ContentSearch,
 	/// A background image preview is ready to render.
 	ImagePreview,
+	/// The selected new file has been checked for preview changes.
+	StatusFilePreview,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

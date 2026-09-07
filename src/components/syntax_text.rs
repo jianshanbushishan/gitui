@@ -31,7 +31,6 @@ use ratatui::{
 	Frame,
 };
 use std::{
-	borrow::Cow,
 	cell::{Cell, RefCell},
 	path::Path,
 	sync::Arc,
@@ -48,6 +47,7 @@ pub struct SyntaxTextComponent {
 	queue: Queue,
 	current_file: Option<(String, PreviewContent)>,
 	async_highlighting: AsyncSingleJob<AsyncSyntaxJob>,
+	highlight_generation: u64,
 	image_preview: RefCell<ui::ImagePreview>,
 	syntax_progress: Option<ProgressPercent>,
 	key_config: SharedKeyConfig,
@@ -70,6 +70,8 @@ pub struct SyntaxTextComponent {
 	/// Cached owned ratatui text; rebuilt only when content/search changes.
 	render_cache: RefCell<Option<(u64, Text<'static>)>>,
 	render_generation: Cell<u64>,
+	/// Base styles of matched spans; moving the cursor only patches two lines.
+	search_span_styles: RefCell<Vec<Vec<(usize, Style)>>>,
 	content_hash: Option<u64>,
 }
 
@@ -85,6 +87,7 @@ impl SyntaxTextComponent {
 			async_highlighting: AsyncSingleJob::new(
 				env.sender_app.clone(),
 			),
+			highlight_generation: 0,
 			image_preview: RefCell::new(ui::ImagePreview::new(
 				env.sender_app.clone(),
 			)),
@@ -104,6 +107,7 @@ impl SyntaxTextComponent {
 			visual_offsets_cache: RefCell::new(None),
 			render_cache: RefCell::new(None),
 			render_generation: Cell::new(1),
+			search_span_styles: RefCell::new(Vec::new()),
 			content_hash: None,
 		}
 	}
@@ -120,30 +124,45 @@ impl SyntaxTextComponent {
 						self.async_highlighting.progress();
 				}
 				SyntaxHighlightProgress::Done => {
-					self.syntax_progress = None;
-					let mut content_changed = false;
 					if let Some(job) =
 						self.async_highlighting.take_last()
 					{
-						if let Some((
-							path,
-							PreviewContent::Text(content),
-						)) = self.current_file.as_mut()
-						{
-							if let Some(syntax) = job.result() {
-								if syntax.path() == Path::new(path) {
-									*content = Either::Left(syntax);
-									content_changed = true;
-								}
-							}
+						if let Some(syntax) = job.result() {
+							self.apply_highlighting(
+								job.generation(),
+								syntax,
+							);
 						}
-					}
-					if content_changed {
-						self.invalidate_content_caches();
 					}
 				}
 			}
 		}
+	}
+
+	fn apply_highlighting(
+		&mut self,
+		generation: u64,
+		syntax: ui::SyntaxText,
+	) {
+		if generation != self.highlight_generation {
+			return;
+		}
+		if let Some((path, PreviewContent::Text(content))) =
+			self.current_file.as_mut()
+		{
+			if syntax.path() == Path::new(path) {
+				*content = Either::Left(syntax);
+				self.syntax_progress = None;
+				self.invalidate_content_caches();
+			}
+		}
+	}
+
+	fn cancel_highlighting(&mut self) {
+		self.highlight_generation =
+			self.highlight_generation.wrapping_add(1);
+		self.async_highlighting.cancel();
+		self.syntax_progress = None;
 	}
 
 	///
@@ -154,6 +173,7 @@ impl SyntaxTextComponent {
 
 	///
 	pub fn clear(&mut self) {
+		self.cancel_highlighting();
 		self.image_preview.get_mut().clear();
 		self.current_file = None;
 		self.content_hash = None;
@@ -203,15 +223,16 @@ impl SyntaxTextComponent {
 				PreviewContent::Image => Text::default(),
 			},
 		);
-		if !self.search_query.is_empty() {
-			highlight_search(
-				&mut text,
-				&self.search_query,
-				self.search_matches
-					.get(self.search_cursor)
-					.map(|m| m.line),
-			);
-		}
+		let styles = highlight_search(&mut text, &self.search_query);
+		set_active_match_line(
+			&mut text,
+			&styles,
+			self.search_matches
+				.get(self.search_cursor)
+				.map(|m| m.line),
+			true,
+		);
+		*self.search_span_styles.borrow_mut() = styles;
 		*self.render_cache.borrow_mut() = Some((generation, text));
 	}
 
@@ -262,13 +283,34 @@ impl SyntaxTextComponent {
 		if self.search_matches.is_empty() {
 			return;
 		}
+		let previous_line =
+			self.search_matches[self.search_cursor].line;
 		let len = self.search_matches.len();
 		self.search_cursor = if forward {
 			(self.search_cursor + 1) % len
 		} else {
 			(self.search_cursor + len - 1) % len
 		};
-		self.invalidate_render_cache();
+		if let Some((generation, text)) = self.render_cache.get_mut()
+		{
+			if *generation == self.render_generation.get() {
+				let styles = self.search_span_styles.get_mut();
+				set_active_match_line(
+					text,
+					styles,
+					Some(previous_line),
+					false,
+				);
+				set_active_match_line(
+					text,
+					styles,
+					Some(
+						self.search_matches[self.search_cursor].line,
+					),
+					true,
+				);
+			}
+		}
 		self.scroll_to_current_match();
 	}
 
@@ -366,30 +408,12 @@ impl SyntaxTextComponent {
 		content: ui::SyntaxText,
 	) {
 		self.image_preview.get_mut().clear();
-		self.async_highlighting.cancel();
-		self.syntax_progress = None;
+		self.cancel_highlighting();
 		self.current_file =
 			Some((path, PreviewContent::Text(Either::Left(content))));
 		self.content_hash = None;
 		self.invalidate_content_caches();
 		self.reset_search();
-	}
-
-	/// Load a newly added file from the source represented by its Status
-	/// pane. Staged files come from the index; unstaged files come from the
-	/// worktree.
-	pub fn load_status_file(&mut self, path: String, staged: bool) {
-		let result = {
-			let repo = self.repo.borrow();
-			sync::status_file_bytes(&repo, Path::new(&path), staged)
-		};
-		match result {
-			Ok(bytes) => self.load_bytes(path, &bytes),
-			Err(error) => self.load_error(
-				path,
-				format!("error loading file: {error}"),
-			),
-		}
 	}
 
 	/// Load a file exactly as it exists in a commit tree.
@@ -436,6 +460,16 @@ impl SyntaxTextComponent {
 
 	fn load_bytes(&mut self, path: String, bytes: &[u8]) {
 		let content_hash = asyncgit::hash(bytes);
+		self.load_hashed_bytes(path, bytes, content_hash);
+	}
+
+	/// Accept bytes already read and hashed by a background preview job.
+	pub(crate) fn load_hashed_bytes(
+		&mut self,
+		path: String,
+		bytes: &[u8],
+		content_hash: u64,
+	) {
 		if self.content_hash == Some(content_hash)
 			&& self
 				.current_file
@@ -446,8 +480,7 @@ impl SyntaxTextComponent {
 		}
 
 		if ui::is_image(bytes) {
-			self.async_highlighting.cancel();
-			self.syntax_progress = None;
+			self.cancel_highlighting();
 			self.image_preview.get_mut().set(bytes, content_hash);
 			self.current_file = Some((path, PreviewContent::Image));
 			self.invalidate_content_caches();
@@ -473,6 +506,7 @@ impl SyntaxTextComponent {
 	}
 
 	fn load_source(&mut self, path: String, content: String) {
+		self.cancel_highlighting();
 		self.image_preview.get_mut().clear();
 		self.invalidate_content_caches();
 		self.reset_search();
@@ -483,7 +517,8 @@ impl SyntaxTextComponent {
 				path.clone(),
 				self.theme.get_syntax(),
 			)
-			.with_line_numbers(true),
+			.with_line_numbers(true)
+			.with_generation(self.highlight_generation),
 		);
 
 		// Avoid a plain-to-highlighted flash while bat is running. The
@@ -499,10 +534,13 @@ impl SyntaxTextComponent {
 		));
 	}
 
-	fn load_error(&mut self, path: String, message: String) {
+	pub(crate) fn load_error(
+		&mut self,
+		path: String,
+		message: String,
+	) {
 		self.image_preview.get_mut().clear();
-		self.async_highlighting.cancel();
-		self.syntax_progress = None;
+		self.cancel_highlighting();
 		self.current_file = Some((
 			path,
 			PreviewContent::Text(Either::Right(message)),
@@ -640,21 +678,20 @@ impl DrawableComponent for SyntaxTextComponent {
 ///
 /// Walks each `Line`'s spans and, for every case-insensitive occurrence of
 /// `query`, splits the intersecting span and patches the matched fragment
-/// with a highlight style. The line holding the currently selected match
-/// (`current_line`) gets a stronger highlight so the user can see where the
-/// cursor is.
+/// with a highlight style. Retain each matched span's base style so moving
+/// the active match never rebuilds text or discards syntax-provided bold.
 fn highlight_search(
 	text: &mut Text<'_>,
 	query: &str,
-	current_line: Option<usize>,
-) {
+) -> Vec<Vec<(usize, Style)>> {
 	let needle = query.to_lowercase();
 	if needle.is_empty() {
-		return;
+		return Vec::new();
 	}
 
-	for (line_idx, line) in text.lines.iter_mut().enumerate() {
-		let is_current = current_line == Some(line_idx);
+	let mut styles = Vec::with_capacity(text.lines.len());
+	for line in &mut text.lines {
+		let mut matched = Vec::new();
 		let mut new_spans: Vec<Span<'static>> =
 			Vec::with_capacity(line.spans.len());
 		for span in line.spans.drain(..) {
@@ -663,107 +700,125 @@ fn highlight_search(
 				&content_owned,
 				&needle,
 				span.style,
-				is_current,
 				&mut new_spans,
+				&mut matched,
 			);
 		}
 		line.spans = new_spans;
+		styles.push(matched);
+	}
+	styles
+}
+
+fn set_active_match_line(
+	text: &mut Text<'_>,
+	styles: &[Vec<(usize, Style)>],
+	line: Option<usize>,
+	active: bool,
+) {
+	let Some(line_index) = line else {
+		return;
+	};
+	let Some(line) = text.lines.get_mut(line_index) else {
+		return;
+	};
+	let Some(styles) = styles.get(line_index) else {
+		return;
+	};
+	for &(index, base_style) in styles {
+		line.spans[index].style = if active {
+			base_style.add_modifier(Modifier::BOLD)
+		} else {
+			base_style
+		};
 	}
 }
 
 /// Split `content` into spans, patching the style of every (case-insensitive)
 /// occurrence of `needle`. Non-matching fragments keep the original style.
 ///
-/// All matching is done in **char-index space** (not byte space) so that
-/// case-folding characters whose lowercased form changes byte length (e.g.
-/// `'İ'`, `'ß'`) cannot produce a non-char-boundary slice and panic.
+/// `needle` is normalized once by the caller. Matching lowercases each span
+/// once, then maps matches back to original UTF-8 boundaries.
 fn split_and_highlight(
 	content: &str,
 	needle: &str,
 	base_style: Style,
-	is_current_line: bool,
 	out: &mut Vec<Span<'static>>,
+	matched: &mut Vec<(usize, Style)>,
 ) {
-	if needle.is_empty() {
-		out.push(Span::styled(
-			Cow::Owned(content.to_string()),
-			base_style,
-		));
-		return;
-	}
-
-	let content_chars: Vec<char> = content.chars().collect();
-	let content_lower: String =
-		content_chars.iter().collect::<String>().to_lowercase();
-	let needle_lower: String = needle.to_lowercase();
-	let needle_lower_chars: Vec<char> =
-		needle_lower.chars().collect();
-	let needle_len = needle_lower_chars.len();
-
-	if needle_len == 0 || needle_len > content_lower.chars().count() {
-		out.push(Span::styled(
-			Cow::Owned(content.to_string()),
-			base_style,
-		));
-		return;
-	}
-
-	let mut hl = Style::default().add_modifier(Modifier::REVERSED);
-	if is_current_line {
-		hl = hl.add_modifier(Modifier::BOLD);
-	}
-
-	let mut i = 0; // char index into content_chars
-	let mut last_pushed = 0; // char index; content[last_pushed..i] not yet emitted
-
-	while i + needle_len <= content_chars.len() {
-		// compare the lowercased window against the lowercased needle
-		let lower_window: String = content_chars[i..i + needle_len]
-			.iter()
-			.collect::<String>()
-			.to_lowercase();
-
-		if lower_window.chars().collect::<Vec<_>>()
-			== needle_lower_chars
-		{
-			// emit the leading non-matching fragment
-			if i > last_pushed {
-				out.push(Span::styled(
-					Cow::Owned(
-						content_chars[last_pushed..i]
-							.iter()
-							.collect::<String>(),
-					),
-					base_style,
-				));
-			}
-			// emit the matched fragment with highlight
+	let hl = Style::default().add_modifier(Modifier::REVERSED);
+	let mut last_pushed = 0;
+	for range in case_insensitive_ranges(content, needle) {
+		if range.start > last_pushed {
 			out.push(Span::styled(
-				Cow::Owned(
-					content_chars[i..i + needle_len]
-						.iter()
-						.collect::<String>(),
-				),
-				base_style.patch(hl),
+				content[last_pushed..range.start].to_owned(),
+				base_style,
 			));
-			i += needle_len;
-			last_pushed = i;
-		} else {
-			i += 1;
 		}
+		matched.push((out.len(), base_style.patch(hl)));
+		last_pushed = range.end;
+		out.push(Span::styled(
+			content[range].to_owned(),
+			base_style.patch(hl),
+		));
 	}
 
 	// trailing fragment
-	if last_pushed < content_chars.len() {
+	if last_pushed < content.len() || content.is_empty() {
 		out.push(Span::styled(
-			Cow::Owned(
-				content_chars[last_pushed..]
-					.iter()
-					.collect::<String>(),
-			),
+			content[last_pushed..].to_owned(),
 			base_style,
 		));
 	}
+}
+
+fn case_insensitive_ranges(
+	content: &str,
+	needle: &str,
+) -> Vec<std::ops::Range<usize>> {
+	if needle.is_empty() {
+		return Vec::new();
+	}
+	let lower = content.to_lowercase();
+	if content.is_ascii() {
+		return lower
+			.match_indices(needle)
+			.map(|(start, value)| start..start + value.len())
+			.collect();
+	}
+
+	// Each boundary maps a lowercased character's starting byte back to
+	// its original starting byte. Expand a partial match of e.g. İ -> i◌̇
+	// to the complete original character instead of slicing inside UTF-8.
+	let mut lower_offset = 0;
+	let mut boundaries = Vec::new();
+	for (original, ch) in content.char_indices() {
+		boundaries.push((lower_offset, original));
+		lower_offset +=
+			ch.to_lowercase().map(char::len_utf8).sum::<usize>();
+	}
+	boundaries.push((lower_offset, content.len()));
+	let mut cursor = 0;
+	let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+	for (start, value) in lower.match_indices(needle) {
+		while boundaries[cursor + 1].0 <= start {
+			cursor += 1;
+		}
+		let end = start + value.len();
+		let mut end_cursor = cursor + 1;
+		while boundaries[end_cursor].0 < end {
+			end_cursor += 1;
+		}
+		let range = boundaries[cursor].1..boundaries[end_cursor].1;
+		if let Some(previous) = ranges.last_mut() {
+			if range.start <= previous.end {
+				previous.end = range.end;
+				continue;
+			}
+		}
+		ranges.push(range);
+	}
+	ranges
 }
 
 impl Component for SyntaxTextComponent {
@@ -833,11 +888,132 @@ impl Component for SyntaxTextComponent {
 
 #[cfg(test)]
 mod tests {
-	use super::SyntaxTextComponent;
+	use super::{
+		highlight_search, set_active_match_line, PreviewContent,
+		SyntaxTextComponent,
+	};
 	use crate::{app::Environment, components::DrawableComponent};
 	use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
 	use ratatui::{backend::TestBackend, Terminal};
 	use std::io::Cursor;
+
+	#[test]
+	fn unicode_case_matches_map_to_original_utf8_boundaries() {
+		use super::case_insensitive_ranges;
+		let content = "İstanbul K ΟΣ";
+		for (query, expected) in
+			[("i", "İ"), ("i\u{307}", "İ"), ("k", "K"), ("ος", "ΟΣ")]
+		{
+			let ranges = case_insensitive_ranges(content, query);
+			assert_eq!(ranges.len(), 1);
+			assert_eq!(&content[ranges[0].clone()], expected);
+		}
+		let mut text = ratatui::text::Text::from(content);
+		highlight_search(&mut text, "i");
+		assert_eq!(
+			text.lines[0]
+				.spans
+				.iter()
+				.map(|span| span.content.as_ref())
+				.collect::<String>(),
+			content
+		);
+	}
+
+	#[test]
+	fn long_shared_prefix_nonmatch_does_not_build_windows() {
+		let content = format!("{}中", "a".repeat(100_000));
+		let query = format!("{}b", "a".repeat(10_000));
+		assert!(super::case_insensitive_ranges(&content, &query)
+			.is_empty());
+		let mut text = ratatui::text::Text::from(content.clone());
+		let matches = highlight_search(&mut text, &query);
+		assert!(matches[0].is_empty());
+		assert_eq!(text.lines[0].spans.len(), 1);
+		assert_eq!(text.lines[0].spans[0].content, content);
+	}
+
+	#[test]
+	fn stale_same_path_highlighting_cannot_replace_new_source() {
+		let env = Environment::test_env();
+		let mut component = SyntaxTextComponent::new(&env);
+		let old_generation = component.highlight_generation;
+		component.load_text(
+			"same.txt".into(),
+			crate::ui::SyntaxText::from_ansi(
+				vec![ratatui::text::Line::from("new source")],
+				"same.txt".into(),
+			),
+		);
+		let generation = component.render_generation.get();
+		component.apply_highlighting(
+			old_generation,
+			crate::ui::SyntaxText::from_ansi(
+				vec![ratatui::text::Line::from("old source")],
+				"same.txt".into(),
+			),
+		);
+		assert_eq!(component.file_lines(), vec!["new source"]);
+		assert_eq!(component.render_generation.get(), generation);
+	}
+
+	#[test]
+	fn navigating_matches_reuses_text_and_layout_generation() {
+		let env = Environment::test_env();
+		let mut component = SyntaxTextComponent::new(&env);
+		component.current_file = Some((
+			"search.txt".into(),
+			PreviewContent::Text(itertools::Either::Right(
+				"hit first\nunmatched\nhit last\n".into(),
+			)),
+		));
+		component.set_search_result("hit", 0, &[0, 2]);
+		component.rebuild_render_cache();
+		let generation = component.render_generation.get();
+		let spans =
+			component.render_cache.borrow().as_ref().unwrap().1.lines
+				[1]
+			.spans
+			.as_ptr();
+		for forward in [true, true, false, false] {
+			component.move_match(forward);
+			component.rebuild_render_cache();
+			assert_eq!(component.render_generation.get(), generation);
+			let cache = component.render_cache.borrow();
+			let text = &cache.as_ref().unwrap().1;
+			assert_eq!(text.lines[1].spans.as_ptr(), spans);
+			for line in [0, 2] {
+				assert_eq!(
+					text.lines[line].spans[0]
+						.style
+						.add_modifier
+						.contains(ratatui::style::Modifier::BOLD),
+					line == component.search_matches
+						[component.search_cursor]
+						.line,
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn moving_active_match_preserves_syntax_bold() {
+		use ratatui::{
+			style::{Modifier, Style},
+			text::{Span, Text},
+		};
+		let mut text = Text::from(Span::styled(
+			"hit",
+			Style::default().add_modifier(Modifier::BOLD),
+		));
+		let styles = highlight_search(&mut text, "hit");
+		set_active_match_line(&mut text, &styles, Some(0), true);
+		set_active_match_line(&mut text, &styles, Some(0), false);
+		assert!(text.lines[0].spans[0]
+			.style
+			.add_modifier
+			.contains(Modifier::BOLD | Modifier::REVERSED));
+	}
 
 	/// ratatui-image 11 blends tiny upscaled images towards the
 	/// background, so cells no longer carry the exact source pixel

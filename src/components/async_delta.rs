@@ -257,12 +257,8 @@ impl AsyncDelta {
 		None
 	}
 
-	/// Synchronous variant for same-file content changes (stage/unstage),
-	/// where preserving cursor position and avoiding flicker matters more
-	/// than non-blocking render. Runs `run_delta` on the current thread,
-	/// caches the result, and returns it directly.
-	///
-	/// File switches still go through the async `request()` path.
+	/// Populate rendered output deterministically in integration tests.
+	#[cfg(test)]
 	pub fn request_sync(
 		&self,
 		params: &DeltaParams,
@@ -1034,6 +1030,35 @@ mod tests {
 		let result = delta.take_if_matches(&current).unwrap();
 		assert_eq!(
 			result.display_lines[0].spans[0].content,
+			"current"
+		);
+	}
+
+	#[test]
+	fn same_file_results_must_match_content_width_and_mode() {
+		let (sender, _receiver) = unbounded();
+		let delta = AsyncDelta::new(&sender);
+		let old =
+			make_params("file.txt", asyncgit::DiffType::WorkDir);
+		let mut current = old.clone();
+		current.diff_hash += 1;
+		*delta.last_completed.lock().unwrap() =
+			Some((hash_params(&old), cached_result("stale")));
+		assert!(delta.take_if_matches(&current).is_none());
+		delta
+			.cache
+			.lock()
+			.unwrap()
+			.insert(hash_params(&current), cached_result("current"));
+		let mut resized = current.clone();
+		resized.width += 1;
+		assert!(delta.take_if_matches(&resized).is_none());
+		let mut toggled = current.clone();
+		toggled.side_by_side = !toggled.side_by_side;
+		assert!(delta.take_if_matches(&toggled).is_none());
+		assert_eq!(
+			delta.take_if_matches(&current).unwrap().display_lines[0]
+				.to_string(),
 			"current"
 		);
 	}

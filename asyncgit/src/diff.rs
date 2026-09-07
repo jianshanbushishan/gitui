@@ -1,6 +1,5 @@
 use crate::{
 	error::Result,
-	hash,
 	sync::{
 		self, commit_files::OldNew, diff::DiffOptions, CommitId,
 		RepoPath,
@@ -8,13 +7,7 @@ use crate::{
 	AsyncGitNotification, FileDiff,
 };
 use crossbeam_channel::Sender;
-use std::{
-	hash::Hash,
-	sync::{
-		atomic::{AtomicUsize, Ordering},
-		Arc, Mutex,
-	},
-};
+use std::sync::{Arc, Mutex};
 
 ///
 #[derive(Debug, Hash, Clone, PartialEq, Eq)]
@@ -40,20 +33,25 @@ pub struct DiffParams {
 	pub options: DiffOptions,
 }
 
-struct Request<R, A>(R, Option<A>);
-
-#[derive(Default, Clone)]
-struct LastResult<P, R> {
-	params: P,
-	result: R,
+#[derive(Clone)]
+struct LastResult {
+	params: DiffParams,
+	result: FileDiff,
 }
 
-///
+#[derive(Default)]
+struct DiffState {
+	current: Option<DiffParams>,
+	result: Option<FileDiff>,
+	last: Option<LastResult>,
+	queued: Option<DiffParams>,
+	running: bool,
+}
+
+/// Computes one diff at a time, retaining only the latest queued request.
 pub struct AsyncDiff {
-	current: Arc<Mutex<Request<u64, FileDiff>>>,
-	last: Arc<Mutex<Option<LastResult<DiffParams, FileDiff>>>>,
+	state: Arc<Mutex<DiffState>>,
 	sender: Sender<AsyncGitNotification>,
-	pending: Arc<AtomicUsize>,
 	repo: RepoPath,
 }
 
@@ -65,43 +63,30 @@ impl AsyncDiff {
 	) -> Self {
 		Self {
 			repo,
-			current: Arc::new(Mutex::new(Request(0, None))),
-			last: Arc::new(Mutex::new(None)),
+			state: Arc::new(Mutex::new(DiffState::default())),
 			sender: sender.clone(),
-			pending: Arc::new(AtomicUsize::new(0)),
 		}
 	}
 
 	///
 	pub fn last(&self) -> Result<Option<(DiffParams, FileDiff)>> {
-		let last = self.last.lock()?;
-
-		Ok(last.clone().map(|res| (res.params, res.result)))
+		Ok(self
+			.state
+			.lock()?
+			.last
+			.clone()
+			.map(|res| (res.params, res.result)))
 	}
 
-	///
+	/// Refresh the current selection, coalescing changes during a running diff.
 	pub fn refresh(&self) -> Result<()> {
-		if let Ok(Some(param)) = self.get_last_param() {
-			if self.is_pending() {
-				// A request with the same params is already in-flight.
-				// Do NOT clear the hash — that would invalidate the
-				// pending result and cause a livelock for large files
-				// where the diff takes long enough for a file-watcher
-				// notification to trigger another refresh() before the
-				// first one completes.
-				let mut current = self.current.lock()?;
-				current.1 = None;
-			} else {
-				self.clear_current()?;
-				self.request(param)?;
-			}
-		}
+		self.enqueue(None, true, Self::get_diff)?;
 		Ok(())
 	}
 
 	///
 	pub fn is_pending(&self) -> bool {
-		self.pending.load(Ordering::Relaxed) > 0
+		self.state.lock().is_ok_and(|state| state.running)
 	}
 
 	///
@@ -109,124 +94,254 @@ impl AsyncDiff {
 		&self,
 		params: DiffParams,
 	) -> Result<Option<FileDiff>> {
-		log::trace!("request {params:?}");
+		self.enqueue(Some(params), false, Self::get_diff)
+	}
 
-		let hash = hash(&params);
-
+	fn enqueue(
+		&self,
+		params: Option<DiffParams>,
+		refresh: bool,
+		mut compute: impl FnMut(&RepoPath, &DiffParams) -> Result<FileDiff>
+			+ Send
+			+ 'static,
+	) -> Result<Option<FileDiff>> {
 		{
-			let mut current = self.current.lock()?;
-
-			if current.0 == hash {
-				return Ok(current.1.clone());
+			let mut state = self.state.lock()?;
+			let Some(params) =
+				params.or_else(|| state.current.clone())
+			else {
+				return Ok(None);
+			};
+			if !refresh && state.current.as_ref() == Some(&params) {
+				return Ok(state.result.clone());
 			}
-
-			current.0 = hash;
-			current.1 = None;
+			state.current = Some(params.clone());
+			state.result = None;
+			state.queued = Some(params);
+			if state.running {
+				return Ok(None);
+			}
+			// Reserve the worker before dispatch so intervening requests
+			// replace the queued selection instead of spawning more jobs.
+			state.running = true;
 		}
 
-		let arc_current = Arc::clone(&self.current);
-		let arc_last = Arc::clone(&self.last);
+		let state = Arc::clone(&self.state);
 		let sender = self.sender.clone();
-		let arc_pending = Arc::clone(&self.pending);
 		let repo = self.repo.clone();
-
-		self.pending.fetch_add(1, Ordering::Relaxed);
-
 		rayon_core::spawn(move || {
-			let notify = Self::get_diff_helper(
+			if let Err(error) = Self::run_pending(
 				&repo,
-				params,
-				&arc_last,
-				&arc_current,
-				hash,
-			);
-
-			let notify = match notify {
-				Err(e) => {
-					log::error!("get_diff_helper error: {e}");
-					true
-				}
-				Ok(notify) => notify,
-			};
-
-			arc_pending.fetch_sub(1, Ordering::Relaxed);
-
-			sender
-				.send(if notify {
-					AsyncGitNotification::Diff
-				} else {
-					AsyncGitNotification::FinishUnchanged
-				})
-				.expect("error sending diff");
+				&state,
+				&sender,
+				&mut compute,
+			) {
+				log::error!("diff worker: {error}");
+			}
 		});
-
 		Ok(None)
 	}
 
-	fn get_diff_helper(
+	fn run_pending(
+		repo: &RepoPath,
+		state: &Mutex<DiffState>,
+		sender: &Sender<AsyncGitNotification>,
+		compute: &mut impl FnMut(
+			&RepoPath,
+			&DiffParams,
+		) -> Result<FileDiff>,
+	) -> Result<()> {
+		loop {
+			let params = {
+				let mut state = state.lock()?;
+				let Some(params) = state.queued.take() else {
+					state.running = false;
+					return Ok(());
+				};
+				params
+			};
+			let result = compute(repo, &params);
+			let (notify, done) = {
+				let mut state = state.lock()?;
+				let notify = state.current.as_ref() == Some(&params);
+				match result {
+					Ok(result) if notify => {
+						state.result = Some(result.clone());
+						state.last =
+							Some(LastResult { params, result });
+					}
+					Err(error) => {
+						log::error!("get_diff error: {error}");
+					}
+					_ => (),
+				}
+				let done = state.queued.is_none();
+				if done {
+					state.running = false;
+				}
+				(notify, done)
+			};
+			if let Err(error) = sender.send(if notify {
+				AsyncGitNotification::Diff
+			} else {
+				AsyncGitNotification::FinishUnchanged
+			}) {
+				log::error!("send diff: {error}");
+			}
+			if done {
+				return Ok(());
+			}
+		}
+	}
+
+	fn get_diff(
 		repo_path: &RepoPath,
-		params: DiffParams,
-		arc_last: &Arc<
-			Mutex<Option<LastResult<DiffParams, FileDiff>>>,
-		>,
-		arc_current: &Arc<Mutex<Request<u64, FileDiff>>>,
-		hash: u64,
-	) -> Result<bool> {
-		let res = match params.diff_type {
+		params: &DiffParams,
+	) -> Result<FileDiff> {
+		match params.diff_type {
 			DiffType::Stage => sync::diff::get_diff(
 				repo_path,
 				&params.path,
 				true,
 				Some(params.options),
-			)?,
+			),
 			DiffType::WorkDir => sync::diff::get_diff(
 				repo_path,
 				&params.path,
 				false,
 				Some(params.options),
-			)?,
+			),
 			DiffType::Commit(id) => sync::diff::get_diff_commit(
 				repo_path,
 				id,
 				params.path.clone(),
 				Some(params.options),
-			)?,
+			),
 			DiffType::Commits(ids) => sync::diff::get_diff_commits(
 				repo_path,
 				ids,
 				params.path.clone(),
 				Some(params.options),
-			)?,
-		};
-
-		let mut notify = false;
-		{
-			let mut current = arc_current.lock()?;
-			if current.0 == hash {
-				current.1 = Some(res.clone());
-				notify = true;
-			}
+			),
 		}
+	}
+}
 
-		{
-			let mut last = arc_last.lock()?;
-			*last = Some(LastResult {
-				result: res,
-				params,
-			});
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crossbeam_channel::unbounded;
+	use std::time::Duration;
+
+	fn params(path: &str) -> DiffParams {
+		DiffParams {
+			path: path.into(),
+			diff_type: DiffType::WorkDir,
+			options: DiffOptions::default(),
 		}
-
-		Ok(notify)
 	}
 
-	fn get_last_param(&self) -> Result<Option<DiffParams>> {
-		Ok(self.last.lock()?.clone().map(|e| e.params))
+	#[test]
+	fn file_switches_only_compute_latest_queued_selection() {
+		let (sender, receiver) = unbounded();
+		let (started_tx, started_rx) = unbounded();
+		let (release_tx, release_rx) = unbounded();
+		let diff = AsyncDiff::new(RepoPath::from("."), &sender);
+		diff.enqueue(
+			Some(params("first")),
+			false,
+			move |_, params| {
+				started_tx.send(params.path.clone()).unwrap();
+				release_rx
+					.recv_timeout(Duration::from_secs(5))
+					.unwrap();
+				Ok(FileDiff::default())
+			},
+		)
+		.unwrap();
+		assert!(diff.is_pending());
+		assert_eq!(
+			started_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+			"first"
+		);
+		for index in 0..100 {
+			diff.request(params(&index.to_string())).unwrap();
+		}
+		diff.request(params("latest")).unwrap();
+		release_tx.send(()).unwrap();
+		let next =
+			started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+		let obsolete_was_discarded = diff.last().unwrap().is_none();
+		let still_pending = diff.is_pending();
+		release_tx.send(()).unwrap();
+		assert_eq!(next, "latest");
+		assert!(obsolete_was_discarded);
+		assert!(still_pending);
+		receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+		receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+		assert!(!diff.is_pending());
+		assert_eq!(diff.last().unwrap().unwrap().0.path, "latest");
+		assert!(diff.request(params("latest")).unwrap().is_some());
+		assert!(!diff.is_pending());
+		assert!(started_rx.try_recv().is_err());
 	}
 
-	fn clear_current(&self) -> Result<()> {
-		let mut current = self.current.lock()?;
-		current.0 = 0;
-		current.1 = None;
-		Ok(())
+	#[test]
+	fn refresh_during_diff_publishes_and_reruns_current_selection() {
+		let (sender, receiver) = unbounded();
+		let (started_tx, started_rx) = unbounded();
+		let (release_tx, release_rx) = unbounded();
+		let diff = AsyncDiff::new(RepoPath::from("."), &sender);
+		let mut count = 0;
+		diff.enqueue(
+			Some(params("file")),
+			false,
+			move |_, params| {
+				started_tx.send(params.path.clone()).unwrap();
+				release_rx
+					.recv_timeout(Duration::from_secs(5))
+					.unwrap();
+				count += 1;
+				Ok(FileDiff {
+					lines: count,
+					..FileDiff::default()
+				})
+			},
+		)
+		.unwrap();
+		started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+		// No completed result exists yet. Refresh must still retain this target.
+		diff.refresh().unwrap();
+		diff.refresh().unwrap();
+		release_tx.send(()).unwrap();
+		let next =
+			started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+		let first = diff.last().unwrap();
+		release_tx.send(()).unwrap();
+		assert_eq!(next, "file");
+		assert_eq!(first.unwrap().1.lines, 1);
+		receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+		receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+		assert_eq!(diff.last().unwrap().unwrap().1.lines, 2);
+		assert!(!diff.is_pending());
+	}
+
+	#[test]
+	fn failed_diff_does_not_block_following_request() {
+		let (sender, receiver) = unbounded();
+		let diff = AsyncDiff::new(RepoPath::from("."), &sender);
+		diff.enqueue(Some(params("bad")), false, |_, _| {
+			Err(crate::Error::Generic("test failure".into()))
+		})
+		.unwrap();
+		receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+		assert!(!diff.is_pending());
+		diff.enqueue(Some(params("good")), false, |_, _| {
+			Ok(FileDiff::default())
+		})
+		.unwrap();
+		receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+		assert!(!diff.is_pending());
+		assert_eq!(diff.last().unwrap().unwrap().0.path, "good");
 	}
 }

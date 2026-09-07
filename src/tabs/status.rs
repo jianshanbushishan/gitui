@@ -11,7 +11,7 @@ use crate::{
 	queue::{Action, InternalEvent, NeedsUpdate, Queue, ResetItem},
 	strings, try_or_popup,
 	ui::style::Theme,
-	AsyncNotification,
+	AsyncAppNotification, AsyncNotification,
 };
 use anyhow::Result;
 use asyncgit::{
@@ -32,6 +32,9 @@ use ratatui::{
 	style::{Color, Style},
 	widgets::{Block, BorderType, Borders, Paragraph},
 };
+
+mod file_preview;
+use file_preview::{PreviewResult, StatusFilePreviewJob};
 
 /// what part of the screen is focused
 #[derive(PartialEq)]
@@ -74,6 +77,14 @@ enum RightPane {
 	File,
 }
 
+struct PreviewState {
+	key: Option<(String, bool)>,
+	job: AsyncSingleJob<StatusFilePreviewJob>,
+	generation: u64,
+	hash: Option<u64>,
+	dirty: bool,
+}
+
 pub struct Status {
 	repo: RepoPathRef,
 	visible: bool,
@@ -84,7 +95,7 @@ pub struct Status {
 	diff: DiffComponent,
 	file_preview: SyntaxTextComponent,
 	right_pane: RightPane,
-	preview_key: Option<(String, bool)>,
+	preview: PreviewState,
 	remotes: RemoteStatus,
 	git_diff: AsyncDiff,
 	git_state: RepoState,
@@ -236,7 +247,13 @@ impl Status {
 			diff: DiffComponent::new(env, false),
 			file_preview: SyntaxTextComponent::new(env),
 			right_pane: RightPane::Diff,
-			preview_key: None,
+			preview: PreviewState {
+				key: None,
+				job: AsyncSingleJob::new(env.sender_app.clone()),
+				generation: 0,
+				hash: None,
+				dirty: false,
+			},
 			git_diff: AsyncDiff::new(
 				repo_clone.clone(),
 				&env.sender_git,
@@ -501,7 +518,13 @@ impl Status {
 				self.options.borrow().status_show_untracked();
 			let diff_options = self.options.borrow().diff_options();
 
-			self.git_diff.refresh()?;
+			if self.right_pane == RightPane::File {
+				// Status equality does not imply content equality. Poll bytes
+				// independently, including when StatusPairUnchanged is ignored.
+				self.request_file_preview(false);
+			} else {
+				self.git_diff.refresh()?;
+			}
 			self.changes_fetcher.fetch(config)?;
 
 			if diff_options != self.line_stats_options {
@@ -523,12 +546,89 @@ impl Status {
 			|| self.git_line_stats.is_pending()
 			|| self.git_branch_compare.is_pending()
 			|| self.file_preview.any_work_pending()
+			|| self.preview.job.is_pending()
 	}
 
 	/// Forward application-level async notifications to the full-file
 	/// preview used for newly added files.
 	pub fn update_async(&mut self, ev: AsyncNotification) {
 		self.file_preview.update(ev);
+		if ev
+			== AsyncNotification::App(
+				AsyncAppNotification::StatusFilePreview,
+			) {
+			self.apply_file_preview();
+		}
+	}
+
+	fn request_file_preview(&mut self, replace_pending: bool) {
+		let Some((path, staged)) = &self.preview.key else {
+			return;
+		};
+		if !replace_pending && self.preview.job.is_pending() {
+			self.preview.dirty = true;
+			return;
+		}
+		self.preview.job.spawn(StatusFilePreviewJob::new(
+			self.repo.borrow().clone(),
+			path.clone(),
+			*staged,
+			self.preview.generation,
+			self.preview.hash,
+		));
+	}
+
+	fn apply_file_preview(&mut self) {
+		let Some((generation, result)) =
+			self.preview.job.take_last().and_then(|job| job.result())
+		else {
+			return;
+		};
+		self.apply_file_preview_result(generation, result);
+	}
+
+	fn apply_file_preview_result(
+		&mut self,
+		generation: u64,
+		result: PreviewResult,
+	) {
+		if generation != self.preview.generation
+			|| self.right_pane != RightPane::File
+		{
+			return;
+		}
+		let Some((path, _)) = &self.preview.key else {
+			return;
+		};
+		match result {
+			PreviewResult::Unchanged => (),
+			PreviewResult::Changed { bytes, hash } => {
+				self.file_preview.load_hashed_bytes(
+					path.clone(),
+					&bytes,
+					hash,
+				);
+				self.preview.hash = Some(hash);
+			}
+			PreviewResult::Error(error) => {
+				self.preview.hash = None;
+				self.file_preview.load_error(path.clone(), error);
+			}
+		}
+		if self.preview.dirty {
+			self.preview.dirty = false;
+			self.request_file_preview(false);
+		}
+	}
+
+	fn clear_file_preview(&mut self) {
+		self.preview.job.cancel();
+		self.preview.generation =
+			self.preview.generation.wrapping_add(1);
+		self.preview.key = None;
+		self.preview.hash = None;
+		self.preview.dirty = false;
+		self.file_preview.clear();
 	}
 
 	fn check_remotes(&mut self) {
@@ -555,7 +655,7 @@ impl Status {
 
 		match ev {
 			AsyncGitNotification::Diff => {
-				self.update_diff_inner(true)?;
+				self.update_diff()?;
 			}
 			AsyncGitNotification::Delta => self.diff.apply_delta(),
 			AsyncGitNotification::StatusPairChanged => {
@@ -638,13 +738,6 @@ impl Status {
 
 	///
 	pub fn update_diff(&mut self) -> Result<()> {
-		self.update_diff_inner(false)
-	}
-
-	fn update_diff_inner(
-		&mut self,
-		refresh_preview: bool,
-	) -> Result<()> {
 		if let Some((item, is_stage)) = self.selected_status_item() {
 			let path = item.path;
 			let diff_type = if is_stage {
@@ -660,33 +753,24 @@ impl Status {
 			};
 
 			if uses_full_file_preview(item.status) {
-				let preview_key = (path.clone(), is_stage);
-				let needs_load = refresh_preview
-					|| self.preview_key.as_ref()
-						!= Some(&preview_key);
+				let preview_key = (path, is_stage);
+				let needs_load =
+					self.preview.key.as_ref() != Some(&preview_key);
 				self.right_pane = RightPane::File;
 				self.sync_right_focus();
 				if needs_load {
-					// Keep the current preview in place while checking the
-					// latest bytes. SyntaxTextComponent compares the content
-					// hash first, so an unchanged periodic refresh neither
-					// rebuilds the image state nor restarts bat highlighting.
-					self.file_preview
-						.load_status_file(path, is_stage);
-					self.preview_key = Some(preview_key);
+					self.clear_file_preview();
+					self.preview.key = Some(preview_key);
+					// Queue the new selection immediately even while a canceled
+					// read is still running. Its completion may be suppressed.
+					self.request_file_preview(true);
 				}
-
-				// Retain the existing async diff request as a content-change
-				// poll. Its periodic notification re-reads the file, while the
-				// content hash above suppresses unchanged work.
-				let _ = self.git_diff.request(diff_params)?;
 				return Ok(());
 			}
 
 			if self.right_pane == RightPane::File {
 				self.right_pane = RightPane::Diff;
-				self.preview_key = None;
-				self.file_preview.clear();
+				self.clear_file_preview();
 				self.sync_right_focus();
 			}
 
@@ -713,8 +797,7 @@ impl Status {
 			}
 		} else {
 			self.right_pane = RightPane::Diff;
-			self.preview_key = None;
-			self.file_preview.clear();
+			self.clear_file_preview();
 			self.sync_right_focus();
 			self.diff.clear(false);
 		}
@@ -941,8 +1024,150 @@ impl Status {
 
 #[cfg(test)]
 mod tests {
-	use super::uses_full_file_preview;
+	use super::{
+		uses_full_file_preview, PreviewResult, RightPane, Status,
+	};
 	use asyncgit::StatusItemType;
+
+	#[test]
+	fn switching_preview_while_reader_is_busy_queues_new_selection() {
+		use super::StatusFilePreviewJob;
+		use crate::{
+			app::Environment, AsyncAppNotification, AsyncNotification,
+		};
+		let (dir, _git) = git2_testing::repo_init();
+		std::fs::write(dir.path().join("a.bin"), b"\0old").unwrap();
+		std::fs::write(dir.path().join("b.bin"), b"\0new").unwrap();
+		let mut env = Environment::test_env();
+		*env.repo.get_mut() = dir.path().to_path_buf().into();
+		let (sender, receiver) = crossbeam_channel::unbounded();
+		env.sender_app = sender;
+		let mut status = Status::new(&env);
+		status.right_pane = RightPane::File;
+		status.preview.key = Some(("a.bin".into(), false));
+		let (started_tx, started_rx) = crossbeam_channel::unbounded();
+		let (release_tx, release_rx) = crossbeam_channel::unbounded();
+		status.preview.job.spawn(
+			StatusFilePreviewJob::new(
+				env.repo.borrow().clone(),
+				"a.bin".into(),
+				false,
+				status.preview.generation,
+				None,
+			)
+			.with_read_gate(started_tx, release_rx),
+		);
+		started_rx
+			.recv_timeout(std::time::Duration::from_secs(5))
+			.unwrap();
+		status
+			.index_wd
+			.set_items(&[asyncgit::StatusItem {
+				path: "b.bin".into(),
+				status: StatusItemType::New,
+			}])
+			.unwrap();
+		status.update_diff().unwrap();
+		release_tx.send(()).unwrap();
+		// No periodic update: B must run immediately after A is released.
+		let deadline = std::time::Instant::now()
+			+ std::time::Duration::from_secs(5);
+		while status.preview.hash.is_none() {
+			let notification =
+				receiver.recv_deadline(deadline).unwrap();
+			assert_eq!(
+				notification,
+				AsyncAppNotification::StatusFilePreview
+			);
+			status.update_async(AsyncNotification::App(notification));
+		}
+		assert_eq!(status.preview.key, Some(("b.bin".into(), false)));
+		assert_eq!(
+			status.preview.hash,
+			Some(asyncgit::hash(&b"\0new"[..]))
+		);
+	}
+
+	#[test]
+	fn new_file_preview_refreshes_without_a_diff_or_status_change() {
+		use crate::{
+			app::Environment, AsyncAppNotification, AsyncNotification,
+		};
+		let (dir, _git) = git2_testing::repo_init();
+		let path = dir.path().join("new.bin");
+		std::fs::write(&path, b"\0first").unwrap();
+		let mut env = Environment::test_env();
+		*env.repo.get_mut() = dir.path().to_path_buf().into();
+		let (sender, receiver) = crossbeam_channel::unbounded();
+		env.sender_app = sender;
+		let (git_sender, _git_receiver) =
+			crossbeam_channel::unbounded();
+		env.sender_git = git_sender;
+		let mut status = Status::new(&env);
+		status
+			.index_wd
+			.set_items(&[asyncgit::StatusItem {
+				path: "new.bin".into(),
+				status: StatusItemType::New,
+			}])
+			.unwrap();
+		status.update_diff().unwrap();
+		assert!(status.right_pane == RightPane::File);
+		assert!(status.git_diff.last().unwrap().is_none());
+		let notification = receiver
+			.recv_timeout(std::time::Duration::from_secs(5))
+			.unwrap();
+		assert_eq!(
+			notification,
+			AsyncAppNotification::StatusFilePreview
+		);
+		status.update_async(AsyncNotification::App(notification));
+		let hash = status.preview.hash;
+		assert!(hash.is_some());
+
+		// No set_items/update_status call: flags and file length are unchanged.
+		std::fs::write(&path, b"\0other").unwrap();
+		status.visible = true;
+		status.update().unwrap();
+		let notification = receiver
+			.recv_timeout(std::time::Duration::from_secs(5))
+			.unwrap();
+		assert_eq!(
+			notification,
+			AsyncAppNotification::StatusFilePreview
+		);
+		status.update_async(AsyncNotification::App(notification));
+		assert_ne!(status.preview.hash, hash);
+		assert!(status.git_diff.last().unwrap().is_none());
+		assert!(!status.git_diff.is_pending());
+	}
+
+	#[test]
+	fn returning_to_same_path_rejects_old_preview_generation() {
+		let env = crate::app::Environment::test_env();
+		let mut status = Status::new(&env);
+		status.right_pane = RightPane::File;
+		status.preview.key = Some(("same.bin".into(), false));
+		let old_generation = status.preview.generation;
+		status.clear_file_preview();
+		status.preview.key = Some(("same.bin".into(), false));
+		status.apply_file_preview_result(
+			old_generation,
+			PreviewResult::Changed {
+				bytes: b"\0old".to_vec(),
+				hash: 1,
+			},
+		);
+		assert_eq!(status.preview.hash, None);
+		status.apply_file_preview_result(
+			status.preview.generation,
+			PreviewResult::Changed {
+				bytes: b"\0new".to_vec(),
+				hash: 2,
+			},
+		);
+		assert_eq!(status.preview.hash, Some(2));
+	}
 
 	#[test]
 	fn only_new_status_items_use_full_file_preview() {
@@ -973,7 +1198,7 @@ impl Component for Status {
 			if self.right_pane == RightPane::File {
 				out.push(CommandInfo::new(
 					strings::commands::edit_item(&self.key_config),
-					self.preview_key.is_some(),
+					self.preview.key.is_some(),
 					self.focus == Focus::Diff || force_all,
 				));
 			}
@@ -1219,7 +1444,7 @@ impl Component for Status {
 					&& self.focus == Focus::Diff
 					&& key_match(k, self.key_config.keys.edit_file)
 				{
-					if let Some((path, _)) = &self.preview_key {
+					if let Some((path, _)) = &self.preview.key {
 						self.queue.push(
 							InternalEvent::OpenExternalEditor(
 								Some(path.clone()),

@@ -228,37 +228,17 @@ impl AsyncLog {
 		sender: &Sender<AsyncGitNotification>,
 		filter: SharedCommitFilterFn,
 	) -> Result<()> {
-		let start_time = Instant::now();
-
-		let mut entries = vec![CommitId::default(); LIMIT_COUNT];
-		entries.resize(0, CommitId::default());
-
 		let r = repo(repo_path)?;
 		let mut walker =
 			LogWalker::new(&r, LIMIT_COUNT)?.filter(Some(filter));
 
-		loop {
-			entries.clear();
-			let read = walker.read(&mut entries)?;
-
-			let mut current = arc_current.lock()?;
-			current.commits.extend(entries.iter());
-			current.duration = start_time.elapsed();
-
-			if read == 0 {
-				break;
-			}
-			Self::notify(sender);
-
-			let sleep_duration =
-				if arc_background.load(Ordering::Relaxed) {
-					SLEEP_BACKGROUND
-				} else {
-					SLEEP_FOREGROUND
-				};
-
-			thread::sleep(sleep_duration);
-		}
+		Self::fetch_batches(
+			|entries| walker.read(entries),
+			arc_current,
+			arc_background,
+			sender,
+			thread::sleep,
+		)?;
 
 		log::trace!("revlog visited: {}", walker.visited());
 
@@ -271,39 +251,56 @@ impl AsyncLog {
 		arc_background: &Arc<AtomicBool>,
 		sender: &Sender<AsyncGitNotification>,
 	) -> Result<()> {
-		let start_time = Instant::now();
-
-		let mut entries = vec![CommitId::default(); LIMIT_COUNT];
-		entries.resize(0, CommitId::default());
-
 		let mut repo: gix::Repository = gix_repo(repo_path)?;
 		let mut walker =
 			LogWalkerWithoutFilter::new(&mut repo, LIMIT_COUNT)?;
 
+		Self::fetch_batches(
+			|entries| walker.read(entries),
+			arc_current,
+			arc_background,
+			sender,
+			thread::sleep,
+		)?;
+
+		log::trace!("revlog visited: {}", walker.visited());
+
+		Ok(())
+	}
+
+	fn fetch_batches(
+		mut read: impl FnMut(&mut Vec<CommitId>) -> Result<usize>,
+		current: &Mutex<AsyncLogResult>,
+		background: &AtomicBool,
+		sender: &Sender<AsyncGitNotification>,
+		pause: impl Fn(Duration),
+	) -> Result<()> {
+		let start_time = Instant::now();
+		let mut entries = Vec::with_capacity(LIMIT_COUNT);
 		loop {
 			entries.clear();
-			let read = walker.read(&mut entries)?;
+			let read = read(&mut entries)?;
 
-			let mut current = arc_current.lock()?;
-			current.commits.extend(entries.iter());
-			current.duration = start_time.elapsed();
+			{
+				let mut current = current.lock()?;
+				current.commits.extend(entries.iter());
+				current.duration = start_time.elapsed();
+			}
 
 			if read == 0 {
 				break;
 			}
 			Self::notify(sender);
 
-			let sleep_duration =
-				if arc_background.load(Ordering::Relaxed) {
-					SLEEP_BACKGROUND
-				} else {
-					SLEEP_FOREGROUND
-				};
+			let sleep_duration = if background.load(Ordering::Relaxed)
+			{
+				SLEEP_BACKGROUND
+			} else {
+				SLEEP_FOREGROUND
+			};
 
-			thread::sleep(sleep_duration);
+			pause(sleep_duration);
 		}
-
-		log::trace!("revlog visited: {}", walker.visited());
 
 		Ok(())
 	}
@@ -337,6 +334,48 @@ mod tests {
 	use crate::AsyncLog;
 
 	use super::AsyncLogResult;
+
+	#[test]
+	fn published_batches_are_unlocked_during_pause() {
+		for background in [false, true] {
+			let current = Mutex::new(AsyncLogResult {
+				commits: Vec::new(),
+				duration: Duration::default(),
+			});
+			let (sender, receiver) = unbounded();
+			let mut first_batch = true;
+			AsyncLog::fetch_batches(
+				|entries| {
+					if std::mem::take(&mut first_batch) {
+						entries
+							.push(crate::sync::CommitId::default());
+						Ok(1)
+					} else {
+						Ok(0)
+					}
+				},
+				&current,
+				&AtomicBool::new(background),
+				&sender,
+				|duration| {
+					assert_eq!(
+						duration,
+						if background {
+							super::SLEEP_BACKGROUND
+						} else {
+							super::SLEEP_FOREGROUND
+						}
+					);
+					receiver.try_recv().unwrap();
+					assert_eq!(
+						current.try_lock().unwrap().commits.len(),
+						1
+					);
+				},
+			)
+			.unwrap();
+		}
+	}
 
 	#[test]
 	#[serial]

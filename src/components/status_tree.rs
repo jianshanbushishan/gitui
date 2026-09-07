@@ -49,7 +49,7 @@ pub struct StatusTreeComponent {
 	repo: RepoPathRef,
 	copy_path_popup: CopyPathPopup,
 	/// Flattened/folded rows, invalidated only when tree layout changes.
-	draw_cache: RefCell<Option<(Vec<TextDrawInfo>, usize)>>,
+	draw_cache: RefCell<Option<Vec<TextDrawInfo>>>,
 }
 
 impl StatusTreeComponent {
@@ -290,7 +290,7 @@ impl StatusTreeComponent {
 	/// allowing folders to be folded up if they are alone in their directory
 	fn build_vec_text_draw_info_for_drawing(
 		&self,
-	) -> (Vec<TextDrawInfo>, usize) {
+	) -> Vec<TextDrawInfo> {
 		let mut should_skip_over: usize = 0;
 		let mut vec_draw_text_info: Vec<TextDrawInfo> = vec![];
 		let tree_items = self.tree.tree.items();
@@ -345,11 +345,8 @@ impl StatusTreeComponent {
 					+ &tree_items[idx_temp].info.path);
 			}
 		}
-		let visible_count = vec_draw_text_info
-			.iter()
-			.filter(|info| info.visible)
-			.count();
-		(vec_draw_text_info, visible_count)
+		vec_draw_text_info.retain(|info| info.visible);
+		vec_draw_text_info
 	}
 
 	fn open_copy_path_popup(&mut self) {
@@ -442,31 +439,31 @@ impl DrawableComponent for StatusTreeComponent {
 					Some(self.build_vec_text_draw_info_for_drawing());
 			}
 			let draw_cache = self.draw_cache.borrow();
-			let (vec_draw_text_info, visible_count) = draw_cache
+			let vec_draw_text_info = draw_cache
 				.as_ref()
 				.expect("draw cache initialized above");
 
 			let selected_source = self.tree.selection.unwrap_or(0);
 			let select = vec_draw_text_info
-				.iter()
-				.rposition(|row| row.source_index <= selected_source)
-				.unwrap_or_default();
-			let visible_selection = vec_draw_text_info[..select]
-				.iter()
-				.filter(|row| row.visible)
-				.count();
+				.partition_point(|row| {
+					row.source_index <= selected_source
+				})
+				.saturating_sub(1);
+			let visible_count = vec_draw_text_info.len();
 			let tree_height = r.height.saturating_sub(2) as usize;
 			self.tree.window_height.set(Some(tree_height));
 
 			self.scroll_top.set(ui::calc_scroll_top(
 				self.scroll_top.get(),
 				tree_height,
-				visible_selection,
+				select,
 			));
 
 			let items = vec_draw_text_info
 				.iter()
 				.enumerate()
+				.skip(self.scroll_top.get())
+				.take(tree_height)
 				.filter_map(|(index, draw_text_info)| {
 					Self::item_to_text(
 						&draw_text_info.name,
@@ -477,8 +474,7 @@ impl DrawableComponent for StatusTreeComponent {
 						self.show_selection && select == index,
 						&self.theme,
 					)
-				})
-				.skip(self.scroll_top.get());
+				});
 
 			ui::draw_list(
 				f,
@@ -489,8 +485,8 @@ impl DrawableComponent for StatusTreeComponent {
 				&self.theme,
 			);
 
-			if self.focused && *visible_count > tree_height {
-				let max_top = *visible_count - tree_height;
+			if self.focused && visible_count > tree_height {
+				let max_top = visible_count - tree_height;
 				draw_scrollbar(
 					f,
 					r,
@@ -709,6 +705,66 @@ mod tests {
 				status: StatusItemType::Modified,
 			})
 			.collect::<Vec<_>>()
+	}
+
+	#[test]
+	fn deep_viewport_uses_visible_cache_and_keeps_selected_row() {
+		let env = Environment::test_env();
+		let mut component =
+			StatusTreeComponent::new(&env, "files", true);
+		let items: Vec<_> = (0..1000)
+			.map(|i| StatusItem {
+				path: format!("file_{i:04}"),
+				status: StatusItemType::Modified,
+			})
+			.collect();
+		component.update(&items).unwrap();
+		component.visible = true;
+		component.tree.selection = Some(995);
+		let mut terminal = ratatui::Terminal::new(
+			ratatui::backend::TestBackend::new(30, 5),
+		)
+		.unwrap();
+		terminal
+			.draw(|frame| {
+				component.draw(frame, Rect::new(0, 0, 30, 5)).unwrap()
+			})
+			.unwrap();
+		assert_eq!(component.scroll_top.get(), 993);
+		let buffer = terminal.backend().buffer();
+		let row: String =
+			(0..30).map(|x| buffer[(x, 3)].symbol()).collect();
+		assert!(row.contains("file_0995"));
+		assert!(component
+			.draw_cache
+			.borrow()
+			.as_ref()
+			.unwrap()
+			.iter()
+			.all(|row| row.visible));
+	}
+
+	#[test]
+	fn folded_cache_excludes_hidden_children_and_maps_source_selection(
+	) {
+		let env = Environment::test_env();
+		let mut component =
+			StatusTreeComponent::new(&env, "files", true);
+		component
+			.update(&string_vec_to_status(&[
+				"a/b/one", "a/b/two", "c/one", "c/two",
+			]))
+			.unwrap();
+		component.move_selection(MoveSelection::Left);
+		component.move_selection(MoveSelection::Down);
+		let rows = component.build_vec_text_draw_info_for_drawing();
+		assert!(rows.iter().all(|row| row.visible));
+		let source = component.tree.selection.unwrap();
+		let selected = rows
+			.partition_point(|row| row.source_index <= source)
+			.saturating_sub(1);
+		assert_eq!(rows[selected].name, "c");
+		assert_eq!(selected, 1);
 	}
 
 	#[test]

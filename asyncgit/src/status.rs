@@ -251,6 +251,26 @@ impl AsyncStatusPair {
 		&self,
 		config: Option<ShowUntrackedFilesConfig>,
 	) -> Result<()> {
+		let repo = self.repo.clone();
+		self.fetch_with(config, move |config| {
+			sync::status::get_status_split(&repo, config).map(
+				|(staged, workdir)| StatusPair {
+					staged: staged.into(),
+					workdir: workdir.into(),
+				},
+			)
+		})
+	}
+
+	fn fetch_with(
+		&self,
+		config: Option<ShowUntrackedFilesConfig>,
+		mut scan: impl FnMut(
+				Option<ShowUntrackedFilesConfig>,
+			) -> Result<StatusPair>
+			+ Send
+			+ 'static,
+	) -> Result<()> {
 		*self.latest_config.lock()? = config;
 		self.request_generation.fetch_add(1, Ordering::Release);
 
@@ -266,7 +286,6 @@ impl AsyncStatusPair {
 		{
 			return Ok(());
 		}
-		let repo = self.repo.clone();
 		let last = Arc::clone(&self.last);
 		let pending = Arc::clone(&self.pending);
 		let request_generation = Arc::clone(&self.request_generation);
@@ -279,17 +298,15 @@ impl AsyncStatusPair {
 					request_generation.load(Ordering::Acquire);
 				let config =
 					latest_config.lock().map_or(None, |c| *c);
-				let result =
-					sync::status::get_status_split(&repo, config)
-						.map(|(staged, workdir)| StatusPair {
-							staged: staged.into(),
-							workdir: workdir.into(),
-						});
+				let result = scan(config);
 
-				// If another request arrived during the scan, discard this
-				// snapshot and immediately scan the latest repository state.
-				if request_generation.load(Ordering::Acquire)
-					!= generation
+				// Polls can arrive faster than a large repository can be
+				// scanned. Publish each completed snapshot before rerunning;
+				// only a changed configuration makes it unsuitable to show.
+				let current_config = latest_config.lock().ok();
+				if current_config
+					.as_deref()
+					.is_some_and(|latest| *latest != config)
 				{
 					continue;
 				}
@@ -308,29 +325,26 @@ impl AsyncStatusPair {
 						false
 					}
 				};
-				let _ = sender.send(if changed {
-					AsyncGitNotification::StatusPairChanged
-				} else {
-					AsyncGitNotification::StatusPairUnchanged
-				});
-
+				drop(current_config);
 				pending.store(0, Ordering::Release);
-				if request_generation.load(Ordering::Acquire)
-					== generation
-				{
-					break;
-				}
 				// Close the race with fetch(): either this worker claims the
 				// rerun, or fetch() already started a replacement worker.
-				if pending
+				let rerun = request_generation
+					.load(Ordering::Acquire)
+					!= generation && pending
 					.compare_exchange(
 						0,
 						1,
 						Ordering::AcqRel,
 						Ordering::Acquire,
 					)
-					.is_err()
-				{
+					.is_ok();
+				let _ = sender.send(if changed {
+					AsyncGitNotification::StatusPairChanged
+				} else {
+					AsyncGitNotification::StatusPairUnchanged
+				});
+				if !rerun {
 					break;
 				}
 			}
@@ -341,10 +355,91 @@ impl AsyncStatusPair {
 
 #[cfg(test)]
 mod tests {
-	use super::AsyncStatusPair;
+	use super::{AsyncStatusPair, StatusPair};
 	use crate::sync::{RepoPath, ShowUntrackedFilesConfig};
+	use crate::{StatusItem, StatusItemType};
 	use crossbeam_channel::unbounded;
 	use std::{fs, time::Duration};
+
+	#[test]
+	fn poll_during_scan_publishes_before_rerun() {
+		let (sender, receiver) = unbounded();
+		let (started_tx, started_rx) = unbounded();
+		let (release_tx, release_rx) = unbounded();
+		let status =
+			AsyncStatusPair::new(RepoPath::from("."), sender);
+		let mut count = 0;
+		status
+			.fetch_with(None, move |_| {
+				started_tx.send(count).unwrap();
+				release_rx
+					.recv_timeout(Duration::from_secs(5))
+					.unwrap();
+				let result = StatusPair {
+					workdir: vec![StatusItem {
+						path: count.to_string(),
+						status: StatusItemType::New,
+					}]
+					.into(),
+					..StatusPair::default()
+				};
+				count += 1;
+				Ok(result)
+			})
+			.unwrap();
+		assert_eq!(
+			started_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+			0
+		);
+		status.fetch(None).unwrap();
+		release_tx.send(()).unwrap();
+		assert_eq!(
+			started_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+			1
+		);
+		// The second scan is still blocked: the first must already be usable.
+		let first = status.last().unwrap();
+		release_tx.send(()).unwrap();
+		assert_eq!(first.workdir[0].path, "0");
+		receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+		receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+		assert_eq!(status.last().unwrap().workdir[0].path, "1");
+		assert!(!status.is_pending());
+	}
+
+	#[test]
+	fn changed_config_discards_inflight_snapshot() {
+		let (sender, receiver) = unbounded();
+		let (started_tx, started_rx) = unbounded();
+		let (release_tx, release_rx) = unbounded();
+		let status =
+			AsyncStatusPair::new(RepoPath::from("."), sender);
+		status
+			.fetch_with(
+				Some(ShowUntrackedFilesConfig::No),
+				move |config| {
+					started_tx.send(config).unwrap();
+					release_rx
+						.recv_timeout(Duration::from_secs(5))
+						.unwrap();
+					Ok(StatusPair::default())
+				},
+			)
+			.unwrap();
+		started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+		status.fetch(Some(ShowUntrackedFilesConfig::All)).unwrap();
+		release_tx.send(()).unwrap();
+		assert!(
+			started_rx.recv_timeout(Duration::from_secs(5)).unwrap()
+				== Some(ShowUntrackedFilesConfig::All)
+		);
+		let unpublished = status.last.lock().unwrap().is_none();
+		let notification = receiver.try_recv();
+		release_tx.send(()).unwrap();
+		assert!(unpublished);
+		assert!(notification.is_err());
+		receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+	}
 
 	#[test]
 	fn pending_fetch_uses_latest_request() {
