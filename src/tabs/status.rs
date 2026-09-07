@@ -667,15 +667,18 @@ impl Status {
 				self.right_pane = RightPane::File;
 				self.sync_right_focus();
 				if needs_load {
-					self.file_preview.clear();
+					// Keep the current preview in place while checking the
+					// latest bytes. SyntaxTextComponent compares the content
+					// hash first, so an unchanged periodic refresh neither
+					// rebuilds the image state nor restarts bat highlighting.
 					self.file_preview
 						.load_status_file(path, is_stage);
 					self.preview_key = Some(preview_key);
 				}
 
-				// Retain the existing async diff request as a cheap content
-				// change detector. A changed result reloads the full preview,
-				// but the patch itself is never shown for a new file.
+				// Retain the existing async diff request as a content-change
+				// poll. Its periodic notification re-reads the file, while the
+				// content hash above suppresses unchanged work.
 				let _ = self.git_diff.request(diff_params)?;
 				return Ok(());
 			}

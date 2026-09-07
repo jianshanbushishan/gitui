@@ -30,7 +30,6 @@ use ratatui::{
 	widgets::{Block, Borders, Wrap},
 	Frame,
 };
-use ratatui_image::{protocol::StatefulProtocol, StatefulImage};
 use std::{
 	borrow::Cow,
 	cell::{Cell, RefCell},
@@ -49,6 +48,7 @@ pub struct SyntaxTextComponent {
 	queue: Queue,
 	current_file: Option<(String, PreviewContent)>,
 	async_highlighting: AsyncSingleJob<AsyncSyntaxJob>,
+	image_preview: RefCell<ui::ImagePreview>,
 	syntax_progress: Option<ProgressPercent>,
 	key_config: SharedKeyConfig,
 	paragraph_state: RefCell<ParagraphState>,
@@ -75,7 +75,7 @@ pub struct SyntaxTextComponent {
 
 enum PreviewContent {
 	Text(Either<ui::SyntaxText, String>),
-	Image(RefCell<StatefulProtocol>),
+	Image,
 }
 
 impl SyntaxTextComponent {
@@ -85,6 +85,9 @@ impl SyntaxTextComponent {
 			async_highlighting: AsyncSingleJob::new(
 				env.sender_app.clone(),
 			),
+			image_preview: RefCell::new(ui::ImagePreview::new(
+				env.sender_app.clone(),
+			)),
 			syntax_progress: None,
 			current_file: None,
 			paragraph_state: RefCell::new(ParagraphState::default()),
@@ -146,10 +149,12 @@ impl SyntaxTextComponent {
 	///
 	pub fn any_work_pending(&self) -> bool {
 		self.async_highlighting.is_pending()
+			|| self.image_preview.borrow().is_pending()
 	}
 
 	///
 	pub fn clear(&mut self) {
+		self.image_preview.get_mut().clear();
 		self.current_file = None;
 		self.content_hash = None;
 		self.invalidate_content_caches();
@@ -195,7 +200,7 @@ impl SyntaxTextComponent {
 				PreviewContent::Text(Either::Right(s)) => {
 					Text::from(s.clone())
 				}
-				PreviewContent::Image(_) => Text::default(),
+				PreviewContent::Image => Text::default(),
 			},
 		);
 		if !self.search_query.is_empty() {
@@ -290,7 +295,7 @@ impl SyntaxTextComponent {
 						.map(ToString::to_string)
 						.collect::<Vec<_>>()
 						.into(),
-					PreviewContent::Image(_) => Arc::default(),
+					PreviewContent::Image => Arc::default(),
 				},
 			);
 		*self.source_lines_cache.borrow_mut() =
@@ -360,6 +365,7 @@ impl SyntaxTextComponent {
 		path: String,
 		content: ui::SyntaxText,
 	) {
+		self.image_preview.get_mut().clear();
 		self.async_highlighting.cancel();
 		self.syntax_progress = None;
 		self.current_file =
@@ -387,7 +393,11 @@ impl SyntaxTextComponent {
 	}
 
 	/// Load a file exactly as it exists in a commit tree.
-	pub fn load_commit_file(&mut self, path: String, commit: CommitId) {
+	pub fn load_commit_file(
+		&mut self,
+		path: String,
+		commit: CommitId,
+	) {
 		let result = {
 			let repo = self.repo.borrow();
 			sync::commit_file_bytes(&repo, commit, Path::new(&path))
@@ -435,13 +445,11 @@ impl SyntaxTextComponent {
 			return;
 		}
 
-		if let Ok(image) = ui::image_protocol(bytes) {
+		if ui::is_image(bytes) {
 			self.async_highlighting.cancel();
 			self.syntax_progress = None;
-			self.current_file = Some((
-				path,
-				PreviewContent::Image(RefCell::new(image)),
-			));
+			self.image_preview.get_mut().set(bytes, content_hash);
+			self.current_file = Some((path, PreviewContent::Image));
 			self.invalidate_content_caches();
 			self.reset_search();
 			self.content_hash = Some(content_hash);
@@ -465,6 +473,7 @@ impl SyntaxTextComponent {
 	}
 
 	fn load_source(&mut self, path: String, content: String) {
+		self.image_preview.get_mut().clear();
 		self.invalidate_content_caches();
 		self.reset_search();
 		self.syntax_progress = Some(ProgressPercent::empty());
@@ -491,6 +500,7 @@ impl SyntaxTextComponent {
 	}
 
 	fn load_error(&mut self, path: String, message: String) {
+		self.image_preview.get_mut().clear();
 		self.async_highlighting.cancel();
 		self.syntax_progress = None;
 		self.current_file = Some((
@@ -504,7 +514,7 @@ impl SyntaxTextComponent {
 
 	fn is_image(&self) -> bool {
 		self.current_file.as_ref().is_some_and(|(_, content)| {
-			matches!(content, PreviewContent::Image(_))
+			matches!(content, PreviewContent::Image)
 		})
 	}
 
@@ -575,22 +585,12 @@ impl DrawableComponent for SyntaxTextComponent {
 			.borders(Borders::ALL)
 			.border_style(self.theme.title(self.focused()));
 
-		if let Some((_, PreviewContent::Image(image))) =
-			self.current_file.as_ref()
-		{
+		if self.is_image() {
 			let inner = block.inner(area);
 			f.render_widget(block, area);
-			let mut image = image.borrow_mut();
-			f.render_stateful_widget(
-				StatefulImage::default(),
-				inner,
-				&mut *image,
-			);
-			if let Some(Err(error)) = image.last_encoding_result() {
-				log::error!(
-					"terminal image rendering failed: {error}"
-				);
-			}
+			self.image_preview
+				.borrow_mut()
+				.render(inner, f.buffer_mut());
 			return Ok(());
 		}
 
@@ -851,25 +851,56 @@ mod tests {
 
 		let env = Environment::test_env();
 		let mut component = SyntaxTextComponent::new(&env);
-		component.load_bytes(
-			"preview.png".to_string(),
-			encoded.get_ref(),
-		);
+		component
+			.load_bytes("preview.png".to_string(), encoded.get_ref());
 		assert!(component.is_image());
 
 		let backend = TestBackend::new(20, 10);
 		let mut terminal = Terminal::new(backend).unwrap();
-		terminal
-			.draw(|frame| {
-				component.draw(frame, frame.area()).unwrap();
-			})
-			.unwrap();
+		let deadline = std::time::Instant::now()
+			+ std::time::Duration::from_secs(10);
+		loop {
+			terminal
+				.draw(|frame| {
+					component.draw(frame, frame.area()).unwrap();
+				})
+				.unwrap();
+			if terminal.backend().buffer().content.iter().any(
+				|cell| {
+					cell.bg
+						== ratatui::style::Color::Rgb(20, 120, 220)
+				},
+			) {
+				break;
+			}
+			assert!(std::time::Instant::now() < deadline);
+			std::thread::sleep(std::time::Duration::from_millis(5));
+		}
 
 		assert!(terminal
 			.backend()
 			.buffer()
 			.content
 			.iter()
-			.any(|cell| cell.symbol().contains('\u{2580}')));
+			.any(|cell| cell.bg
+				== ratatui::style::Color::Rgb(20, 120, 220)));
+	}
+
+	#[test]
+	fn identical_content_does_not_invalidate_preview() {
+		let env = Environment::test_env();
+		let mut component = SyntaxTextComponent::new(&env);
+		component.load_bytes(
+			"preview.rs".to_string(),
+			b"fn unchanged() {}\n",
+		);
+		let generation = component.render_generation.get();
+
+		component.load_bytes(
+			"preview.rs".to_string(),
+			b"fn unchanged() {}\n",
+		);
+
+		assert_eq!(component.render_generation.get(), generation);
 	}
 }

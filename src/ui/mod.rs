@@ -8,7 +8,7 @@ mod syntax_text;
 
 use filetreelist::MoveSelection;
 pub use image::{
-	init_terminal_image_support, protocol as image_protocol,
+	init_terminal_image_support, is_image, ImagePreview,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 pub use scrollbar::{draw_scrollbar, Orientation};

@@ -144,6 +144,8 @@ pub enum AsyncAppNotification {
 	FuzzyFind,
 	/// A file-content search completed.
 	ContentSearch,
+	/// A background image preview is ready to render.
+	ImagePreview,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
