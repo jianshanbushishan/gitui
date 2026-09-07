@@ -21,11 +21,16 @@
 
 <h5 align="center">GitUI provides you with the comfort of a git GUI but right in your terminal</h1>
 
+> [!NOTE]
+> **This is a personal fork** of [gitui](https://github.com/gitui-org/gitui) (maintained by [@jianshanbushishan](https://github.com/jianshanbushishan), regularly merged with upstream `master`).
+> On top of upstream it adds `delta`-powered diffs, `bat`/`eza` file previews, inline image previews, in-file content search, large-repo performance work, and many UX refinements — see [Fork Enhancements](#fork-enhancements) for the full list.
+
 ![](demo.gif)
 
 ## <a name="table-of-contents"></a> Table of Contents
 
 1. [Features](#features)
+   - [Fork Enhancements over upstream](#fork-enhancements)
 2. [Motivation](#motivation)
 3. [Benchmarks](#bench)
 4. [Roadmap](#roadmap)
@@ -55,6 +60,84 @@
 - Async git API for fluid control
 - Submodule support
 - gpg commit signing with shortcomings (see [#97](https://github.com/gitui-org/gitui/issues/97)))
+
+### <a name="fork-enhancements"></a> Fork Enhancements <small><sup>[Top ▲](#table-of-contents)</sup></small>
+
+Everything in this section is added or changed on top of upstream gitui (the fork is regularly merged with upstream `master`). Detailed per-release notes live in [CHANGELOG.md](./CHANGELOG.md).
+
+#### Delta-powered diffs
+
+- Diffs are rendered by [delta](https://github.com/dandavison/delta) when it is on `PATH` — **delta side-by-side is the default diff mode**, and `Alt+P` cycles between it and the built-in unified view (toggling into delta without the binary installed shows a hint to install it).
+- In the unified diff view, `0` and `$` jump to the start/end of the (potentially long) diff line, and line numbers are shown.
+- Delta rendering is async with an LRU cache and request dedupe; same-file stage/unstage re-renders synchronously, so the cursor never jumps and the view never flickers or shows stale content after staging hunks/lines.
+- All gitui workflows work inside the delta preview: stage/unstage hunk & lines, reset hunk, per-file `(+added -deleted)` line counters in the diff title, and correct rendering of deleted files.
+- Line wrapping, background highlighting and horizontal scrolling behave correctly in both delta modes, including CJK/double-width characters (wrapping uses unicode display width, not char count).
+- delta (and bat) previews follow the **OS light/dark theme**, detected once at startup (on Windows via the `AppsUseLightTheme` registry key), so gitui's piped delta/bat output matches direct terminal runs.
+
+#### File previews: bat, eza, images, in-content search
+
+- File previews are syntax-highlighted by [bat](https://github.com/sharkdp/bat) when available (ANSI output rendered through gitui's own pipeline, `$BAT_THEME` respected), falling back to the built-in syntect highlighter — including bat line numbers in the file-history preview, and no plain-text flash before the highlighted result.
+- **Images render inline** in preview panes via [ratatui-image](https://github.com/benjajaja/ratatui-image) terminal image protocols; newly added files are previewed at full content, including images. Image encoding runs on a background thread.
+- Focusing a folder shows a directory listing (`eza`, falling back to `ls`) — as a depth-limited tree, configurable via `preview_tree_depth`.
+- Press `f` while the preview pane is focused to **search within the file content** and jump between matches.
+- bat's 256-color syntax output is expanded to exact RGB values so previews match direct bat output (notably on Windows), and external-tool discovery honors Windows `PATHEXT` (e.g. scoop's `bat.exe`).
+
+#### Editor integration
+
+- `e` opens the external editor **at the source line under the cursor** (`nvim +42 src/main.rs`) — in the status diff, inspect-commit, compare-commits and file-history views.
+- `e` (edit file) and `c` (commit) also work while a diff pane is focused, not just from the file tree.
+- Windows fixes: backslashes in configured editor paths are preserved, and the `VISUAL` environment variable is honored.
+
+#### Status tab
+
+- The Staged and Unstaged panes show live `(+N -M)` line-stat totals, and the Unstaged pane also shows the current branch with ahead/behind counts, on their top borders. The stats are computed off the UI thread via a single bulk diff.
+- The commit popup accepts `Shift+Enter`/`Alt+Enter` as newline (in addition to the configured `newline` key) and **persists the message draft and cursor position** across sessions and restarts (per-repo).
+- Pushing (branches and tags) and stash apply ask for confirmation first.
+
+#### Revlog & commit details
+
+- Commit details has a 3-way focus cycle `Info → Message → Files`; `y` copies the commit hash, the full commit message, or the whole author/date/sha/tags block, depending on which pane is focused.
+- The Info pane is focusable with its own scrollbar and shows tags inline on one line; the author column keeps a stable fixed width; focused Files/Message panes show scrollbars when content overflows.
+- Log search: `Ctrl+N`/`Ctrl+P` jump between matches with viewport centering, `j`/`k`/`g`/`G` move freely instead of being locked to matches, and the search status shows the cursor's position in the match range. Filename search is disabled by default for speed, and per-thread mailmap caching speeds up huge/NFS repositories.
+
+#### Copy popup
+
+- `Shift+Y` opens a copy popup that offers copying the file path or the **entire file content** (from the working tree in the Status tab, or from the selected revision in the files tree), with a labeled confirmation popup showing what was copied.
+
+#### Performance (large repositories)
+
+Tuned on giant working trees such as Unreal Engine projects:
+
+- Status refreshes are coalesced and remote-progress notifications throttled, keeping the UI responsive during fetch/push.
+- Line stats, log search and image encoding are moved off the UI thread; revlog and preview layout/rendering are cached.
+- Fixed a stage/unstage hang and slow staging on large repos; commit search caches mailmap per thread.
+
+#### Windows & CJK robustness
+
+- Wide (CJK/emoji) graphemes no longer visually overflow popup borders, truncate wrapped delta lines, or break layout — a class of fixes across the diff view and popups.
+- OS-theme detection for bat/delta, `PATHEXT`-aware tool discovery and true-color output as described above.
+
+#### New configuration options
+
+In the global `config.ron` (all optional):
+
+```ron
+(
+    // left-pane width of the Status tab split, in percent
+    status_left_ratio: Some(30),
+    // left-pane width of the Revlog/Stash list split, in percent
+    log_left_ratio: Some(30),
+    // left-pane width of commit-details file/message split, in percent
+    detail_left_ratio: Some(50),
+    // recursion depth of the folder tree preview (default 2, clamped to [1, 10])
+    preview_tree_depth: Some(3),
+)
+```
+
+#### Miscellaneous
+
+- The binary version string is derived from `git describe` and refreshes on every commit/checkout/tag.
+- Dependency stack kept ahead of upstream: `git2` 0.21, `gix` 0.86, ratatui 0.30.
 
 ## 2. <a name="motivation"></a> Motivation <small><sup>[Top ▲](#table-of-contents)</sup></small>
 
