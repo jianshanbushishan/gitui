@@ -35,17 +35,23 @@ pub struct Theme {
 	branch_fg: Color,
 	line_break: String,
 	block_title_focused: Color,
+	#[serde(default = "Theme::default_focused_border")]
+	block_border_focused: Color,
 	syntax: String,
 }
 
 impl Theme {
+	const fn default_focused_border() -> Color {
+		Color::Cyan
+	}
+
 	pub fn scroll_bar_pos(&self) -> Style {
 		Style::default().fg(self.selection_bg)
 	}
 
 	pub fn block(&self, focus: bool) -> Style {
 		if focus {
-			Style::default()
+			Style::default().fg(self.block_border_focused)
 		} else {
 			Style::default().fg(self.disabled_fg)
 		}
@@ -328,7 +334,7 @@ impl Theme {
 impl Default for Theme {
 	fn default() -> Self {
 		Self {
-			selected_tab: Color::Reset,
+			selected_tab: Color::Cyan,
 			command_fg: Color::White,
 			selection_bg: Color::Blue,
 			selection_fg: Color::White,
@@ -351,6 +357,7 @@ impl Default for Theme {
 			branch_fg: Color::LightYellow,
 			line_break: "¶".to_string(),
 			block_title_focused: Color::Reset,
+			block_border_focused: Self::default_focused_border(),
 			// Available themes can be found in:
 			// [ThemeSet::load_defaults function](https://github.com/trishume/syntect/blob/7fe13c0fd53cdfa0f9fea1aa14c5ba37f81d8b71/src/dumps.rs#L215).
 			syntax: DEFAULT_SYNTAX_THEME.to_string(),

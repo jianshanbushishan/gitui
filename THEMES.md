@@ -34,6 +34,21 @@ Notes:
 * valid colors can be found in ratatui's [Color](https://docs.rs/ratatui/latest/ratatui/style/enum.Color.html) struct.
 * all customizable theme elements can be found in [`style.rs` in the `impl Default for Theme` block](https://github.com/gitui-org/gitui/blob/master/src/ui/style.rs#L305)
 
+## Tab and Pane Focus Colors
+
+The active tab keeps its underline and uses cyan by default. The focused pane's
+border also uses cyan, making keyboard focus visible in multi-pane layouts.
+Override these colors independently in `theme.ron`:
+
+```ron
+(
+    selected_tab: Some("Cyan"),
+    block_border_focused: Some("Cyan"),
+)
+```
+
+`block_title_focused` controls the focused pane's title color separately.
+
 ## Preset Themes
 
 You can find preset themes by Catppuccin [here](https://github.com/catppuccin/gitui.git).

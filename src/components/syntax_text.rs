@@ -619,9 +619,12 @@ impl DrawableComponent for SyntaxTextComponent {
 				.unwrap_or_default()
 		);
 		let block = Block::default()
-			.title(title)
+			.title(Span::styled(
+				title,
+				self.theme.title(self.focused()),
+			))
 			.borders(Borders::ALL)
-			.border_style(self.theme.title(self.focused()));
+			.border_style(self.theme.block(self.focused()));
 
 		if self.is_image() {
 			let inner = block.inner(area);
