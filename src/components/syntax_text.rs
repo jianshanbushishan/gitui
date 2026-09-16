@@ -847,7 +847,7 @@ impl Component for SyntaxTextComponent {
 		&mut self,
 		event: &crossterm::event::Event,
 	) -> Result<EventState> {
-		if self.is_image() {
+		if !self.focused() || self.is_image() {
 			return Ok(EventState::NotConsumed);
 		}
 		if let Event::Key(key) = event {
@@ -895,10 +895,63 @@ mod tests {
 		highlight_search, set_active_match_line, PreviewContent,
 		SyntaxTextComponent,
 	};
-	use crate::{app::Environment, components::DrawableComponent};
+	use crate::{
+		app::Environment,
+		components::{Component, DrawableComponent},
+	};
+	use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 	use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
 	use ratatui::{backend::TestBackend, Terminal};
 	use std::io::Cursor;
+
+	#[test]
+	fn preview_navigation_requires_focus() {
+		let env = Environment::test_env();
+		let mut component = SyntaxTextComponent::new(&env);
+		component.load_text(
+			"new.txt".into(),
+			crate::ui::SyntaxText::from_ansi(
+				(0..100)
+					.map(|i| {
+						ratatui::text::Line::from(format!("line {i}"))
+					})
+					.collect(),
+				"new.txt".into(),
+			),
+		);
+		let mut terminal =
+			Terminal::new(TestBackend::new(40, 10)).unwrap();
+		terminal
+			.draw(|frame| {
+				component.draw(frame, frame.area()).unwrap()
+			})
+			.unwrap();
+
+		for key in [
+			KeyCode::Down,
+			KeyCode::Up,
+			KeyCode::PageDown,
+			KeyCode::PageUp,
+			KeyCode::End,
+			KeyCode::Home,
+		] {
+			let event =
+				Event::Key(KeyEvent::new(key, KeyModifiers::empty()));
+			assert!(component.set_scroll(10));
+			for focused in [false, true, false] {
+				component.focus(focused);
+				let before =
+					component.paragraph_state.borrow().scroll().y;
+				assert_eq!(
+					component.event(&event).unwrap().is_consumed(),
+					focused
+				);
+				let after =
+					component.paragraph_state.borrow().scroll().y;
+				assert_eq!(before != after, focused);
+			}
+		}
+	}
 
 	#[test]
 	fn unicode_case_matches_map_to_original_utf8_boundaries() {
