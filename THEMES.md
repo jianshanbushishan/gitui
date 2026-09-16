@@ -37,13 +37,14 @@ Notes:
 ## Tab and Pane Focus Colors
 
 The active tab keeps its underline and uses cyan by default. The focused pane's
-border also uses cyan, making keyboard focus visible in multi-pane layouts.
+border and bold title also use cyan, making keyboard focus visible in multi-pane layouts.
 Override these colors independently in `theme.ron`:
 
 ```ron
 (
     selected_tab: Some("Cyan"),
     block_border_focused: Some("Cyan"),
+    block_title_focused: Some("Cyan"),
 )
 ```
 

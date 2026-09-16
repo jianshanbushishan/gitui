@@ -356,7 +356,7 @@ impl Default for Theme {
 			tag_fg: Color::LightMagenta,
 			branch_fg: Color::LightYellow,
 			line_break: "¶".to_string(),
-			block_title_focused: Color::Reset,
+			block_title_focused: Color::Cyan,
 			block_border_focused: Self::default_focused_border(),
 			// Available themes can be found in:
 			// [ThemeSet::load_defaults function](https://github.com/trishume/syntect/blob/7fe13c0fd53cdfa0f9fea1aa14c5ba37f81d8b71/src/dumps.rs#L215).
