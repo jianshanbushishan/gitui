@@ -40,6 +40,11 @@ thiserror = "2.0"
 unicode-truncate = "2.0"
 url = "2.5"
 
+[target.'cfg(windows)'.dependencies]
+# WinCNG lacks Curve25519 and disables ECDH by default, preventing SSH
+# connections to servers that only offer modern elliptic-curve key exchange.
+libssh2-sys = { version = "0.3.2", features = ["openssl-on-win32"] }
+
 [dev-dependencies]
 env_logger = "0.11"
 invalidstring = { path = "../invalidstring", version = "0.1" }

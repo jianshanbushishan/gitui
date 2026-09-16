@@ -126,6 +126,7 @@ dependencies = [
  "git2-hooks",
  "gix",
  "invalidstring",
+ "libssh2-sys",
  "log",
  "openssl-sys",
  "pretty_assertions",

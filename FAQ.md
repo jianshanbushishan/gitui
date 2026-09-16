@@ -15,6 +15,16 @@ See Github's excellent documentation for [Adding your SSH Key to the ssh-agent](
 
 Note that in some cases adding the line `ssh-add -K ~/.ssh/id_ed25519`(or whatever your key is called) to your bash init script is necessary too to survive restarts.
 
+GitUI tries the SSH agent first, then the default private keys `~/.ssh/id_ed25519`,
+`~/.ssh/id_ecdsa`, and `~/.ssh/id_rsa`. Encrypted keys and keys at custom paths
+should be loaded into the agent; GitUI does not read OpenSSH `IdentityFile` settings.
+An unreadable, encrypted, or malformed default key can stop authentication before
+later files are tried. Load the intended key into the agent in that case.
+
+On Windows, SSH uses OpenSSL for compatibility with servers requiring Curve25519
+or ECDH key exchange. The default build bundles OpenSSL. Builds that disable
+`vendor-openssl` need an installed OpenSSL development library.
+
 ## 2. <a name="keybindings"></a> Custom key bindings <small><sup>[Top ▲](#table-of-contents)</sup></small>
 
 If you want to use `vi`-style keys or customize your key bindings in any other fashion see the specific docs on that: [key config](./KEY_CONFIG.md)

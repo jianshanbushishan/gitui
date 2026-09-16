@@ -3,7 +3,7 @@ use crate::{error::Result, sync::cred::BasicAuthCredential};
 use crossbeam_channel::Sender;
 use git2::{Cred, Error as GitError, RemoteCallbacks};
 use std::sync::{
-	atomic::{AtomicBool, Ordering},
+	atomic::{AtomicBool, AtomicUsize, Ordering},
 	Arc, Mutex,
 };
 
@@ -13,6 +13,64 @@ pub struct CallbackStats {
 	pub push_rejected_msg: Option<(String, String)>,
 }
 
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn ssh_fallback_is_bounded_and_shared_between_clones() {
+		let home = tempfile::tempdir().unwrap();
+		let ssh = home.path().join(".ssh");
+		std::fs::create_dir(&ssh).unwrap();
+		// Credential construction is lazy; these files only test candidate selection.
+		std::fs::write(ssh.join("id_ed25519"), "test").unwrap();
+		std::fs::write(ssh.join("id_rsa"), "test").unwrap();
+		let callbacks = Callbacks::new(None, None);
+		// Simulate the agent credential having been rejected by libgit2.
+		callbacks.ssh_attempt.store(1, Ordering::Relaxed);
+		let clone = callbacks.clone();
+		assert!(callbacks
+			.ssh_credentials("git", Some(home.path()))
+			.is_ok());
+		assert_eq!(callbacks.ssh_attempt.load(Ordering::Relaxed), 2);
+		assert!(clone
+			.ssh_credentials("git", Some(home.path()))
+			.is_ok());
+		assert_eq!(callbacks.ssh_attempt.load(Ordering::Relaxed), 4);
+		assert!(callbacks
+			.ssh_credentials("git", Some(home.path()))
+			.is_err());
+		assert!(clone
+			.ssh_credentials("git", Some(home.path()))
+			.is_err());
+	}
+
+	#[test]
+	fn ssh_fallback_without_home_terminates() {
+		let callbacks = Callbacks::new(None, None);
+		callbacks.ssh_attempt.store(1, Ordering::Relaxed);
+		assert!(callbacks.ssh_credentials("git", None).is_err());
+	}
+
+	#[test]
+	fn password_credentials_are_not_retried() {
+		let callbacks = Callbacks::new(
+			None,
+			Some(BasicAuthCredential::new(
+				Some("user".into()),
+				Some("password".into()),
+			)),
+		);
+		let kind = git2::CredentialType::USER_PASS_PLAINTEXT;
+		assert!(callbacks
+			.credentials("https://example.com", None, kind)
+			.is_ok());
+		assert!(callbacks
+			.credentials("https://example.com", None, kind)
+			.is_err());
+	}
+}
+
 ///
 #[derive(Clone)]
 pub struct Callbacks {
@@ -20,6 +78,7 @@ pub struct Callbacks {
 	basic_credential: Option<BasicAuthCredential>,
 	stats: Arc<Mutex<CallbackStats>>,
 	first_call_to_credentials: Arc<AtomicBool>,
+	ssh_attempt: Arc<AtomicUsize>,
 }
 
 impl Callbacks {
@@ -37,6 +96,7 @@ impl Callbacks {
 			first_call_to_credentials: Arc::new(AtomicBool::new(
 				true,
 			)),
+			ssh_attempt: Arc::new(AtomicUsize::new(0)),
 		}
 	}
 
@@ -186,7 +246,19 @@ impl Callbacks {
 			"creds: '{url}' {username_from_url:?} ({allowed_types:?})",
 		);
 
-		// This boolean is used to avoid multiple calls to credentials callback.
+		if allowed_types.is_ssh_key() {
+			let username = username_from_url.ok_or_else(|| {
+				GitError::from_str(
+					"Couldn't extract username from url.",
+				)
+			})?;
+			return self.ssh_credentials(
+				username,
+				dirs::home_dir().as_deref(),
+			);
+		}
+
+		// Password credentials are tried only once to avoid retry loops.
 		if self.first_call_to_credentials.load(Ordering::Relaxed) {
 			self.first_call_to_credentials
 				.store(false, Ordering::Relaxed);
@@ -195,15 +267,6 @@ impl Callbacks {
 		}
 
 		match &self.basic_credential {
-			_ if allowed_types.is_ssh_key() => username_from_url
-				.map_or_else(
-					|| {
-						Err(GitError::from_str(
-							" Couldn't extract username from url.",
-						))
-					},
-					Cred::ssh_key_from_agent,
-				),
 			Some(BasicAuthCredential {
 				username: Some(user),
 				password: Some(pwd),
@@ -216,6 +279,43 @@ impl Callbacks {
 			}) if allowed_types.is_username() => Cred::username(user),
 			_ if allowed_types.is_default() => Cred::default(),
 			_ => Err(GitError::from_str("Couldn't find credentials")),
+		}
+	}
+
+	fn ssh_credentials(
+		&self,
+		username: &str,
+		home: Option<&std::path::Path>,
+	) -> std::result::Result<Cred, GitError> {
+		const KEYS: [&str; 3] = ["id_ed25519", "id_ecdsa", "id_rsa"];
+		loop {
+			let attempt =
+				self.ssh_attempt.fetch_add(1, Ordering::Relaxed);
+			if attempt == 0 {
+				if let Ok(cred) = Cred::ssh_key_from_agent(username) {
+					return Ok(cred);
+				}
+				continue;
+			}
+			let Some(key) = KEYS.get(attempt - 1) else {
+				return Err(GitError::from_str(
+					"SSH authentication failed. Load your key into ssh-agent; default keys in ~/.ssh were also tried.",
+				));
+			};
+			if let Some(home) = home {
+				let private_key = home.join(".ssh").join(key);
+				if private_key.is_file() {
+					// libssh2 derives the public key; encrypted keys still need an agent.
+					if let Ok(cred) = Cred::ssh_key(
+						username,
+						None,
+						&private_key,
+						None,
+					) {
+						return Ok(cred);
+					}
+				}
+			}
 		}
 	}
 }
