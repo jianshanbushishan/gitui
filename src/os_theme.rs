@@ -1,8 +1,8 @@
 //! Process-wide detection of the external-tool color mode (`bat`, `delta`)
 //! based on the OS light/dark color scheme.
 //!
-//! At startup [`detect_color_scheme`] is queried (Windows only; on other
-//! platforms it returns [`ColorScheme::Unknown`]) and pinned via [`set`].
+//! At startup [`detect_color_scheme`] is queried on Windows and Linux
+//! and pinned via [`set`]. Unsupported platforms return Unknown.
 //! The `bat`/`delta` spawn sites then read it via [`get`]. The detected
 //! scheme must be passed explicitly because both tools normally see a pipe
 //! rather than the terminal when launched by gitui.
@@ -17,12 +17,18 @@ use std::sync::OnceLock;
 /// The OS color scheme as detected at launch.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ColorScheme {
-	// constructed only by the Windows-only detection below
-	#[cfg_attr(not(windows), allow(dead_code))]
+	// Constructed by the Windows and Linux detectors below.
+	#[cfg_attr(
+		not(any(windows, target_os = "linux")),
+		allow(dead_code)
+	)]
 	Light,
-	#[cfg_attr(not(windows), allow(dead_code))]
+	#[cfg_attr(
+		not(any(windows, target_os = "linux")),
+		allow(dead_code)
+	)]
 	Dark,
-	/// Detection is unavailable (non-Windows) or the value could not be
+	/// Detection is unavailable or the value could not be
 	/// read. Callers fall back to current behavior (no forced theme).
 	#[default]
 	Unknown,
@@ -69,8 +75,8 @@ pub fn get() -> ColorScheme {
 ///
 /// On Windows this reads the `AppsUseLightTheme` registry value, which
 /// Windows Terminal follows when its `theme` is set to `system` (the
-/// default). On other platforms, or if the value can't be read, this
-/// returns [`ColorScheme::Unknown`].
+/// default). Linux queries the desktop portal, then GNOME settings.
+/// Unsupported platforms or failed detection return [`ColorScheme::Unknown`].
 #[allow(clippy::missing_const_for_fn)]
 pub fn detect_color_scheme() -> ColorScheme {
 	#[cfg(windows)]
@@ -101,15 +107,136 @@ pub fn detect_color_scheme() -> ColorScheme {
 		ColorScheme::Unknown
 	}
 
-	#[cfg(not(windows))]
+	#[cfg(target_os = "linux")]
+	{
+		detect_linux_color_scheme()
+	}
+
+	#[cfg(not(any(windows, target_os = "linux")))]
 	{
 		ColorScheme::Unknown
 	}
 }
 
+/// Query only small settings responses, with a deadline so unavailable desktop
+/// services cannot indefinitely block startup (including over SSH).
+#[cfg(target_os = "linux")]
+fn settings_output(program: &str, args: &[&str]) -> Option<String> {
+	use std::{
+		process::{Command, Stdio},
+		time::{Duration, Instant},
+	};
+
+	let mut child = Command::new(program)
+		.args(args)
+		.stdin(Stdio::null())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::null())
+		.spawn()
+		.ok()?;
+	let deadline = Instant::now() + Duration::from_secs(1);
+	loop {
+		match child.try_wait() {
+			Ok(Some(status)) if status.success() => {
+				let output = child.wait_with_output().ok()?;
+				return String::from_utf8(output.stdout).ok();
+			}
+			Ok(Some(_)) => return None,
+			Ok(None) if Instant::now() < deadline => {
+				std::thread::sleep(Duration::from_millis(10));
+			}
+			_ => {
+				let _ = child.kill();
+				let _ = child.wait();
+				return None;
+			}
+		}
+	}
+}
+
+#[cfg(target_os = "linux")]
+fn parse_portal_scheme(output: &str) -> ColorScheme {
+	// Settings.Read wraps its variant result: busctl prints "v v u 2".
+	// Accept a single variant too, but reject unrelated/malformed values.
+	let words: Vec<_> = output.split_whitespace().collect();
+	match words.as_slice() {
+		["v", "v", "u", "1"] | ["v", "u", "1"] => ColorScheme::Dark,
+		["v", "v", "u", "2"] | ["v", "u", "2"] => ColorScheme::Light,
+		_ => ColorScheme::Unknown,
+	}
+}
+
+#[cfg(target_os = "linux")]
+fn parse_gsettings_scheme(output: &str) -> ColorScheme {
+	match output.trim() {
+		"'prefer-light'" => ColorScheme::Light,
+		"'prefer-dark'" => ColorScheme::Dark,
+		_ => ColorScheme::Unknown,
+	}
+}
+
+#[cfg(target_os = "linux")]
+fn detect_linux_color_scheme() -> ColorScheme {
+	let portal = settings_output(
+		"busctl",
+		&[
+			"--user",
+			"--timeout=1",
+			"call",
+			"org.freedesktop.portal.Desktop",
+			"/org/freedesktop/portal/desktop",
+			"org.freedesktop.portal.Settings",
+			"Read",
+			"ss",
+			"org.freedesktop.appearance",
+			"color-scheme",
+		],
+	)
+	.map_or(ColorScheme::Unknown, |s| parse_portal_scheme(&s));
+	if portal != ColorScheme::Unknown {
+		return portal;
+	}
+
+	settings_output(
+		"gsettings",
+		&["get", "org.gnome.desktop.interface", "color-scheme"],
+	)
+	.map_or(ColorScheme::Unknown, |s| parse_gsettings_scheme(&s))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::ColorScheme;
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn linux_settings_values() {
+		use super::{parse_gsettings_scheme, parse_portal_scheme};
+		for (text, expected) in [
+			("v v u 1", ColorScheme::Dark),
+			("v v u 2\n", ColorScheme::Light),
+			("v u 2", ColorScheme::Light),
+			("v v u 0", ColorScheme::Unknown),
+			("v v u 3", ColorScheme::Unknown),
+			("error 2", ColorScheme::Unknown),
+			("", ColorScheme::Unknown),
+		] {
+			assert_eq!(parse_portal_scheme(text), expected, "{text}");
+		}
+		for (text, expected) in [
+			("'prefer-light'\n", ColorScheme::Light),
+			("'prefer-dark'", ColorScheme::Dark),
+			("'default'", ColorScheme::Unknown),
+			("", ColorScheme::Unknown),
+			("'unexpected'", ColorScheme::Unknown),
+		] {
+			assert_eq!(
+				parse_gsettings_scheme(text),
+				expected,
+				"{text}"
+			);
+		}
+	}
 
 	#[test]
 	fn detected_scheme_maps_to_external_tool_modes() {
