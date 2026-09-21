@@ -82,6 +82,11 @@ impl StatusTreeComponent {
 		self.revision = revision;
 	}
 
+	#[cfg(test)]
+	pub(crate) const fn is_pending(&self) -> bool {
+		self.pending
+	}
+
 	///
 	pub fn update(&mut self, list: &[StatusItem]) -> Result<()> {
 		self.pending = false;

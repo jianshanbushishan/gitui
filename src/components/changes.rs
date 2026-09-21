@@ -71,6 +71,11 @@ impl ChangesComponent {
 		self.files.is_empty()
 	}
 
+	#[cfg(test)]
+	pub(crate) const fn is_pending(&self) -> bool {
+		self.files.is_pending()
+	}
+
 	///
 	pub fn is_file_selected(&self) -> bool {
 		self.files.is_file_selected()

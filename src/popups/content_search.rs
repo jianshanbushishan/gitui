@@ -446,6 +446,10 @@ impl Component for ContentSearchPopup {
 		self.visible
 	}
 
+	fn is_input_mode(&self) -> bool {
+		self.is_visible() && self.find_text.is_input_mode()
+	}
+
 	fn hide(&mut self) {
 		self.visible = false;
 		self.search_generation.fetch_add(1, Ordering::Relaxed);
@@ -518,4 +522,22 @@ fn substring_match_indices(
 /// with the original line so grapheme indices match up.
 fn line_graphmes_lower(graphemes: &[&str]) -> String {
 	graphemes.iter().map(|g| g.to_lowercase()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn input_mode_follows_popup_visibility() {
+		let env = Environment::test_env();
+		let mut popup = ContentSearchPopup::new(&env);
+
+		assert!(!popup.is_input_mode());
+		popup.open(Vec::new()).unwrap();
+		assert!(popup.is_input_mode());
+
+		popup.hide();
+		assert!(!popup.is_input_mode());
+	}
 }

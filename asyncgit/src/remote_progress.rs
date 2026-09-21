@@ -36,6 +36,12 @@ pub struct RemoteProgress {
 	pub state: RemoteProgressState,
 	///
 	pub progress: ProgressPercent,
+	/// objects handled in the current phase
+	pub current: usize,
+	/// total objects of the current phase (0 if unknown)
+	pub total: usize,
+	/// bytes transferred so far (push upload only)
+	pub bytes: Option<u64>,
 }
 
 impl RemoteProgress {
@@ -48,6 +54,9 @@ impl RemoteProgress {
 		Self {
 			state,
 			progress: ProgressPercent::new(current, total),
+			current,
+			total,
+			bytes: None,
 		}
 	}
 
@@ -146,12 +155,16 @@ impl From<ProgressNotification> for RemoteProgress {
 			ProgressNotification::PushTransfer {
 				current,
 				total,
-				..
-			} => Self::new(
-				RemoteProgressState::Pushing,
-				current,
-				total,
-			),
+				bytes,
+			} => {
+				let mut res = Self::new(
+					RemoteProgressState::Pushing,
+					current,
+					total,
+				);
+				res.bytes = Some(bytes as u64);
+				res
+			}
 			ProgressNotification::Transfer {
 				objects,
 				total_objects,

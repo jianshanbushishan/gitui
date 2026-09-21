@@ -102,6 +102,11 @@ impl Gitui {
 			{
 				if matches!(event, QueueEvent::SpinnerUpdate) {
 					spinner.update();
+					// keep the push popup alive (elapsed time,
+					// progress) even when git reports nothing
+					if self.app.is_push_in_progress() {
+						self.draw(terminal)?;
+					}
 					spinner.draw(terminal)?;
 					continue;
 				}

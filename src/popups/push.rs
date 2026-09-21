@@ -25,11 +25,12 @@ use asyncgit::{
 };
 use crossterm::event::Event;
 use ratatui::{
-	layout::Rect,
+	layout::{Alignment, Constraint, Layout, Rect},
 	text::Span,
-	widgets::{Block, BorderType, Borders, Clear, Gauge},
+	widgets::{Block, BorderType, Borders, Clear, Gauge, Paragraph},
 	Frame,
 };
+use std::time::Instant;
 
 ///
 #[derive(PartialEq, Eq)]
@@ -63,6 +64,7 @@ pub struct PushPopup {
 	theme: SharedTheme,
 	key_config: SharedKeyConfig,
 	input_cred: CredComponent,
+	start_time: Option<Instant>,
 }
 
 impl PushPopup {
@@ -84,6 +86,7 @@ impl PushPopup {
 			input_cred: CredComponent::new(env),
 			theme: env.theme.clone(),
 			key_config: env.key_config.clone(),
+			start_time: None,
 		}
 	}
 
@@ -105,6 +108,7 @@ impl PushPopup {
 		};
 
 		self.show()?;
+		self.start_time = None;
 
 		if need_username_password_for_push(&self.repo.borrow())? {
 			let cred = extract_username_password_for_push(
@@ -166,6 +170,7 @@ impl PushPopup {
 
 		self.pending = true;
 		self.progress = None;
+		self.start_time = Some(Instant::now());
 		self.git_push.request(PushRequest {
 			remote,
 			branch: self.branch.clone(),
@@ -200,6 +205,7 @@ impl PushPopup {
 					format!("push failed:\n{err}"),
 				));
 			}
+			self.start_time = None;
 			self.hide();
 		}
 
@@ -209,6 +215,11 @@ impl PushPopup {
 	///
 	pub const fn any_work_pending(&self) -> bool {
 		self.pending
+	}
+
+	/// a push is running right now (for ticker-driven redraws)
+	pub const fn is_active(&self) -> bool {
+		self.visible && self.pending
 	}
 
 	///
@@ -246,38 +257,158 @@ impl PushPopup {
 		}
 		.into()
 	}
+
+	fn elapsed_suffix(&self) -> String {
+		self.start_time
+			.map(|start| {
+				format!(" · {:.1}s", start.elapsed().as_secs_f32())
+			})
+			.unwrap_or_default()
+	}
+
+	fn gauge_content(&self) -> (String, u16) {
+		self.progress.as_ref().map_or_else(
+			|| (strings::PUSH_POPUP_PROGRESS_NONE.into(), 0),
+			|progress| {
+				// libgit2 reports no total while counting objects
+				let percent = if progress.total == 0
+					&& matches!(
+						progress.state,
+						RemoteProgressState::PackingAddingObject
+					) {
+					0
+				} else {
+					progress.get_progress_percent()
+				};
+				(
+					Self::progress_state_name(&progress.state),
+					u16::from(percent),
+				)
+			},
+		)
+	}
+
+	fn detail_line(&self) -> String {
+		self.progress.as_ref().map_or_else(
+			|| {
+				if self.start_time.is_some() {
+					format!("connecting{}", self.elapsed_suffix())
+				} else {
+					String::new()
+				}
+			},
+			|progress| {
+				if matches!(progress.state, RemoteProgressState::Done)
+				{
+					return format!("done{}", self.elapsed_suffix());
+				}
+
+				let counts = if progress.total > 0 {
+					format!(
+						"{}/{} objects",
+						group_digits(progress.current),
+						group_digits(progress.total)
+					)
+				} else {
+					format!(
+						"{} objects",
+						group_digits(progress.current)
+					)
+				};
+
+				let bytes =
+					progress.bytes.map_or_else(String::new, |b| {
+						format!(" · {}", format_bytes(b))
+					});
+
+				format!("{counts}{bytes}{}", self.elapsed_suffix())
+			},
+		)
+	}
+}
+
+fn group_digits(n: usize) -> String {
+	let s = n.to_string();
+	let mut out = String::with_capacity(s.len() + s.len() / 3);
+	for (i, c) in s.chars().enumerate() {
+		if i > 0 && (s.len() - i).is_multiple_of(3) {
+			out.push(',');
+		}
+		out.push(c);
+	}
+	out
+}
+
+fn format_bytes(bytes: u64) -> String {
+	const KB: u64 = 1024;
+	const MB: u64 = KB * KB;
+	const GB: u64 = MB * KB;
+
+	let (factor, unit) = if bytes >= GB {
+		(GB, "GB")
+	} else if bytes >= MB {
+		(MB, "MB")
+	} else if bytes >= KB {
+		(KB, "KB")
+	} else {
+		return format!("{bytes} B");
+	};
+
+	let tenths = bytes.saturating_mul(10) / factor;
+	let whole = tenths / 10;
+	let frac = tenths % 10;
+	format!("{whole}.{frac} {unit}")
 }
 
 impl DrawableComponent for PushPopup {
 	fn draw(&self, f: &mut Frame, rect: Rect) -> Result<()> {
 		if self.visible {
-			let (state, progress) =
-				Self::get_progress(self.progress.as_ref());
+			let (label, percent) = self.gauge_content();
+			let detail = self.detail_line();
 
-			let area = ui::centered_rect_absolute(30, 3, f.area());
+			let area = ui::centered_rect_absolute(50, 4, f.area());
 
+			let block = Block::default()
+				.title(Span::styled(
+					if self.modifier.force() {
+						strings::FORCE_PUSH_POPUP_MSG
+					} else {
+						strings::PUSH_POPUP_MSG
+					},
+					self.theme.title(true),
+				))
+				.borders(Borders::ALL)
+				.border_type(BorderType::Thick)
+				.border_style(self.theme.block(true));
+
+			let inner = block.inner(area);
 			f.render_widget(Clear, area);
+			f.render_widget(block, area);
+
+			let rows = Layout::default()
+				.constraints([
+					Constraint::Length(1),
+					Constraint::Length(1),
+				])
+				.split(inner);
+
 			f.render_widget(
 				Gauge::default()
-					.label(state.as_str())
-					.block(
-						Block::default()
-							.title(Span::styled(
-								if self.modifier.force() {
-									strings::FORCE_PUSH_POPUP_MSG
-								} else {
-									strings::PUSH_POPUP_MSG
-								},
-								self.theme.title(true),
-							))
-							.borders(Borders::ALL)
-							.border_type(BorderType::Thick)
-							.border_style(self.theme.block(true)),
-					)
+					.label(label)
 					.gauge_style(self.theme.push_gauge())
-					.percent(u16::from(progress)),
-				area,
+					.percent(percent),
+				rows[0],
 			);
+
+			f.render_widget(
+				Paragraph::new(Span::styled(
+					detail,
+					self.theme.text(true, false),
+				))
+				.alignment(Alignment::Center),
+				rows[1],
+			);
+
 			self.input_cred.draw(f, rect)?;
 		}
 
@@ -341,6 +472,10 @@ impl Component for PushPopup {
 		self.visible
 	}
 
+	fn is_input_mode(&self) -> bool {
+		self.input_cred.is_input_mode()
+	}
+
 	fn hide(&mut self) {
 		self.visible = false;
 	}
@@ -349,5 +484,26 @@ impl Component for PushPopup {
 		self.visible = true;
 
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn test_group_digits() {
+		assert_eq!(group_digits(0), "0");
+		assert_eq!(group_digits(999), "999");
+		assert_eq!(group_digits(1_000), "1,000");
+		assert_eq!(group_digits(12_345_678), "12,345,678");
+	}
+
+	#[test]
+	fn test_format_bytes() {
+		assert_eq!(format_bytes(512), "512 B");
+		assert_eq!(format_bytes(2_048), "2.0 KB");
+		assert_eq!(format_bytes(1_500_000), "1.4 MB");
+		assert_eq!(format_bytes(3_221_225_472), "3.0 GB");
 	}
 }

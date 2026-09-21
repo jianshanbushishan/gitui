@@ -281,6 +281,10 @@ impl Component for PullPopup {
 		self.visible
 	}
 
+	fn is_input_mode(&self) -> bool {
+		self.input_cred.is_input_mode()
+	}
+
 	fn hide(&mut self) {
 		self.visible = false;
 	}

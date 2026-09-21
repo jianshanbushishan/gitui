@@ -85,6 +85,10 @@ impl Component for GotoLinePopup {
 		self.visible
 	}
 
+	fn is_input_mode(&self) -> bool {
+		self.is_visible()
+	}
+
 	///
 	fn event(&mut self, event: &Event) -> Result<EventState> {
 		if self.is_visible() {
@@ -142,6 +146,24 @@ impl Component for GotoLinePopup {
 			return Ok(EventState::Consumed);
 		}
 		Ok(EventState::NotConsumed)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn input_mode_follows_popup_visibility() {
+		let env = Environment::test_env();
+		let mut popup = GotoLinePopup::new(&env);
+
+		assert!(!popup.is_input_mode());
+		popup.open(10);
+		assert!(popup.is_input_mode());
+
+		popup.visible = false;
+		assert!(!popup.is_input_mode());
 	}
 }
 

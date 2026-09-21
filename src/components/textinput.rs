@@ -770,6 +770,10 @@ impl Component for TextInputComponent {
 		self.textarea.is_some()
 	}
 
+	fn is_input_mode(&self) -> bool {
+		self.is_visible()
+	}
+
 	fn hide(&mut self) {
 		// Cache the cursor before dropping the textarea so callers
 		// can still read it via `cursor()` after hide (used to persist

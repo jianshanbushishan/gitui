@@ -8,6 +8,7 @@ use crate::{
 };
 use crossbeam_channel::Sender;
 use std::{
+	collections::VecDeque,
 	hash::Hash,
 	sync::{
 		atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -212,11 +213,78 @@ impl AsyncStatus {
 /// Asynchronously fetches both status panes in a single repository walk.
 pub struct AsyncStatusPair {
 	last: Arc<Mutex<Option<StatusPair>>>,
+	failures: Arc<Mutex<StatusPairFailures>>,
 	sender: Sender<AsyncGitNotification>,
 	pending: Arc<AtomicUsize>,
 	request_generation: Arc<AtomicU64>,
 	latest_config: Arc<Mutex<Option<ShowUntrackedFilesConfig>>>,
 	repo: RepoPath,
+}
+
+#[derive(Default)]
+struct StatusPairFailures {
+	/// The most recent error, used to suppress repeated UI messages until a
+	/// successful scan resets the failure streak.
+	current: Option<String>,
+	/// Error messages waiting for the corresponding failure notification to be
+	/// consumed. A duplicate has a `None` placeholder so rapidly completed
+	/// notifications cannot consume a later, different error message.
+	queued: VecDeque<Option<String>>,
+}
+
+#[derive(Copy, Clone)]
+enum StatusPairCompletion {
+	Changed,
+	Unchanged,
+	Failed,
+}
+
+fn format_error_chain(error: &crate::Error) -> String {
+	let mut message = error.to_string();
+	let mut source = std::error::Error::source(error);
+	while let Some(error) = source {
+		message.push_str("\nCaused by: ");
+		message.push_str(&error.to_string());
+		source = error.source();
+	}
+	message
+}
+
+fn store_status_pair_result(
+	result: Result<StatusPair>,
+	last: &Mutex<Option<StatusPair>>,
+	failures: &Mutex<StatusPairFailures>,
+) -> StatusPairCompletion {
+	match result {
+		Ok(result) => {
+			let changed = last.lock().is_ok_and(|mut last| {
+				let changed = last.as_ref() != Some(&result);
+				*last = Some(result);
+				changed
+			});
+			if let Ok(mut failures) = failures.lock() {
+				failures.current = None;
+			}
+			if changed {
+				StatusPairCompletion::Changed
+			} else {
+				StatusPairCompletion::Unchanged
+			}
+		}
+		Err(error) => {
+			let message = format_error_chain(&error);
+			log::error!("combined status fetch: {message}");
+			if let Ok(mut failures) = failures.lock() {
+				let is_new =
+					failures.current.as_ref() != Some(&message);
+				failures
+					.queued
+					.push_back(is_new.then(|| message.clone()));
+				failures.current = Some(message);
+			}
+			StatusPairCompletion::Failed
+		}
+	}
 }
 
 impl AsyncStatusPair {
@@ -227,6 +295,9 @@ impl AsyncStatusPair {
 	) -> Self {
 		Self {
 			last: Arc::new(Mutex::new(None)),
+			failures: Arc::new(Mutex::new(
+				StatusPairFailures::default(),
+			)),
 			sender,
 			pending: Arc::new(AtomicUsize::new(0)),
 			request_generation: Arc::new(AtomicU64::new(0)),
@@ -238,6 +309,14 @@ impl AsyncStatusPair {
 	/// Returns the latest completed pair, or an empty pair before first load.
 	pub fn last(&self) -> Result<StatusPair> {
 		Ok(self.last.lock()?.clone().unwrap_or_default())
+	}
+
+	/// Takes the oldest status error that has not yet been presented.
+	///
+	/// Repeated identical failures are represented by failure notifications but
+	/// only enqueue one message until a scan succeeds or the error changes.
+	pub fn take_failure(&self) -> Result<Option<String>> {
+		Ok(self.failures.lock()?.queued.pop_front().flatten())
 	}
 
 	/// Whether a combined status walk is running.
@@ -271,7 +350,15 @@ impl AsyncStatusPair {
 			+ Send
 			+ 'static,
 	) -> Result<()> {
-		*self.latest_config.lock()? = config;
+		let config_changed = {
+			let mut latest_config = self.latest_config.lock()?;
+			let changed = *latest_config != config;
+			*latest_config = config;
+			changed
+		};
+		if config_changed {
+			self.failures.lock()?.current = None;
+		}
 		self.request_generation.fetch_add(1, Ordering::Release);
 
 		if self
@@ -287,6 +374,7 @@ impl AsyncStatusPair {
 			return Ok(());
 		}
 		let last = Arc::clone(&self.last);
+		let failures = Arc::clone(&self.failures);
 		let pending = Arc::clone(&self.pending);
 		let request_generation = Arc::clone(&self.request_generation);
 		let latest_config = Arc::clone(&self.latest_config);
@@ -311,20 +399,9 @@ impl AsyncStatusPair {
 					continue;
 				}
 
-				let changed = match result {
-					Ok(result) => {
-						last.lock().is_ok_and(|mut last| {
-							let changed =
-								last.as_ref() != Some(&result);
-							*last = Some(result);
-							changed
-						})
-					}
-					Err(error) => {
-						log::error!("combined status fetch: {error}");
-						false
-					}
-				};
+				let completion = store_status_pair_result(
+					result, &last, &failures,
+				);
 				drop(current_config);
 				pending.store(0, Ordering::Release);
 				// Close the race with fetch(): either this worker claims the
@@ -339,11 +416,22 @@ impl AsyncStatusPair {
 						Ordering::Acquire,
 					)
 					.is_ok();
-				let _ = sender.send(if changed {
-					AsyncGitNotification::StatusPairChanged
-				} else {
-					AsyncGitNotification::StatusPairUnchanged
-				});
+				let notification = match completion {
+					StatusPairCompletion::Changed => {
+						AsyncGitNotification::StatusPairChanged
+					}
+					StatusPairCompletion::Unchanged => {
+						AsyncGitNotification::StatusPairUnchanged
+					}
+					StatusPairCompletion::Failed => {
+						AsyncGitNotification::StatusPairFailed
+					}
+				};
+				if let Err(error) = sender.send(notification) {
+					log::error!(
+						"send combined status error: {error}"
+					);
+				}
 				if !rerun {
 					break;
 				}
@@ -357,9 +445,15 @@ impl AsyncStatusPair {
 mod tests {
 	use super::{AsyncStatusPair, StatusPair};
 	use crate::sync::{RepoPath, ShowUntrackedFilesConfig};
-	use crate::{StatusItem, StatusItemType};
+	use crate::{
+		AsyncGitNotification, Error, StatusItem, StatusItemType,
+	};
 	use crossbeam_channel::unbounded;
-	use std::{fs, time::Duration};
+	use std::{fs, io, time::Duration};
+
+	fn failure(message: &str) -> Error {
+		Error::Io(io::Error::other(message))
+	}
 
 	#[test]
 	fn poll_during_scan_publishes_before_rerun() {
@@ -439,6 +533,140 @@ mod tests {
 		assert!(unpublished);
 		assert!(notification.is_err());
 		receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+	}
+
+	#[test]
+	fn failure_preserves_last_snapshot_and_exposes_error_chain() {
+		let (sender, receiver) = unbounded();
+		let status =
+			AsyncStatusPair::new(RepoPath::from("."), sender);
+		status
+			.fetch_with(None, |_| {
+				Ok(StatusPair {
+					workdir: vec![StatusItem {
+						path: "kept".into(),
+						status: StatusItemType::Modified,
+					}]
+					.into(),
+					..StatusPair::default()
+				})
+			})
+			.unwrap();
+		assert_eq!(
+			receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+			AsyncGitNotification::StatusPairChanged
+		);
+
+		status
+			.fetch_with(None, |_| Err(failure("low-level cause")))
+			.unwrap();
+		assert_eq!(
+			receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+			AsyncGitNotification::StatusPairFailed
+		);
+
+		assert_eq!(status.last().unwrap().workdir[0].path, "kept");
+		let error = status.take_failure().unwrap().unwrap();
+		assert!(error.starts_with("io error:low-level cause"));
+		assert!(error.contains("Caused by: low-level cause"));
+		assert!(!status.is_pending());
+	}
+
+	#[test]
+	fn repeated_failure_notifies_each_completion_but_queues_once() {
+		let (sender, receiver) = unbounded();
+		let status =
+			AsyncStatusPair::new(RepoPath::from("."), sender);
+
+		for message in ["same error", "same error", "different error"]
+		{
+			status
+				.fetch_with(None, move |_| Err(failure(message)))
+				.unwrap();
+			assert_eq!(
+				receiver
+					.recv_timeout(Duration::from_secs(5))
+					.unwrap(),
+				AsyncGitNotification::StatusPairFailed
+			);
+		}
+
+		assert!(status
+			.take_failure()
+			.unwrap()
+			.is_some_and(|error| error.contains("same error")));
+		assert!(status.take_failure().unwrap().is_none());
+		assert!(status
+			.take_failure()
+			.unwrap()
+			.is_some_and(|error| error.contains("different error")));
+	}
+
+	#[test]
+	fn success_resets_failure_deduplication() {
+		let (sender, receiver) = unbounded();
+		let status =
+			AsyncStatusPair::new(RepoPath::from("."), sender);
+
+		status
+			.fetch_with(None, |_| Err(failure("intermittent")))
+			.unwrap();
+		receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+		assert!(status.take_failure().unwrap().is_some());
+
+		status
+			.fetch_with(None, |_| Ok(StatusPair::default()))
+			.unwrap();
+		receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+
+		status
+			.fetch_with(None, |_| Err(failure("intermittent")))
+			.unwrap();
+		assert_eq!(
+			receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+			AsyncGitNotification::StatusPairFailed
+		);
+		assert!(status.take_failure().unwrap().is_some());
+	}
+
+	#[test]
+	fn changed_config_discards_inflight_failure() {
+		let (sender, receiver) = unbounded();
+		let (started_tx, started_rx) = unbounded();
+		let (release_tx, release_rx) = unbounded();
+		let status =
+			AsyncStatusPair::new(RepoPath::from("."), sender);
+		status
+			.fetch_with(
+				Some(ShowUntrackedFilesConfig::No),
+				move |config| {
+					started_tx.send(config).unwrap();
+					release_rx
+						.recv_timeout(Duration::from_secs(5))
+						.unwrap();
+					if config == Some(ShowUntrackedFilesConfig::No) {
+						Err(failure("stale failure"))
+					} else {
+						Ok(StatusPair::default())
+					}
+				},
+			)
+			.unwrap();
+		started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+		status.fetch(Some(ShowUntrackedFilesConfig::All)).unwrap();
+		release_tx.send(()).unwrap();
+		assert!(
+			started_rx.recv_timeout(Duration::from_secs(5)).unwrap()
+				== Some(ShowUntrackedFilesConfig::All)
+		);
+		assert!(receiver.try_recv().is_err());
+		assert!(status.take_failure().unwrap().is_none());
+
+		release_tx.send(()).unwrap();
+		assert_eq!(
+			receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+			AsyncGitNotification::StatusPairChanged
+		);
 	}
 
 	#[test]

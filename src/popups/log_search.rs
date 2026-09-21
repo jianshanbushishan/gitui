@@ -658,6 +658,12 @@ impl Component for LogSearchPopupPopup {
 		self.visible
 	}
 
+	fn is_input_mode(&self) -> bool {
+		self.is_visible()
+			&& matches!(self.selection, Selection::EnterText)
+			&& self.find_text.is_input_mode()
+	}
+
 	fn hide(&mut self) {
 		self.visible = false;
 	}
@@ -666,5 +672,29 @@ impl Component for LogSearchPopupPopup {
 		self.visible = true;
 
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn input_mode_requires_visible_popup_and_text_selection() {
+		let env = Environment::test_env();
+		let mut popup = LogSearchPopupPopup::new(&env);
+
+		assert!(!popup.is_input_mode());
+		popup.open().unwrap();
+		assert!(popup.is_input_mode());
+
+		popup.move_selection(false);
+		assert!(!popup.is_input_mode());
+
+		popup.move_selection(true);
+		assert!(popup.is_input_mode());
+
+		popup.hide();
+		assert!(!popup.is_input_mode());
 	}
 }

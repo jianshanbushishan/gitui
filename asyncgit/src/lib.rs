@@ -114,6 +114,8 @@ pub enum AsyncGitNotification {
 	StatusPairChanged,
 	/// Combined staged/worktree status did not change.
 	StatusPairUnchanged,
+	/// Combined staged/worktree status could not be loaded.
+	StatusPairFailed,
 	///
 	Diff,
 	///

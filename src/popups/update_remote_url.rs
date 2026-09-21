@@ -76,6 +76,10 @@ impl Component for UpdateRemoteUrlPopup {
 		self.input.is_visible()
 	}
 
+	fn is_input_mode(&self) -> bool {
+		self.input.is_input_mode()
+	}
+
 	fn hide(&mut self) {
 		self.input.hide();
 	}

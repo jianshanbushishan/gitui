@@ -445,6 +445,10 @@ impl Component for FuzzyFindPopup {
 		self.visible
 	}
 
+	fn is_input_mode(&self) -> bool {
+		self.is_visible() && self.find_text.is_input_mode()
+	}
+
 	fn hide(&mut self) {
 		self.visible = false;
 		self.search_generation.fetch_add(1, Ordering::Relaxed);
@@ -453,5 +457,23 @@ impl Component for FuzzyFindPopup {
 	fn show(&mut self) -> Result<()> {
 		self.visible = true;
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn input_mode_follows_popup_visibility() {
+		let env = Environment::test_env();
+		let mut popup = FuzzyFindPopup::new(&env);
+
+		assert!(!popup.is_input_mode());
+		popup.open(Vec::new(), FuzzyFinderTarget::Files).unwrap();
+		assert!(popup.is_input_mode());
+
+		popup.hide();
+		assert!(!popup.is_input_mode());
 	}
 }

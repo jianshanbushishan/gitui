@@ -14,9 +14,9 @@ pub static FORCE_PUSH_POPUP_MSG: &str = "Force Push";
 pub static PULL_POPUP_MSG: &str = "Pull";
 pub static FETCH_POPUP_MSG: &str = "Fetch";
 pub static PUSH_POPUP_PROGRESS_NONE: &str = "preparing...";
-pub static PUSH_POPUP_STATES_ADDING: &str = "adding objects (1/3)";
-pub static PUSH_POPUP_STATES_DELTAS: &str = "deltas (2/3)";
-pub static PUSH_POPUP_STATES_PUSHING: &str = "pushing (3/3)";
+pub static PUSH_POPUP_STATES_ADDING: &str = "counting objects";
+pub static PUSH_POPUP_STATES_DELTAS: &str = "compressing objects";
+pub static PUSH_POPUP_STATES_PUSHING: &str = "pushing";
 pub static PUSH_POPUP_STATES_TRANSFER: &str = "transfer";
 pub static PUSH_POPUP_STATES_DONE: &str = "done";
 
@@ -1419,7 +1419,7 @@ pub mod commands {
 		CommandText::new(
 			format!(
 				"Quit [{}]",
-				key_config.get_hint(key_config.keys.exit),
+				key_config.get_hint(key_config.keys.quit),
 			),
 			"quit gitui application",
 			CMD_GROUP_GENERAL,

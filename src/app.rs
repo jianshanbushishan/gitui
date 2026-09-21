@@ -480,6 +480,11 @@ impl App {
 			|| self.tags_popup.any_work_pending()
 	}
 
+	/// a push is currently running (drives ticker-based popup redraws)
+	pub const fn is_push_in_progress(&self) -> bool {
+		self.push_popup.is_active()
+	}
+
 	///
 	pub fn requires_redraw(&self) -> bool {
 		if self.requires_redraw.get() {
@@ -575,11 +580,16 @@ impl App {
 	);
 
 	fn check_quit(&mut self, ev: &Event) -> bool {
-		if self.any_popup_visible() {
+		// while a text input is focused the quit key is a regular
+		// character, so let it be typed instead of quitting
+		let typing =
+			self.components().iter().any(|c| c.is_input_mode());
+		if typing {
 			return false;
 		}
 		if let Event::Key(e) = ev {
 			if key_match(e, self.key_config.keys.quit) {
+				self.commit_popup.persist_draft();
 				self.do_quit = QuitState::Close;
 				return true;
 			}
@@ -1220,7 +1230,7 @@ impl App {
 			CommandInfo::new(
 				strings::commands::quit(&self.key_config),
 				true,
-				!self.any_popup_visible(),
+				true,
 			)
 			.order(100)
 			.hidden(),

@@ -1,7 +1,7 @@
 //! sync git api for fetching a status
 
 use crate::{
-	error::Result,
+	error::{Error, Result},
 	sync::{
 		config::untracked_files_config_repo,
 		repository::{gix_repo, repo},
@@ -296,35 +296,85 @@ pub fn get_status_split(
 ) -> Result<(Vec<StatusItem>, Vec<StatusItem>)> {
 	scope_time!("get_status_split");
 
-	let repo: gix::Repository = gix_repo(repo_path)?;
+	let repo = repo(repo_path)?;
+
+	if repo.is_bare() && !repo.is_worktree() {
+		return Ok((Vec::new(), Vec::new()));
+	}
+
 	let show_untracked = if let Some(config) = show_untracked {
 		config
 	} else {
-		let git2_repo = crate::sync::repository::repo(repo_path)?;
-		untracked_files_config_repo(&git2_repo)?
+		untracked_files_config_repo(&repo)?
 	};
-	let status = repo
-		.status(gix::progress::Discard)?
-		.untracked_files(show_untracked.into());
-	let mut staged = Vec::new();
-	let mut workdir = Vec::new();
 
-	for item in status.into_iter(Vec::new())? {
-		match item? {
-			gix::status::Item::IndexWorktree(item) => {
-				if let Some(status) = item.summary().map(Into::into) {
-					workdir.push(StatusItem {
-						path: item.rela_path().to_string(),
-						status,
-					});
-				}
-			}
-			gix::status::Item::TreeIndex(change) => {
-				staged.push(StatusItem {
-					path: change.fields().0.to_string(),
-					status: change.into(),
-				});
-			}
+	let mut options = StatusOptions::default();
+	options
+		.show(StatusShow::IndexAndWorkdir)
+		.update_index(true)
+		.include_untracked(show_untracked.include_untracked())
+		.renames_head_to_index(true)
+		.recurse_untracked_dirs(
+			show_untracked.recurse_untracked_dirs(),
+		);
+
+	let statuses = repo.statuses(Some(&mut options))?;
+	let mut staged = Vec::with_capacity(statuses.len());
+	let mut workdir = Vec::with_capacity(statuses.len());
+
+	for entry in statuses.iter() {
+		let status = entry.status();
+
+		if let Some(status) = staged_status_type(status) {
+			let path = entry
+				.head_to_index()
+				.and_then(|delta| delta.new_file().path())
+				.map_or_else(
+					|| {
+						entry
+							.path()
+							.map(String::from)
+							.map_err(Into::into)
+					},
+					|path| {
+						path.to_str().map(String::from).ok_or_else(
+							|| {
+								Error::Generic(
+								"failed to get path to staged file."
+									.to_string(),
+							)
+							},
+						)
+					},
+				)?;
+
+			staged.push(StatusItem { path, status });
+		}
+
+		if let Some(status) = workdir_status_type(status) {
+			let path = entry
+				.index_to_workdir()
+				.and_then(|delta| delta.new_file().path())
+				.map_or_else(
+					|| {
+						entry
+							.path()
+							.map(String::from)
+							.map_err(Into::into)
+					},
+					|path| {
+						path.to_str().map(String::from).ok_or_else(
+							|| {
+								Error::Generic(
+								"failed to get path to worktree file."
+									.to_string(),
+							)
+							},
+						)
+					},
+				)?;
+
+			workdir.push(StatusItem { path, status });
 		}
 	}
 
@@ -337,6 +387,42 @@ pub fn get_status_split(
 	sort(&mut workdir);
 
 	Ok((staged, workdir))
+}
+
+fn staged_status_type(status: Status) -> Option<StatusItemType> {
+	if status.is_conflicted() {
+		None
+	} else if status.is_index_new() {
+		Some(StatusItemType::New)
+	} else if status.is_index_deleted() {
+		Some(StatusItemType::Deleted)
+	} else if status.is_index_renamed() {
+		Some(StatusItemType::Renamed)
+	} else if status.is_index_typechange() {
+		Some(StatusItemType::Typechange)
+	} else if status.is_index_modified() {
+		Some(StatusItemType::Modified)
+	} else {
+		None
+	}
+}
+
+fn workdir_status_type(status: Status) -> Option<StatusItemType> {
+	if status.is_conflicted() {
+		Some(StatusItemType::Conflicted)
+	} else if status.is_wt_new() {
+		Some(StatusItemType::New)
+	} else if status.is_wt_deleted() {
+		Some(StatusItemType::Deleted)
+	} else if status.is_wt_renamed() {
+		Some(StatusItemType::Renamed)
+	} else if status.is_wt_typechange() {
+		Some(StatusItemType::Typechange)
+	} else if status.is_wt_modified() {
+		Some(StatusItemType::Modified)
+	} else {
+		None
+	}
 }
 
 /// discard all changes in the working directory
@@ -363,6 +449,17 @@ mod tests {
 	};
 	use std::{fs, fs::File, io::Write, path::Path};
 	use tempfile::TempDir;
+
+	#[test]
+	fn test_get_status_split_maps_conflicts_only_to_workdir() {
+		let conflict = Status::CONFLICTED | Status::INDEX_MODIFIED;
+
+		assert_eq!(staged_status_type(conflict), None);
+		assert_eq!(
+			workdir_status_type(conflict),
+			Some(StatusItemType::Conflicted)
+		);
+	}
 
 	#[test]
 	fn test_discard_status() {
@@ -447,5 +544,139 @@ mod tests {
 
 		assert_eq!(staged, expected_staged);
 		assert_eq!(workdir, expected_workdir);
+	}
+
+	#[test]
+	fn test_get_status_split_maps_index_and_workdir_independently() {
+		let (_td, repo) = repo_init().unwrap();
+		let root = repo.path().parent().unwrap();
+		let repo_path: RepoPath = root.to_path_buf().into();
+		let file_path = Path::new("new-then-deleted.txt");
+
+		fs::write(root.join(file_path), "staged\n").unwrap();
+		stage_add_file(&repo_path, file_path).unwrap();
+		fs::remove_file(root.join(file_path)).unwrap();
+
+		let (staged, workdir) =
+			get_status_split(&repo_path, None).unwrap();
+
+		assert_eq!(
+			staged,
+			vec![StatusItem {
+				path: "new-then-deleted.txt".into(),
+				status: StatusItemType::New,
+			}]
+		);
+		assert_eq!(
+			workdir,
+			vec![StatusItem {
+				path: "new-then-deleted.txt".into(),
+				status: StatusItemType::Deleted,
+			}]
+		);
+	}
+
+	#[test]
+	fn test_get_status_split_uses_staged_rename_destination() {
+		let (_td, repo) = repo_init().unwrap();
+		let root = repo.path().parent().unwrap();
+		let repo_path: RepoPath = root.to_path_buf().into();
+		let old_path = Path::new("old-name.txt");
+		let new_path = Path::new("new-name.txt");
+
+		fs::write(root.join(old_path), "unchanged\n").unwrap();
+		stage_add_file(&repo_path, old_path).unwrap();
+		commit(&repo_path, "initial").unwrap();
+		fs::rename(root.join(old_path), root.join(new_path)).unwrap();
+
+		let mut index = repo.index().unwrap();
+		index.remove_path(old_path).unwrap();
+		index.add_path(new_path).unwrap();
+		index.write().unwrap();
+
+		let (staged, workdir) =
+			get_status_split(&repo_path, None).unwrap();
+
+		assert_eq!(
+			staged,
+			vec![StatusItem {
+				path: "new-name.txt".into(),
+				status: StatusItemType::Renamed,
+			}]
+		);
+		assert!(workdir.is_empty());
+	}
+
+	#[test]
+	fn test_get_status_split_respects_untracked_configuration() {
+		let (_td, repo) = repo_init().unwrap();
+		let root = repo.path().parent().unwrap();
+		let repo_path: RepoPath = root.to_path_buf().into();
+		let file_path = Path::new("untracked.txt");
+
+		fs::write(root.join(file_path), "untracked\n").unwrap();
+
+		let (staged, workdir) = get_status_split(
+			&repo_path,
+			Some(ShowUntrackedFilesConfig::No),
+		)
+		.unwrap();
+		assert!(staged.is_empty());
+		assert!(workdir.is_empty());
+
+		let (staged, workdir) = get_status_split(
+			&repo_path,
+			Some(ShowUntrackedFilesConfig::All),
+		)
+		.unwrap();
+		assert!(staged.is_empty());
+		assert_eq!(
+			workdir,
+			vec![StatusItem {
+				path: "untracked.txt".into(),
+				status: StatusItemType::New,
+			}]
+		);
+	}
+
+	#[test]
+	fn test_get_status_split_is_empty_for_bare_repository() {
+		let (git_dir, _repo) = repo_init_bare().unwrap();
+		let repo_path: RepoPath = git_dir.path().to_path_buf().into();
+
+		let (staged, workdir) =
+			get_status_split(&repo_path, None).unwrap();
+
+		assert!(staged.is_empty());
+		assert!(workdir.is_empty());
+	}
+
+	#[test]
+	fn test_get_status_split_with_separate_workdir() {
+		let (git_dir, _repo) = repo_init_bare().unwrap();
+		let separate_workdir = TempDir::new().unwrap();
+		let file_path = Path::new("foo");
+
+		fs::write(separate_workdir.path().join(file_path), "a")
+			.unwrap();
+
+		let repo_path = RepoPath::Workdir {
+			gitdir: git_dir.path().into(),
+			workdir: separate_workdir.path().into(),
+		};
+		let (staged, workdir) = get_status_split(
+			&repo_path,
+			Some(ShowUntrackedFilesConfig::All),
+		)
+		.unwrap();
+
+		assert!(staged.is_empty());
+		assert_eq!(
+			workdir,
+			vec![StatusItem {
+				path: "foo".into(),
+				status: StatusItemType::New,
+			}]
+		);
 	}
 }

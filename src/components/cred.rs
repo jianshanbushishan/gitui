@@ -144,6 +144,10 @@ impl Component for CredComponent {
 		self.visible
 	}
 
+	fn is_input_mode(&self) -> bool {
+		self.is_visible()
+	}
+
 	fn hide(&mut self) {
 		self.cred = BasicAuthCredential::new(None, None);
 		self.visible = false;

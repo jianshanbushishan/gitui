@@ -264,6 +264,12 @@ pub trait Component {
 	}
 	/// focus/unfocus this component depending on param
 	fn focus(&mut self, _focus: bool) {}
+	/// whether this component currently receives text input,
+	/// so printable keys must be typed instead of acting as
+	/// shortcuts (eg the quit key)
+	fn is_input_mode(&self) -> bool {
+		false
+	}
 	///
 	fn is_visible(&self) -> bool {
 		true

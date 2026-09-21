@@ -649,6 +649,14 @@ impl Status {
 		&mut self,
 		ev: AsyncGitNotification,
 	) -> Result<()> {
+		// A failed status scan must always be consumed. In particular, the
+		// notification may arrive after the user changed tabs; leaving it queued
+		// would associate its error text with a later scan and keep both status
+		// trees in their loading state.
+		if ev == AsyncGitNotification::StatusPairFailed {
+			return self.update_status_failed();
+		}
+
 		if !self.is_visible() {
 			return Ok(());
 		}
@@ -681,6 +689,23 @@ impl Status {
 				self.update_branch_compare();
 			}
 			_ => (),
+		}
+
+		Ok(())
+	}
+
+	fn update_status_failed(&mut self) -> Result<()> {
+		// Keep the most recent successful snapshot. On the initial load this is
+		// the empty default snapshot. Calling set_items also clears the status
+		// trees' own pending flags, so the UI cannot remain stuck on Loading.
+		let status = self.changes_fetcher.last()?;
+		self.index.set_items(&status.staged)?;
+		self.index_wd.set_items(&status.workdir)?;
+
+		if let Some(error) = self.changes_fetcher.take_failure()? {
+			self.queue.push(InternalEvent::ShowErrorMsg(format!(
+				"failed to load repository status:\n{error}"
+			)));
 		}
 
 		Ok(())
@@ -1027,7 +1052,44 @@ mod tests {
 	use super::{
 		uses_full_file_preview, PreviewResult, RightPane, Status,
 	};
-	use asyncgit::StatusItemType;
+	use asyncgit::{AsyncGitNotification, StatusItemType};
+
+	#[test]
+	fn status_failure_ends_loading_and_is_consumed_while_hidden() {
+		use crate::{app::Environment, queue::InternalEvent};
+
+		let dir = tempfile::tempdir().unwrap();
+		let mut env = Environment::test_env();
+		*env.repo.get_mut() =
+			dir.path().join("missing-repository").into();
+		let (sender, receiver) = crossbeam_channel::unbounded();
+		env.sender_git = sender;
+		let mut status = Status::new(&env);
+
+		status.changes_fetcher.fetch(None).unwrap();
+		let notification = receiver
+			.recv_timeout(std::time::Duration::from_secs(5))
+			.unwrap();
+		assert_eq!(
+			notification,
+			AsyncGitNotification::StatusPairFailed
+		);
+
+		// A tab switch must not swallow the completion and leave Loading visible.
+		status.visible = false;
+		status.update_git(notification).unwrap();
+		assert!(!status.index.is_pending());
+		assert!(!status.index_wd.is_pending());
+
+		match env.queue.pop() {
+			Some(InternalEvent::ShowErrorMsg(message)) => {
+				assert!(message.starts_with(
+					"failed to load repository status:\n"
+				));
+			}
+			_ => panic!("expected status error message"),
+		}
+	}
 
 	#[test]
 	fn switching_preview_while_reader_is_busy_queues_new_selection() {
