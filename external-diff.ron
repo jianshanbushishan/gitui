@@ -15,8 +15,8 @@
     external_diff_tools: Some((
         beyondcompare: Some((
             // Windows default; on Linux/macOS the default is "bcomp".
-            // bcomp.com / bcomp wait for the comparison to close intrinsically.
-            command: "bcomp.com",
+            // Keep the viewer open until the comparison is closed so snapshots remain available.
+            command: "BComp.exe",
             args: ["{left}", "{right}"],
         )),
         nvim: Some((

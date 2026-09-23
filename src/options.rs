@@ -43,7 +43,7 @@ impl ExternalDiffTool {
 	fn default_command(self) -> ExternalDiffCommand {
 		let (command, args) = match self {
 			Self::BeyondCompare => (
-				if cfg!(windows) { "bcomp.com" } else { "bcomp" },
+				if cfg!(windows) { "BComp.exe" } else { "bcomp" },
 				vec!["{left}", "{right}"],
 			),
 			Self::Nvim => {
@@ -397,6 +397,17 @@ mod tests {
 			Some(ExternalDiffTool::BeyondCompare)
 		);
 		let tools = config.external_diff_tools.unwrap();
+		let beyondcompare = tools.beyondcompare.unwrap();
+		assert_eq!(beyondcompare.command, "BComp.exe");
+		assert_eq!(
+			beyondcompare.args,
+			vec!["{left}", "{right}"]
+		);
+		#[cfg(windows)]
+		assert_eq!(
+			beyondcompare,
+			ExternalDiffTool::BeyondCompare.default_command()
+		);
 		assert_eq!(
 			tools.nvim.unwrap(),
 			ExternalDiffTool::Nvim.default_command()
