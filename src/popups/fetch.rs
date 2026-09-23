@@ -19,7 +19,8 @@ use asyncgit::{
 		},
 		RepoPathRef,
 	},
-	AsyncFetchJob, AsyncGitNotification, ProgressPercent,
+	AsyncFetchJob, AsyncGitNotification, FetchProgress,
+	FetchProgressStage,
 };
 use crossterm::event::Event;
 use ratatui::{
@@ -34,7 +35,7 @@ pub struct FetchPopup {
 	repo: RepoPathRef,
 	visible: bool,
 	async_fetch: AsyncSingleJob<AsyncFetchJob>,
-	progress: Option<ProgressPercent>,
+	progress: Option<FetchProgress>,
 	pending: bool,
 	queue: Queue,
 	theme: SharedTheme,
@@ -81,8 +82,7 @@ impl FetchPopup {
 
 	fn fetch_all(&mut self, cred: Option<BasicAuthCredential>) {
 		self.pending = true;
-		self.progress = None;
-		self.progress = Some(ProgressPercent::empty());
+		self.progress = Some(FetchProgress::default());
 		self.async_fetch.spawn(AsyncFetchJob::new(
 			self.repo.borrow().clone(),
 			cred,
@@ -117,17 +117,40 @@ impl FetchPopup {
 impl DrawableComponent for FetchPopup {
 	fn draw(&self, f: &mut Frame, rect: Rect) -> Result<()> {
 		if self.visible {
-			let progress = self.progress.unwrap_or_default().progress;
+			let progress = self.progress.clone().unwrap_or_default();
+			let stage = match progress.stage {
+				FetchProgressStage::Preparing => "preparing",
+				FetchProgressStage::Branches => "receiving branches",
+				FetchProgressStage::IndexingBranches => {
+					"indexing branches"
+				}
+				FetchProgressStage::Tags => "receiving tags",
+				FetchProgressStage::IndexingTags => "indexing tags",
+				FetchProgressStage::UpdatingRefs => "updating refs",
+				FetchProgressStage::Done => "done",
+			};
+			let title = if progress.remote.is_empty() {
+				strings::FETCH_POPUP_MSG.to_string()
+			} else {
+				format!(
+					"{} {} ({}/{})",
+					strings::FETCH_POPUP_MSG,
+					progress.remote,
+					progress.current,
+					progress.total,
+				)
+			};
 
-			let area = ui::centered_rect_absolute(30, 3, f.area());
+			let area = ui::centered_rect_absolute(48, 3, f.area());
 
 			f.render_widget(Clear, area);
 			f.render_widget(
 				Gauge::default()
+					.label(format!("{stage} {}%", progress.percent))
 					.block(
 						Block::default()
 							.title(Span::styled(
-								strings::FETCH_POPUP_MSG,
+								title,
 								self.theme.title(true),
 							))
 							.borders(Borders::ALL)
@@ -135,7 +158,7 @@ impl DrawableComponent for FetchPopup {
 							.border_style(self.theme.block(true)),
 					)
 					.gauge_style(self.theme.push_gauge())
-					.percent(u16::from(progress)),
+					.percent(u16::from(progress.percent)),
 				area,
 			);
 			self.input_cred.draw(f, rect)?;

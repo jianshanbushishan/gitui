@@ -6,7 +6,7 @@ use crate::{
 		DrawableComponent, EventState,
 	},
 	keys::{key_match, SharedKeyConfig},
-	options::SharedOptions,
+	options::{ExternalDiffTool, SharedOptions},
 	queue::{InternalEvent, Queue},
 	strings,
 	ui::{self, style::SharedTheme},
@@ -29,10 +29,12 @@ pub enum AppOption {
 	DiffIgnoreWhitespaces,
 	DiffContextLines,
 	DiffInterhunkLines,
+	ExternalDiffTool,
 }
 
 pub struct OptionsPopup {
 	selection: AppOption,
+	tool_selection: Option<usize>,
 	queue: Queue,
 	visible: bool,
 	key_config: SharedKeyConfig,
@@ -45,6 +47,7 @@ impl OptionsPopup {
 	pub fn new(env: &Environment) -> Self {
 		Self {
 			selection: AppOption::StatusShowUntracked,
+			tool_selection: None,
 			queue: env.queue.clone(),
 			visible: false,
 			key_config: env.key_config.clone(),
@@ -111,6 +114,27 @@ impl OptionsPopup {
 			&diff.interhunk_lines.to_string(),
 			self.is_select(AppOption::DiffInterhunkLines),
 		);
+		self.add_entry(
+			txt,
+			width,
+			"External diff tool",
+			self.options.borrow().external_diff_tool().label(),
+			self.is_select(AppOption::ExternalDiffTool),
+		);
+		if let Some(selected) = self.tool_selection {
+			for (index, tool) in
+				ExternalDiffTool::ALL.iter().enumerate()
+			{
+				self.add_entry(
+					txt,
+					width,
+					"",
+					tool.label(),
+					selected == index,
+				);
+			}
+			Self::add_header(txt, "Enter: select   Esc: cancel");
+		}
 	}
 
 	fn is_select(&self, kind: AppOption) -> bool {
@@ -150,6 +174,9 @@ impl OptionsPopup {
 		if up {
 			self.selection = match self.selection {
 				AppOption::StatusShowUntracked => {
+					AppOption::ExternalDiffTool
+				}
+				AppOption::ExternalDiffTool => {
 					AppOption::DiffInterhunkLines
 				}
 				AppOption::DiffMode => AppOption::StatusShowUntracked,
@@ -175,8 +202,11 @@ impl OptionsPopup {
 				AppOption::DiffContextLines => {
 					AppOption::DiffInterhunkLines
 				}
-				AppOption::DiffInterhunkLines => {
+				AppOption::ExternalDiffTool => {
 					AppOption::StatusShowUntracked
+				}
+				AppOption::DiffInterhunkLines => {
+					AppOption::ExternalDiffTool
 				}
 			};
 		}
@@ -185,6 +215,7 @@ impl OptionsPopup {
 	fn switch_option(&self, right: bool) {
 		if right {
 			match self.selection {
+				AppOption::ExternalDiffTool => return,
 				AppOption::StatusShowUntracked => {
 					let untracked =
 						self.options.borrow().status_show_untracked();
@@ -229,6 +260,7 @@ impl OptionsPopup {
 			}
 		} else {
 			match self.selection {
+				AppOption::ExternalDiffTool => return,
 				AppOption::StatusShowUntracked => {
 					let untracked =
 						self.options.borrow().status_show_untracked();
@@ -301,11 +333,18 @@ impl OptionsPopup {
 impl DrawableComponent for OptionsPopup {
 	fn draw(&self, f: &mut Frame, area: Rect) -> Result<()> {
 		if self.is_visible() {
-			const SIZE: (u16, u16) = (50, 10);
+			let size = (
+				54,
+				if self.tool_selection.is_some() {
+					16
+				} else {
+					12
+				},
+			);
 			let area =
-				ui::centered_rect_absolute(SIZE.0, SIZE.1, area);
+				ui::centered_rect_absolute(size.0, size.1, area);
 
-			let width = area.width;
+			let width = area.width.saturating_sub(2);
 
 			f.render_widget(Clear, area);
 			let block = Block::default()
@@ -363,6 +402,51 @@ impl Component for OptionsPopup {
 	) -> Result<EventState> {
 		if self.is_visible() {
 			if let Event::Key(key) = &event {
+				if let Some(selected) = self.tool_selection {
+					if key_match(key, self.key_config.keys.exit_popup)
+					{
+						self.tool_selection = None;
+					} else if key_match(
+						key,
+						self.key_config.keys.enter,
+					) {
+						self.options
+							.borrow_mut()
+							.set_external_diff_tool(
+								ExternalDiffTool::ALL[selected],
+							);
+						self.tool_selection = None;
+					} else if key_match(
+						key,
+						self.key_config.keys.move_up,
+					) || key_match(
+						key,
+						self.key_config.keys.popup_up,
+					) {
+						self.tool_selection =
+							Some((selected + 2) % 3);
+					} else if key_match(
+						key,
+						self.key_config.keys.move_down,
+					) || key_match(
+						key,
+						self.key_config.keys.popup_down,
+					) {
+						self.tool_selection =
+							Some((selected + 1) % 3);
+					}
+					return Ok(EventState::Consumed);
+				}
+				if self.selection == AppOption::ExternalDiffTool
+					&& key_match(key, self.key_config.keys.enter)
+				{
+					let tool =
+						self.options.borrow().external_diff_tool();
+					self.tool_selection = ExternalDiffTool::ALL
+						.iter()
+						.position(|candidate| *candidate == tool);
+					return Ok(EventState::Consumed);
+				}
 				if key_match(key, self.key_config.keys.exit_popup) {
 					self.hide();
 				} else if key_match(key, self.key_config.keys.move_up)
@@ -402,6 +486,7 @@ impl Component for OptionsPopup {
 
 	fn hide(&mut self) {
 		self.visible = false;
+		self.tool_selection = None;
 	}
 
 	fn show(&mut self) -> Result<()> {
@@ -414,6 +499,44 @@ impl Component for OptionsPopup {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn external_diff_dropdown_confirms_and_cancels() {
+		use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+		let env = Environment::test_env();
+		env.options
+			.borrow_mut()
+			.set_external_diff_tool(ExternalDiffTool::BeyondCompare);
+		let mut popup = OptionsPopup::new(&env);
+		popup.show().unwrap();
+		popup.move_selection(true);
+		assert_eq!(popup.selection, AppOption::ExternalDiffTool);
+		let press = |popup: &mut OptionsPopup, code| {
+			popup
+				.event(&Event::Key(KeyEvent::new(
+					code,
+					KeyModifiers::NONE,
+				)))
+				.unwrap();
+		};
+		press(&mut popup, KeyCode::Enter);
+		press(&mut popup, KeyCode::Down);
+		assert_eq!(
+			env.options.borrow().external_diff_tool(),
+			ExternalDiffTool::BeyondCompare
+		);
+		press(&mut popup, KeyCode::Esc);
+		assert!(popup.is_visible());
+		assert_eq!(popup.tool_selection, None);
+		press(&mut popup, KeyCode::Enter);
+		press(&mut popup, KeyCode::Down);
+		press(&mut popup, KeyCode::Enter);
+		assert_eq!(
+			env.options.borrow().external_diff_tool(),
+			ExternalDiffTool::Nvim
+		);
+		assert_eq!(popup.tool_selection, None);
+	}
 
 	#[test]
 	fn diff_mode_is_part_of_diff_option_navigation() {

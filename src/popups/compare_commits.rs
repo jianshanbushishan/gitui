@@ -96,6 +96,13 @@ impl Component for CompareCommitsPopup {
 			));
 
 			out.push(CommandInfo::new(
+				strings::commands::external_diff(&self.key_config),
+				self.can_focus_diff()
+					&& self.details.files().focused(),
+				!self.diff.focused() || force_all,
+			));
+
+			out.push(CommandInfo::new(
 				strings::commands::diff_focus_left(&self.key_config),
 				true,
 				self.diff.focused() || force_all,
@@ -145,6 +152,22 @@ impl Component for CompareCommitsPopup {
 				} else if key_match(e, self.key_config.keys.move_left)
 				{
 					self.hide_stacked(false);
+				} else if self.details.files().focused()
+					&& key_match(
+						e,
+						self.key_config.keys.external_diff,
+					) {
+					if let (Some(ids), Some(file)) = (
+						self.get_ids(),
+						self.details.files().selection_file(),
+					) {
+						self.queue.push(
+							InternalEvent::OpenExternalDiff(
+								file.path,
+								DiffType::Commits(ids),
+							),
+						);
+					}
 				} else if key_match(
 					e,
 					self.key_config.keys.diff_mode_toggle,

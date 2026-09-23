@@ -141,6 +141,13 @@ impl Component for InspectCommitPopup {
 			));
 
 			out.push(CommandInfo::new(
+				strings::commands::external_diff(&self.key_config),
+				self.can_focus_right()
+					&& self.details.files().focused(),
+				!self.right_focused() || force_all,
+			));
+
+			out.push(CommandInfo::new(
 				strings::commands::diff_focus_left(&self.key_config),
 				true,
 				self.right_focused() || force_all,
@@ -212,6 +219,22 @@ impl Component for InspectCommitPopup {
 				} else if key_match(e, self.key_config.keys.move_left)
 				{
 					self.hide_stacked(false);
+				} else if self.details.files().focused()
+					&& key_match(
+						e,
+						self.key_config.keys.external_diff,
+					) {
+					if let (Some(request), Some(file)) = (
+						self.open_request.as_ref(),
+						self.details.files().selection_file(),
+					) {
+						self.queue.push(
+							InternalEvent::OpenExternalDiff(
+								file.path,
+								DiffType::Commit(request.commit_id),
+							),
+						);
+					}
 				} else if self.right_pane == RightPane::File
 					&& self.right_focused()
 					&& key_match(e, self.key_config.keys.edit_file)

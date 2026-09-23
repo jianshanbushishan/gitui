@@ -70,6 +70,7 @@ pub struct KeysList {
 	pub blame: GituiKeyEvent,
 	pub file_history: GituiKeyEvent,
 	pub edit_file: GituiKeyEvent,
+	pub external_diff: GituiKeyEvent,
 	pub status_stage_all: GituiKeyEvent,
 	pub status_reset_item: GituiKeyEvent,
 	pub status_ignore_file: GituiKeyEvent,
@@ -139,6 +140,7 @@ pub struct KeysList {
 
 #[rustfmt::skip]
 impl Default for KeysList {
+	#[allow(clippy::too_many_lines)]
 	fn default() -> Self {
 		Self {
 			tab_status: GituiKeyEvent::new(KeyCode::Char('1'), KeyModifiers::empty()),
@@ -174,9 +176,10 @@ impl Default for KeysList {
 			blame: GituiKeyEvent::new(KeyCode::Char('B'),  KeyModifiers::SHIFT),
 			file_history: GituiKeyEvent::new(KeyCode::Char('H'),  KeyModifiers::SHIFT),
 			edit_file: GituiKeyEvent::new(KeyCode::Char('e'),  KeyModifiers::empty()),
+			external_diff: GituiKeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty()),
 			status_stage_all: GituiKeyEvent::new(KeyCode::Char('a'),  KeyModifiers::empty()),
 			status_reset_item: GituiKeyEvent::new(KeyCode::Char('D'),  KeyModifiers::SHIFT),
-			diff_reset_lines: GituiKeyEvent::new(KeyCode::Char('d'),  KeyModifiers::empty()),
+			diff_reset_lines: GituiKeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT),
 			status_ignore_file: GituiKeyEvent::new(KeyCode::Char('i'),  KeyModifiers::empty()),
 			diff_stage_lines: GituiKeyEvent::new(KeyCode::Char('s'),  KeyModifiers::empty()),
 			stashing_save: GituiKeyEvent::new(KeyCode::Char('s'),  KeyModifiers::empty()),

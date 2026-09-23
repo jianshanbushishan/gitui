@@ -74,7 +74,7 @@ pub use crate::{
 	commit_files::{AsyncCommitFiles, CommitFilesParams},
 	diff::{AsyncDiff, DiffParams, DiffType},
 	error::{Error, Result},
-	fetch_job::AsyncFetchJob,
+	fetch_job::{AsyncFetchJob, FetchProgress, FetchProgressStage},
 	filter_commits::{AsyncCommitFilterJob, CommitFilterResult},
 	linestats::{AsyncLineStats, LineStats},
 	progress::ProgressPercent,

@@ -1439,6 +1439,11 @@ impl Component for DiffComponent {
 		}
 
 		out.push(CommandInfo::new(
+			strings::commands::external_diff(&self.key_config),
+			!self.current.path.is_empty(),
+			self.focused(),
+		));
+		out.push(CommandInfo::new(
 			strings::commands::edit_item(&self.key_config),
 			!self.current.path.is_empty(),
 			self.focused(),
@@ -1464,7 +1469,17 @@ impl Component for DiffComponent {
 	fn event(&mut self, ev: &Event) -> Result<EventState> {
 		if self.focused() {
 			if let Event::Key(e) = ev {
-				return if key_match(e, self.key_config.keys.move_down)
+				return if !self.current.path.is_empty()
+					&& key_match(
+						e,
+						self.key_config.keys.external_diff,
+					) {
+					self.queue.push(InternalEvent::OpenExternalDiff(
+						self.current.path.clone(),
+						self.current.diff_type.clone(),
+					));
+					Ok(EventState::Consumed)
+				} else if key_match(e, self.key_config.keys.move_down)
 					|| key_match(e, self.key_config.keys.popup_down)
 				{
 					self.move_selection(ScrollType::Down);
@@ -2774,6 +2789,34 @@ mod tests {
 			None,
 			"hunk header has no new_lineno"
 		);
+	}
+
+	#[test]
+	fn external_diff_uses_current_comparison_and_requires_focus() {
+		let env = Environment::test_env();
+		let mut diff = DiffComponent::new(&env, false);
+		diff.current.path = "file with spaces.rs".into();
+		diff.current.diff_type = DiffType::Stage;
+		let event = Event::Key(KeyEvent::new(
+			KeyCode::Char('d'),
+			KeyModifiers::empty(),
+		));
+		assert!(matches!(
+			diff.event(&event).unwrap(),
+			EventState::NotConsumed
+		));
+		assert!(env.queue.pop().is_none());
+		diff.focus(true);
+		assert!(matches!(
+			diff.event(&event).unwrap(),
+			EventState::Consumed
+		));
+		assert!(
+			matches!(env.queue.pop(), Some(InternalEvent::OpenExternalDiff(path, DiffType::Stage)) if path == "file with spaces.rs")
+		);
+		diff.current.path.clear();
+		diff.event(&event).unwrap();
+		assert!(env.queue.pop().is_none());
 	}
 
 	#[test]

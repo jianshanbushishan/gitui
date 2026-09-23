@@ -127,9 +127,13 @@ pub enum InternalEvent {
 	///
 	SelectBranch,
 	/// Browse a branch's history without checking it out.
-	ViewBranchLog { reference: String, name: String },
+	ViewBranchLog {
+		reference: String,
+		name: String,
+	},
 	///
 	OpenExternalEditor(Option<String>, Option<u32>),
+	OpenExternalDiff(String, asyncgit::DiffType),
 	///
 	Push(String, PushType, bool, bool),
 	///
@@ -163,7 +167,9 @@ pub enum InternalEvent {
 	///
 	CreateRemote,
 	///
-	OpenRepo { path: PathBuf },
+	OpenRepo {
+		path: PathBuf,
+	},
 	///
 	OpenResetPopup(CommitId),
 	///

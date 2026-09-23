@@ -1,0 +1,31 @@
+// Merge these fields into your gitui config.ron (in the gitui config directory).
+// In a file diff, press d to launch the selected viewer. Reset defaults to Alt+d;
+// custom key configurations can override external_diff (Vim reset remains u).
+// Options -> External diff tool: Enter opens the dropdown; Up/Down choose;
+// Enter saves the choice for this repository; Esc cancels.
+// The repository choice overrides external_diff_tool below.
+// Executables must be on PATH, or use an absolute command path.
+// Each argument is passed separately, without shell expansion. {left}/{right}
+// are replaced with temporary snapshots. Keep a wait/blocking option so the
+// snapshots remain available until the comparison window is closed.
+// Beyond Compare and VS Code run in the background without pausing GitUI.
+// Neovim takes over the current terminal until it exits.
+(
+    external_diff_tool: Some(BeyondCompare),
+    external_diff_tools: Some((
+        beyondcompare: Some((
+            // Windows default; on Linux/macOS the default is "bcomp".
+            // bcomp.com / bcomp wait for the comparison to close intrinsically.
+            command: "bcomp.com",
+            args: ["{left}", "{right}"],
+        )),
+        nvim: Some((
+            command: "nvim",
+            args: ["-d", "-R", "{left}", "{right}"],
+        )),
+        vscode: Some((
+            command: "code",
+            args: ["--wait", "--diff", "{left}", "{right}"],
+        )),
+    )),
+)

@@ -201,6 +201,7 @@ impl Callbacks {
 			sender.send(ProgressNotification::Transfer {
 				objects: p.received_objects(),
 				total_objects: p.total_objects(),
+				indexed_objects: p.indexed_objects(),
 			})
 		});
 	}

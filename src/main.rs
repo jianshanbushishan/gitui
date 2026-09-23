@@ -66,6 +66,7 @@ mod bug_report;
 mod clipboard;
 mod cmdbar;
 mod components;
+mod external_diff;
 mod gitui;
 mod input;
 mod keys;

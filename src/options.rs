@@ -17,10 +17,70 @@ use std::{
 	rc::Rc,
 };
 
+/// External viewer used for the currently displayed file comparison.
+#[derive(
+	Default, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize,
+)]
+pub enum ExternalDiffTool {
+	#[default]
+	BeyondCompare,
+	Nvim,
+	Vscode,
+}
+
+impl ExternalDiffTool {
+	pub const ALL: [Self; 3] =
+		[Self::BeyondCompare, Self::Nvim, Self::Vscode];
+
+	pub const fn label(self) -> &'static str {
+		match self {
+			Self::BeyondCompare => "Beyond Compare",
+			Self::Nvim => "Neovim",
+			Self::Vscode => "VS Code",
+		}
+	}
+
+	fn default_command(self) -> ExternalDiffCommand {
+		let (command, args) = match self {
+			Self::BeyondCompare => (
+				if cfg!(windows) { "bcomp.com" } else { "bcomp" },
+				vec!["{left}", "{right}"],
+			),
+			Self::Nvim => {
+				("nvim", vec!["-d", "-R", "{left}", "{right}"])
+			}
+			Self::Vscode => (
+				"code",
+				vec!["--wait", "--diff", "{left}", "{right}"],
+			),
+		};
+		ExternalDiffCommand {
+			command: command.to_owned(),
+			args: args.into_iter().map(str::to_owned).collect(),
+		}
+	}
+}
+
+/// Arguments are passed directly to the executable, without a shell.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalDiffCommand {
+	pub command: String,
+	pub args: Vec<String>,
+}
+
+#[derive(Default, Clone, Serialize, Deserialize)]
+struct ExternalDiffTools {
+	pub beyondcompare: Option<ExternalDiffCommand>,
+	pub nvim: Option<ExternalDiffCommand>,
+	pub vscode: Option<ExternalDiffCommand>,
+}
+
 /// Global config options loaded from ~/.config/gitui/config.ron
 #[derive(Default, Clone, Serialize, Deserialize)]
 #[allow(clippy::struct_field_names)]
 struct GlobalOptions {
+	pub external_diff_tool: Option<ExternalDiffTool>,
+	pub external_diff_tools: Option<ExternalDiffTools>,
 	pub status_left_ratio: Option<u16>,
 	pub log_left_ratio: Option<u16>,
 	pub detail_left_ratio: Option<u16>,
@@ -32,6 +92,7 @@ struct GlobalOptions {
 
 #[derive(Default, Clone, Serialize, Deserialize)]
 struct OptionsData {
+	pub external_diff_tool: Option<ExternalDiffTool>,
 	pub tab: usize,
 	pub diff: DiffOptions,
 	pub status_show_untracked: Option<ShowUntrackedFilesConfig>,
@@ -68,6 +129,47 @@ impl Options {
 			data: Self::read(&repo).unwrap_or_default(),
 			repo,
 		}))
+	}
+
+	pub fn external_diff_tool(&self) -> ExternalDiffTool {
+		self.data
+			.external_diff_tool
+			.or_else(|| {
+				Self::read_global()
+					.ok()
+					.and_then(|g| g.external_diff_tool)
+			})
+			.unwrap_or_default()
+	}
+
+	pub fn set_external_diff_tool(&mut self, tool: ExternalDiffTool) {
+		self.data.external_diff_tool = Some(tool);
+		self.save();
+	}
+
+	pub fn external_diff_command(
+		&self,
+	) -> Result<ExternalDiffCommand> {
+		let path = get_app_config_path()?.join("config.ron");
+		let global = if path.try_exists()? {
+			Self::read_global()?
+		} else {
+			GlobalOptions::default()
+		};
+		let tool = self
+			.data
+			.external_diff_tool
+			.or(global.external_diff_tool)
+			.unwrap_or_default();
+		let configured =
+			global.external_diff_tools.and_then(|tools| match tool {
+				ExternalDiffTool::BeyondCompare => {
+					tools.beyondcompare
+				}
+				ExternalDiffTool::Nvim => tools.nvim,
+				ExternalDiffTool::Vscode => tools.vscode,
+			});
+		Ok(configured.unwrap_or_else(|| tool.default_command()))
 	}
 
 	pub fn set_current_tab(&mut self, tab: usize) {
@@ -283,6 +385,47 @@ mod tests {
 	use asyncgit::sync::RepoPath;
 	use std::cell::RefCell;
 	use tempfile::TempDir;
+
+	#[test]
+	fn external_diff_example_and_defaults() {
+		use super::{ExternalDiffTool, GlobalOptions};
+		let config: GlobalOptions =
+			ron::from_str(include_str!("../external-diff.ron"))
+				.unwrap();
+		assert_eq!(
+			config.external_diff_tool,
+			Some(ExternalDiffTool::BeyondCompare)
+		);
+		let tools = config.external_diff_tools.unwrap();
+		assert_eq!(
+			tools.nvim.unwrap(),
+			ExternalDiffTool::Nvim.default_command()
+		);
+		assert_eq!(
+			tools.vscode.unwrap(),
+			ExternalDiffTool::Vscode.default_command()
+		);
+		let old: GlobalOptions =
+			ron::from_str("(status_left_ratio: Some(40))").unwrap();
+		assert_eq!(old.external_diff_tool, None);
+		assert!(old.external_diff_tools.is_none());
+	}
+
+	#[test]
+	fn external_diff_selection_persists() {
+		use super::ExternalDiffTool;
+		let td = TempDir::new().unwrap();
+		init_repo(&td);
+		let repo =
+			RefCell::new(RepoPath::Path(td.path().to_path_buf()));
+		let opts = Options::new(repo.clone());
+		opts.borrow_mut()
+			.set_external_diff_tool(ExternalDiffTool::Vscode);
+		assert_eq!(
+			Options::new(repo).borrow().external_diff_tool(),
+			ExternalDiffTool::Vscode
+		);
+	}
 
 	fn init_repo(td: &TempDir) {
 		for args in [

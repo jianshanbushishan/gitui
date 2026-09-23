@@ -30,6 +30,13 @@ pub trait AsyncProgress: Clone + Send + Sync {
 ///
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProgressNotification {
+	/// A new phase of a fetch across all remotes.
+	FetchPhase {
+		remote: String,
+		current: usize,
+		total: usize,
+		phase: FetchPhase,
+	},
 	///
 	UpdateTips {
 		///
@@ -45,6 +52,8 @@ pub enum ProgressNotification {
 		objects: usize,
 		///
 		total_objects: usize,
+		///
+		indexed_objects: usize,
 	},
 	///
 	PushTransfer {
@@ -65,6 +74,13 @@ pub enum ProgressNotification {
 		current: usize,
 	},
 	///
+	Done,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchPhase {
+	Branches,
+	Tags,
 	Done,
 }
 

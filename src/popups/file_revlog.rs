@@ -251,6 +251,17 @@ impl FileRevlogPopup {
 		self.selected_commit().is_some()
 	}
 
+	fn open_external_diff(&self) {
+		if let (Some(request), Some(commit_id)) =
+			(&self.open_request, self.selected_commit())
+		{
+			self.queue.push(InternalEvent::OpenExternalDiff(
+				request.file_path.clone(),
+				DiffType::Commit(commit_id),
+			));
+		}
+	}
+
 	fn get_title(&self) -> String {
 		let selected = {
 			let table = self.table_state.take();
@@ -539,6 +550,12 @@ impl Component for FileRevlogPopup {
 				) && self.can_focus_diff()
 				{
 					self.diff.focus(true);
+				} else if !self.diff.focused()
+					&& key_match(
+						key,
+						self.key_config.keys.external_diff,
+					) {
+					self.open_external_diff();
 				} else if key_match(key, self.key_config.keys.enter) {
 					if let Some(commit_id) = self.selected_commit() {
 						self.hide_stacked(true);
@@ -652,6 +669,11 @@ impl Component for FileRevlogPopup {
 				!self.diff.focused(),
 			));
 			out.push(CommandInfo::new(
+				strings::commands::external_diff(&self.key_config),
+				self.can_focus_diff(),
+				!self.diff.focused(),
+			));
+			out.push(CommandInfo::new(
 				strings::commands::diff_focus_left(&self.key_config),
 				true,
 				self.diff.focused(),
@@ -683,5 +705,45 @@ impl Component for FileRevlogPopup {
 		self.visible = true;
 
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use asyncgit::sync::CommitInfo;
+	use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+	#[test]
+	fn external_diff_uses_selected_revision_before_preview_loads() {
+		let env = Environment::test_env();
+		let mut popup = FileRevlogPopup::new(&env);
+		popup.visible = true;
+		popup.open_request = Some(FileRevOpen::new("file.rs".into()));
+		let commit_id = CommitId::default();
+		popup.items.set_items(
+			0,
+			vec![CommitInfo {
+				message: "change".into(),
+				time: 0,
+				author: "author".into(),
+				id: commit_id,
+			}],
+			None,
+		);
+		popup.set_selection(0);
+		let event = Event::Key(KeyEvent::new(
+			KeyCode::Char('d'),
+			KeyModifiers::empty(),
+		));
+		popup.event(&event).unwrap();
+		assert!(matches!(
+			env.queue.pop(),
+			Some(InternalEvent::OpenExternalDiff(path, DiffType::Commit(id)))
+				if path == "file.rs" && id == commit_id
+		));
+		popup.items.clear();
+		popup.event(&event).unwrap();
+		assert!(env.queue.pop().is_none());
 	}
 }

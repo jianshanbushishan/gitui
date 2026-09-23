@@ -8,7 +8,9 @@ use crate::{
 	error::{Error, Result},
 	sync::{
 		cred::BasicAuthCredential,
-		remotes::push::ProgressNotification, repository::repo, utils,
+		remotes::push::{FetchPhase, ProgressNotification},
+		repository::repo,
+		utils,
 	},
 	ProgressPercent,
 };
@@ -271,27 +273,54 @@ pub(crate) fn get_default_remote_in_repo(
 ///
 fn fetch_from_remote(
 	repo_path: &RepoPath,
-	remote: &str,
+	remote_name: &str,
+	current: usize,
+	total: usize,
 	basic_credential: Option<BasicAuthCredential>,
-	progress_sender: Option<Sender<ProgressNotification>>,
+	progress_sender: Option<&Sender<ProgressNotification>>,
 ) -> Result<()> {
 	let repo = repo(repo_path)?;
 
-	let mut remote = repo.find_remote(remote)?;
+	let mut remote = repo.find_remote(remote_name)?;
 
 	let mut options = FetchOptions::new();
-	let callbacks = Callbacks::new(progress_sender, basic_credential);
+	let callbacks =
+		Callbacks::new(progress_sender.cloned(), basic_credential);
 	options.prune(git2::FetchPrune::On);
 	options.proxy_options(proxy_auto());
 	options.download_tags(git2::AutotagOption::All);
 	options.remote_callbacks(callbacks.callbacks());
+	if let Some(sender) = &progress_sender {
+		sender.send(ProgressNotification::FetchPhase {
+			remote: remote_name.to_string(),
+			current,
+			total,
+			phase: FetchPhase::Branches,
+		})?;
+	}
 	remote.fetch(&[] as &[&str], Some(&mut options), None)?;
 	// fetch tags (also removing remotely deleted ones)
+	if let Some(sender) = &progress_sender {
+		sender.send(ProgressNotification::FetchPhase {
+			remote: remote_name.to_string(),
+			current,
+			total,
+			phase: FetchPhase::Tags,
+		})?;
+	}
 	remote.fetch(
 		&["refs/tags/*:refs/tags/*"],
 		Some(&mut options),
 		None,
 	)?;
+	if let Some(sender) = &progress_sender {
+		sender.send(ProgressNotification::FetchPhase {
+			remote: remote_name.to_string(),
+			current,
+			total,
+			phase: FetchPhase::Done,
+		})?;
+	}
 
 	Ok(())
 }
@@ -301,6 +330,33 @@ pub fn fetch_all(
 	repo_path: &RepoPath,
 	basic_credential: &Option<BasicAuthCredential>,
 	progress_sender: &Option<Sender<ProgressPercent>>,
+) -> Result<()> {
+	fetch_all_inner(
+		repo_path,
+		basic_credential.as_ref(),
+		None,
+		progress_sender.as_ref(),
+	)
+}
+
+pub(crate) fn fetch_all_with_progress(
+	repo_path: &RepoPath,
+	basic_credential: Option<&BasicAuthCredential>,
+	progress_sender: Option<&Sender<ProgressNotification>>,
+) -> Result<()> {
+	fetch_all_inner(
+		repo_path,
+		basic_credential,
+		progress_sender,
+		None,
+	)
+}
+
+fn fetch_all_inner(
+	repo_path: &RepoPath,
+	basic_credential: Option<&BasicAuthCredential>,
+	progress_sender: Option<&Sender<ProgressNotification>>,
+	remote_progress_sender: Option<&Sender<ProgressPercent>>,
 ) -> Result<()> {
 	scope_time!("fetch_all");
 
@@ -317,13 +373,13 @@ pub fn fetch_all(
 		fetch_from_remote(
 			repo_path,
 			&remote,
-			basic_credential.clone(),
-			None,
+			idx + 1,
+			remotes_count,
+			basic_credential.cloned(),
+			progress_sender,
 		)?;
-
-		if let Some(sender) = progress_sender {
-			let progress = ProgressPercent::new(idx, remotes_count);
-			sender.send(progress)?;
+		if let Some(sender) = remote_progress_sender {
+			sender.send(ProgressPercent::new(idx, remotes_count))?;
 		}
 	}
 
@@ -363,8 +419,56 @@ pub(crate) fn fetch(
 mod tests {
 	use super::*;
 	use crate::sync::tests::{
-		debug_cmd_print, repo_clone, repo_init,
+		debug_cmd_print, repo_clone, repo_init, write_commit_file,
 	};
+	use crossbeam_channel::unbounded;
+
+	#[test]
+	fn fetch_all_reports_transfer_and_phase_progress() {
+		let (remote_dir, remote) = repo_init().unwrap();
+		let remote_path = remote_dir.path().to_str().unwrap();
+		let (clone_dir, _clone) = repo_clone(remote_path).unwrap();
+		let clone_path: &RepoPath =
+			&clone_dir.path().to_str().unwrap().into();
+		write_commit_file(&remote, "new.txt", "new", "new commit");
+
+		let (sender, receiver) = unbounded();
+		fetch_all_with_progress(clone_path, None, Some(&sender))
+			.unwrap();
+		let events: Vec<_> = receiver.try_iter().collect();
+
+		assert!(events.iter().any(|event| matches!(
+			event,
+			ProgressNotification::FetchPhase {
+				remote,
+				current: 1,
+				total: 1,
+				phase: FetchPhase::Branches,
+			} if remote == "origin"
+		)));
+		assert!(events.iter().any(|event| matches!(
+			event,
+			ProgressNotification::Transfer {
+				objects,
+				total_objects,
+				..
+			} if *objects > 0 && *total_objects > 0
+		)));
+		assert!(events.iter().any(|event| matches!(
+			event,
+			ProgressNotification::FetchPhase {
+				phase: FetchPhase::Tags,
+				..
+			}
+		)));
+		assert!(matches!(
+			events.last(),
+			Some(ProgressNotification::FetchPhase {
+				phase: FetchPhase::Done,
+				..
+			})
+		));
+	}
 
 	#[test]
 	fn test_smoke() {

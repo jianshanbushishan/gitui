@@ -1316,6 +1316,15 @@ pub mod commands {
 			CMD_GROUP_COMMIT_POPUP,
 		)
 	}
+	pub fn external_diff(
+		key_config: &SharedKeyConfig,
+	) -> CommandText {
+		CommandText::new(
+            format!("ExternalDiff [{}]", key_config.get_hint(key_config.keys.external_diff)),
+            "compare the current file in the configured external diff tool",
+            CMD_GROUP_CHANGES,
+        )
+	}
 	pub fn edit_item(key_config: &SharedKeyConfig) -> CommandText {
 		CommandText::new(
 			format!(

@@ -1020,6 +1020,14 @@ impl Status {
 		);
 		out.push(
 			CommandInfo::new(
+				strings::commands::external_diff(&self.key_config),
+				self.can_focus_diff(),
+				(self.visible && !focus_on_diff) || force_all,
+			)
+			.order(strings::order::NAV),
+		);
+		out.push(
+			CommandInfo::new(
 				strings::commands::select_staging(&self.key_config),
 				!focus_on_diff,
 				(self.visible
@@ -1053,6 +1061,68 @@ mod tests {
 		uses_full_file_preview, PreviewResult, RightPane, Status,
 	};
 	use asyncgit::{AsyncGitNotification, StatusItemType};
+
+	#[test]
+	fn file_lists_open_external_diff_for_selected_side() {
+		use crate::{
+			app::Environment, components::Component,
+			queue::InternalEvent,
+		};
+		use crossterm::event::{
+			Event, KeyCode, KeyEvent, KeyModifiers,
+		};
+		let (dir, _git) = git2_testing::repo_init();
+		let mut env = Environment::test_env();
+		*env.repo.get_mut() = dir.path().to_path_buf().into();
+		let mut status = Status::new(&env);
+		status.visible = true;
+		let event = Event::Key(KeyEvent::new(
+			KeyCode::Char('d'),
+			KeyModifiers::NONE,
+		));
+		assert!(!status.can_focus_diff());
+		status.event(&event).unwrap();
+		assert!(env.queue.pop().is_none());
+		for (focus, target, kind) in [
+			(
+				super::Focus::WorkDir,
+				super::DiffTarget::WorkingDir,
+				asyncgit::DiffType::WorkDir,
+			),
+			(
+				super::Focus::Stage,
+				super::DiffTarget::Stage,
+				asyncgit::DiffType::Stage,
+			),
+		] {
+			let staged = focus == super::Focus::Stage;
+			status.focus = focus;
+			status.set_diff_target(target);
+			let tree = if staged {
+				&mut status.index
+			} else {
+				&mut status.index_wd
+			};
+			tree.set_items(&[asyncgit::StatusItem {
+				path: "selected.rs".into(),
+				status: StatusItemType::Modified,
+			}])
+			.unwrap();
+			let mut commands = Vec::new();
+			status.commands_nav(&mut commands, false);
+			assert!(commands.iter().any(|command| command
+				.text
+				.name
+				.starts_with("ExternalDiff")
+				&& command.show_in_quickbar()));
+			while env.queue.pop().is_some() {}
+			assert!(status.event(&event).unwrap().is_consumed());
+			assert!(
+				matches!(env.queue.pop(), Some(InternalEvent::OpenExternalDiff(path, actual)) if path == "selected.rs" && actual == kind)
+			);
+			assert_eq!(status.focus == super::Focus::Stage, staged);
+		}
+	}
 
 	#[test]
 	fn status_failure_ends_loading_and_is_consumed_while_hidden() {
@@ -1374,6 +1444,27 @@ impl Component for Status {
 			}
 
 			if let Event::Key(k) = ev {
+				if self.can_focus_diff()
+					&& key_match(
+						k,
+						self.key_config.keys.external_diff,
+					) {
+					if let Some((item, staged)) =
+						self.selected_status_item()
+					{
+						self.queue.push(
+							InternalEvent::OpenExternalDiff(
+								item.path,
+								if staged {
+									DiffType::Stage
+								} else {
+									DiffType::WorkDir
+								},
+							),
+						);
+						return Ok(EventState::Consumed);
+					}
+				}
 				return if key_match(
 					k,
 					self.key_config.keys.open_commit,

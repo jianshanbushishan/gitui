@@ -136,6 +136,23 @@ In the global `config.ron` (all optional):
 )
 ```
 
+#### External diff tools
+
+With a file diff focused, or a file selected in a list offering `Diff →`, press
+`d` (`ExternalDiff`) to compare its complete old/new versions in
+Beyond Compare (default), Neovim, or VS Code. In Options, select **External diff
+tool**, press Enter to open the dropdown, use Up/Down, then Enter to save (Esc
+cancels). The choice is saved per repository.
+
+Merge the settings in [external-diff.ron](external-diff.ron) into your global
+`config.ron` to customize executable paths and argument arrays. `{left}` and
+`{right}` expand to temporary snapshots; keep the tool's wait behavior enabled.
+Beyond Compare and VS Code run in the background while GitUI remains usable.
+Neovim uses the current terminal and returns to GitUI when closed.
+Snapshots are discarded when the viewer closes, so edits there do not modify
+the worktree. The `external_diff` key binding is configurable; the default
+binding for resetting selected diff lines is now `Alt+d` (Vim preset: `u`).
+
 #### Miscellaneous
 
 - The binary version string is derived from `git describe` and refreshes on every commit/checkout/tag.

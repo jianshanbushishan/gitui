@@ -119,6 +119,7 @@ pub struct App {
 	// "Flags"
 	requires_redraw: Cell<bool>,
 	file_to_open: Option<(String, Option<u32>)>,
+	diff_to_open: Option<(String, asyncgit::DiffType)>,
 }
 
 pub struct Environment {
@@ -242,6 +243,7 @@ impl App {
 			key_config: env.key_config,
 			requires_redraw: Cell::new(false),
 			file_to_open: None,
+			diff_to_open: None,
 			repo: env.repo,
 			popup_stack: PopupStack::default(),
 		};
@@ -365,7 +367,11 @@ impl App {
 		} else if let InputEvent::State(polling_state) = ev {
 			self.external_editor_popup.hide();
 			if matches!(polling_state, InputState::Paused) {
-				let result = if let Some((path, line)) =
+				let result = if let Some((path, diff_type)) =
+					self.diff_to_open.take()
+				{
+					self.open_external_diff(&path, &diff_type)
+				} else if let Some((path, line)) =
 					self.file_to_open.take()
 				{
 					ExternalEditorPopup::open_file_in_editor(
@@ -380,8 +386,9 @@ impl App {
 				};
 
 				if let Err(e) = result {
-					let msg =
-						format!("failed to launch editor:\n{e}");
+					let msg = format!(
+						"failed to launch external tool:\n{e}"
+					);
 					log::error!("{}", msg.as_str());
 					self.msg_popup.show_error(msg.as_str())?;
 				}
@@ -392,6 +399,21 @@ impl App {
 		}
 
 		Ok(())
+	}
+
+	fn open_external_diff(
+		&self,
+		path: &str,
+		diff_type: &asyncgit::DiffType,
+	) -> Result<()> {
+		let command =
+			self.options.borrow().external_diff_command()?;
+		crate::external_diff::open(
+			&self.repo.borrow(),
+			path,
+			diff_type,
+			&command,
+		)
 	}
 
 	//TODO: do we need this?
@@ -852,6 +874,32 @@ impl App {
 					flags.insert(NeedsUpdate::ALL);
 				}
 			}
+			InternalEvent::OpenExternalDiff(path, diff_type) => {
+				if self.options.borrow().external_diff_tool()
+					== crate::options::ExternalDiffTool::Nvim
+				{
+					self.diff_to_open = Some((path, diff_type));
+					self.input.set_polling(false);
+					self.external_editor_popup.show()?;
+				} else {
+					let result = self
+						.options
+						.borrow()
+						.external_diff_command()
+						.and_then(|command| {
+							crate::external_diff::open_gui(
+								&self.repo.borrow(),
+								&path,
+								&diff_type,
+								&command,
+							)
+						});
+					if let Err(error) = result {
+						self.msg_popup.show_error(&format!("failed to launch external diff tool:\n{error:#}"))?;
+					}
+				}
+				flags.insert(NeedsUpdate::ALL);
+			}
 			InternalEvent::OpenExternalEditor(path, line) => {
 				self.input.set_polling(false);
 				self.external_editor_popup.show()?;
@@ -922,6 +970,7 @@ impl App {
 			}
 			InternalEvent::OptionSwitched(o) => {
 				match o {
+					AppOption::ExternalDiffTool => {}
 					AppOption::StatusShowUntracked => {
 						self.status_tab.update()?;
 					}
