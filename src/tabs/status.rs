@@ -954,6 +954,10 @@ impl Status {
 
 	fn can_fetch(&self) -> bool {
 		self.remotes.has_remote_for_fetch
+	}
+
+	fn can_pull(&self) -> bool {
+		self.can_fetch()
 			&& self.git_branch_state.is_some()
 			&& self.git_branch_name.last().is_some_and(|branch| {
 				self.git_branch_state_branch.as_ref() == Some(&branch)
@@ -1061,6 +1065,39 @@ mod tests {
 		uses_full_file_preview, PreviewResult, RightPane, Status,
 	};
 	use asyncgit::{AsyncGitNotification, StatusItemType};
+
+	#[test]
+	fn fetch_is_available_without_an_upstream_branch() {
+		use crate::{app::Environment, queue::InternalEvent};
+
+		let (dir, repo) = git2_testing::repo_init();
+		let branch =
+			repo.head().unwrap().shorthand().unwrap().to_owned();
+		assert!(repo
+			.find_branch(&branch, git2::BranchType::Local)
+			.unwrap()
+			.upstream()
+			.is_err());
+
+		let mut env = Environment::test_env();
+		*env.repo.get_mut() = dir.path().to_path_buf().into();
+		let mut status = Status::new(&env);
+		status.check_remotes();
+		assert!(!status.can_fetch());
+		status.fetch();
+		assert!(env.queue.pop().is_none());
+
+		repo.remote("origin", dir.path().to_str().unwrap()).unwrap();
+		status.check_remotes();
+		assert!(status.can_fetch());
+		assert!(!status.can_pull());
+
+		status.fetch();
+		assert!(matches!(
+			env.queue.pop(),
+			Some(InternalEvent::FetchRemotes)
+		));
+	}
 
 	#[test]
 	fn file_lists_open_external_diff_for_selected_side() {
@@ -1372,7 +1409,7 @@ impl Component for Status {
 			));
 			out.push(CommandInfo::new(
 				strings::commands::status_pull(&self.key_config),
-				self.can_fetch(),
+				self.can_pull(),
 				!focus_on_diff,
 			));
 
@@ -1538,7 +1575,7 @@ impl Component for Status {
 					Ok(EventState::Consumed)
 				} else if key_match(k, self.key_config.keys.pull)
 					&& !self.is_focus_on_diff()
-					&& self.can_fetch()
+					&& self.can_pull()
 				{
 					self.pull();
 					Ok(EventState::Consumed)

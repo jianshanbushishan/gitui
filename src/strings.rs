@@ -547,6 +547,19 @@ pub mod commands {
 	static CMD_GROUP_LOG: &str = "-- Log --";
 	static CMD_GROUP_BRANCHES: &str = "-- Branches --";
 
+	pub fn retry_file_tree(
+		key_config: &SharedKeyConfig,
+	) -> CommandText {
+		CommandText::new(
+			format!(
+				"Retry [{}]",
+				key_config.get_hint(key_config.keys.enter)
+			),
+			"retry loading the file tree",
+			CMD_GROUP_GENERAL,
+		)
+	}
+
 	pub fn toggle_tabs(key_config: &SharedKeyConfig) -> CommandText {
 		CommandText::new(
 			format!(

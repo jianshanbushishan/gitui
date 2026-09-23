@@ -150,6 +150,8 @@ impl Component for CredComponent {
 
 	fn hide(&mut self) {
 		self.cred = BasicAuthCredential::new(None, None);
+		self.input_username.hide();
+		self.input_password.hide();
 		self.visible = false;
 	}
 
@@ -162,5 +164,37 @@ impl Component for CredComponent {
 		} else {
 			Ok(())
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+	#[test]
+	fn cancel_password_prompt_clears_nested_inputs() {
+		let env = Environment::test_env();
+		let mut input = CredComponent::new(&env);
+		input.set_cred(BasicAuthCredential::new(
+			Some("user".into()),
+			None,
+		));
+		input.show().unwrap();
+		assert!(input.input_password.is_visible());
+
+		input
+			.event(&Event::Key(KeyEvent::new(
+				KeyCode::Esc,
+				KeyModifiers::empty(),
+			)))
+			.unwrap();
+		assert!(!input.is_visible());
+		assert!(!input.input_username.is_visible());
+		assert!(!input.input_password.is_visible());
+
+		input.show().unwrap();
+		assert!(input.input_username.is_visible());
+		assert!(!input.input_password.is_visible());
 	}
 }

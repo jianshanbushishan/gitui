@@ -43,18 +43,28 @@ enum Focus {
 	File,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum TreeLoadState {
+	Loading,
+	Ready,
+	Failed(String),
+	NoCommits,
+}
+
 pub struct RevisionFilesComponent {
 	repo: RepoPathRef,
 	queue: Queue,
 	theme: SharedTheme,
 	//TODO: store TreeFiles in `tree`
 	files: Option<Vec<TreeFile>>,
+	load_state: TreeLoadState,
 	async_treefiles: AsyncSingleJob<AsyncTreeFilesJob>,
 	current_file: SyntaxTextComponent,
 	tree: FileTree,
 	scroll: VerticalScroll,
 	visible: bool,
 	revision: Option<CommitInfo>,
+	requested_commit: Option<CommitId>,
 	focus: Focus,
 	key_config: SharedKeyConfig,
 	select_file: Option<PathBuf>,
@@ -75,10 +85,12 @@ impl RevisionFilesComponent {
 			current_file: SyntaxTextComponent::new(env),
 			theme: env.theme.clone(),
 			files: None,
+			load_state: TreeLoadState::Loading,
 			async_treefiles: AsyncSingleJob::new(
 				env.sender_git.clone(),
 			),
 			revision: None,
+			requested_commit: None,
 			focus: Focus::Tree,
 			key_config: env.key_config.clone(),
 			repo: env.repo.clone(),
@@ -102,13 +114,67 @@ impl RevisionFilesComponent {
 
 		if !same_id {
 			self.files = None;
+			self.tree = FileTree::default();
+			self.current_file.clear();
+			self.revision = None;
+			self.requested_commit = Some(commit);
+			let revision =
+				match get_commit_info(&self.repo.borrow(), &commit) {
+					Ok(revision) => revision,
+					Err(error) => {
+						self.load_state = TreeLoadState::Failed(
+							format!("Unable to read commit: {error}"),
+						);
+						return Ok(());
+					}
+				};
+			self.load_state = TreeLoadState::Loading;
+			self.revision = Some(revision);
 
 			self.request_files(commit);
-
-			self.revision =
-				Some(get_commit_info(&self.repo.borrow(), &commit)?);
 		}
 
+		Ok(())
+	}
+
+	/// Show an empty repository without leaving the file tree loading.
+	pub fn set_no_commits(&mut self) {
+		self.revision = None;
+		self.requested_commit = None;
+		self.files = None;
+		self.tree = FileTree::default();
+		self.current_file.clear();
+		self.load_state = TreeLoadState::NoCommits;
+	}
+
+	/// Show a HEAD lookup error in the file tree.
+	pub fn set_head_error(&mut self, error: &str) {
+		self.revision = None;
+		self.requested_commit = None;
+		self.files = None;
+		self.tree = FileTree::default();
+		self.current_file.clear();
+		self.load_state = TreeLoadState::Failed(format!(
+			"Unable to read HEAD: {error}"
+		));
+	}
+
+	/// Whether Enter should retry a failed or unavailable tree.
+	pub fn can_retry(&self) -> bool {
+		matches!(
+			self.load_state,
+			TreeLoadState::Failed(_) | TreeLoadState::NoCommits
+		)
+	}
+
+	/// Retry loading the selected revision, if one exists.
+	pub fn retry_files(&mut self) -> Result<()> {
+		if let Some(revision) = &self.revision {
+			self.load_state = TreeLoadState::Loading;
+			self.request_files(revision.id);
+		} else if let Some(commit) = self.requested_commit {
+			self.set_commit(commit)?;
+		}
 		Ok(())
 	}
 
@@ -139,25 +205,7 @@ impl RevisionFilesComponent {
 					.as_ref()
 					.is_some_and(|commit| commit.id == result.commit)
 				{
-					if let Ok(last) = result.result {
-						let filenames: Vec<&Path> = last
-							.iter()
-							.map(|f| f.path.as_path())
-							.collect();
-						self.tree = FileTree::new(
-							&filenames,
-							&BTreeSet::new(),
-						)?;
-						self.tree.collapse_but_root();
-
-						self.files = Some(last);
-
-						let select_file = self.select_file.clone();
-						self.select_file = None;
-						if let Some(file) = select_file {
-							self.find_file(file.as_path());
-						}
-					}
+					self.apply_tree_result(result.result);
 				} else if let Some(rev) = &self.revision {
 					self.request_files(rev.id);
 				}
@@ -165,6 +213,42 @@ impl RevisionFilesComponent {
 		}
 
 		Ok(())
+	}
+
+	fn apply_tree_result(
+		&mut self,
+		result: asyncgit::Result<Vec<TreeFile>>,
+	) {
+		let result: Result<(FileTree, Vec<TreeFile>)> =
+			result.map_err(Into::into).and_then(|files| {
+				let filenames: Vec<&Path> = files
+					.iter()
+					.map(|file| file.path.as_path())
+					.collect();
+				let mut tree =
+					FileTree::new(&filenames, &BTreeSet::new())?;
+				tree.collapse_but_root();
+				Ok((tree, files))
+			});
+
+		match result {
+			Ok((tree, files)) => {
+				self.tree = tree;
+				self.files = Some(files);
+				self.load_state = TreeLoadState::Ready;
+				if let Some(file) = self.select_file.take() {
+					self.find_file(file.as_path());
+				}
+			}
+			Err(error) => {
+				self.files = None;
+				self.tree = FileTree::default();
+				self.current_file.clear();
+				self.load_state = TreeLoadState::Failed(format!(
+					"Unable to load files: {error}"
+				));
+			}
+		}
 	}
 
 	///
@@ -438,17 +522,32 @@ impl RevisionFilesComponent {
 			.borders(Borders::ALL)
 			.border_style(self.theme.block(is_tree_focused));
 
-		if self.files.is_some() {
+		if self.files.as_ref().is_some_and(|files| !files.is_empty())
+		{
 			ui::draw_list_block(f, area, block, items);
 		} else {
+			let retry_hint =
+				self.key_config.get_hint(self.key_config.keys.enter);
+			let message = match &self.load_state {
+				TreeLoadState::Loading => {
+					strings::loading_text(&self.key_config)
+				}
+				TreeLoadState::Ready => {
+					"This commit has no files.".into()
+				}
+				TreeLoadState::NoCommits => {
+					format!("No commits yet. Press {retry_hint} to retry.")
+				}
+				TreeLoadState::Failed(error) => {
+					format!("{error}. Press {retry_hint} to retry.")
+				}
+			};
 			ui::draw_list_block(
 				f,
 				area,
 				block,
 				vec![Span::styled(
-					Cow::from(strings::loading_text(
-						&self.key_config,
-					)),
+					Cow::from(message),
 					self.theme.text(false, false),
 				)]
 				.into_iter(),
@@ -542,6 +641,14 @@ impl Component for RevisionFilesComponent {
 
 		let is_tree_focused = matches!(self.focus, Focus::Tree);
 
+		if self.can_retry() {
+			out.push(CommandInfo::new(
+				strings::commands::retry_file_tree(&self.key_config),
+				true,
+				true,
+			));
+		}
+
 		if is_tree_focused || force_all {
 			out.push(
 				CommandInfo::new(
@@ -632,7 +739,12 @@ impl Component for RevisionFilesComponent {
 
 		if let Event::Key(key) = event {
 			let is_tree_focused = matches!(self.focus, Focus::Tree);
-			if is_tree_focused
+			if self.can_retry()
+				&& key_match(key, self.key_config.keys.enter)
+			{
+				self.retry_files()?;
+				return Ok(EventState::Consumed);
+			} else if is_tree_focused
 				&& tree_nav(&mut self.tree, &self.key_config, key)
 			{
 				self.selection_changed();
@@ -746,5 +858,74 @@ fn tree_nav(
 		true
 	} else {
 		false
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::keys::GituiKeyEvent;
+
+	#[test]
+	fn failed_tree_load_can_be_retried() {
+		let (dir, repo) = git2_testing::repo_init();
+		let env = Environment::test_env();
+		*env.repo.borrow_mut() = dir.path().to_str().unwrap().into();
+		let mut files = RevisionFilesComponent::new(&env, None);
+		let head = repo.head().unwrap().target().unwrap().into();
+		files.set_commit(head).unwrap();
+		files.apply_tree_result(Err(asyncgit::Error::NoHead));
+
+		assert!(matches!(
+			files.load_state,
+			TreeLoadState::Failed(ref message)
+				if message.contains("no head found")
+		));
+		assert!(files.files.is_none());
+		assert!(files.can_retry());
+
+		let retry = GituiKeyEvent::new(
+			env.key_config.keys.enter.code,
+			env.key_config.keys.enter.modifiers,
+		);
+		assert!(files
+			.event(&Event::Key((&retry).into()))
+			.unwrap()
+			.is_consumed());
+		assert_eq!(files.load_state, TreeLoadState::Loading);
+	}
+
+	#[test]
+	fn empty_commit_is_ready_without_files() {
+		let env = Environment::test_env();
+		let mut files = RevisionFilesComponent::new(&env, None);
+		files.apply_tree_result(Ok(Vec::new()));
+		assert_eq!(files.load_state, TreeLoadState::Ready);
+		assert!(files.files.as_ref().is_some_and(Vec::is_empty));
+		assert!(!files.can_retry());
+	}
+
+	#[test]
+	fn missing_commit_shows_retryable_error() {
+		let (dir, _repo) = git2_testing::repo_init();
+		let env = Environment::test_env();
+		*env.repo.borrow_mut() = dir.path().to_str().unwrap().into();
+		let mut files = RevisionFilesComponent::new(&env, None);
+		let missing = git2::Oid::from_str(
+			"0000000000000000000000000000000000000000",
+		)
+		.unwrap()
+		.into();
+
+		files.set_commit(missing).unwrap();
+		assert!(matches!(
+			files.load_state,
+			TreeLoadState::Failed(ref message)
+				if message.starts_with("Unable to read commit:")
+		));
+		assert!(files.revision().is_none());
+		assert!(files.can_retry());
+		files.retry_files().unwrap();
+		assert!(files.can_retry());
 	}
 }

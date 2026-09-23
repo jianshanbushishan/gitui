@@ -262,13 +262,13 @@ impl Component for PullPopup {
 				if self.input_cred.is_visible() {
 					self.input_cred.event(ev)?;
 
-					if self.input_cred.get_cred().is_complete()
-						|| !self.input_cred.is_visible()
-					{
+					if self.input_cred.get_cred().is_complete() {
 						self.fetch_from_remote(Some(
 							self.input_cred.get_cred().clone(),
 						))?;
 						self.input_cred.hide();
+					} else if !self.input_cred.is_visible() {
+						self.hide();
 					}
 				}
 			}
@@ -293,5 +293,29 @@ impl Component for PullPopup {
 		self.visible = true;
 
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+	#[test]
+	fn escape_from_credentials_cancels_pull() {
+		let env = Environment::test_env();
+		let mut popup = PullPopup::new(&env);
+		popup.show().unwrap();
+		popup.input_cred.show().unwrap();
+
+		popup
+			.event(&Event::Key(KeyEvent::new(
+				KeyCode::Esc,
+				KeyModifiers::empty(),
+			)))
+			.unwrap();
+
+		assert!(!popup.is_visible());
+		assert!(!popup.any_work_pending());
 	}
 }

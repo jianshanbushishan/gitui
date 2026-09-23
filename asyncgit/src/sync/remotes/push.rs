@@ -15,7 +15,9 @@ use crate::{
 	},
 };
 use crossbeam_channel::Sender;
-use git2::{PackBuilderStage, PushOptions};
+use git2::{
+	Direction, PackBuilderStage, PushOptions, Remote, Repository,
+};
 use scopetime::scope_time;
 use std::fmt::Write as _;
 
@@ -123,6 +125,73 @@ pub enum PushType {
 	Tag,
 }
 
+/// Push on the same connection that advertised the destination ref. The
+/// server checks the advertised old OID when applying the update, so a
+/// concurrent remote change after the advertisement rejects the push.
+fn push_with_checked_lease(
+	repo: &Repository,
+	remote: &mut Remote<'_>,
+	remote_name: &str,
+	destination: &str,
+	push_ref: &str,
+	options: &mut PushOptions<'_>,
+	basic_credential: Option<BasicAuthCredential>,
+) -> Result<()> {
+	let refuse = |reason: &str| {
+		Error::Generic(format!(
+			"force push to '{destination}' refused: {reason}"
+		))
+	};
+
+	// A push URL may point at another repository, whose history the fetch
+	// tracking ref does not represent.
+	if let Some(push_url) = remote.pushurl()? {
+		if push_url != remote.url()? {
+			return Err(refuse("push URL differs from fetch URL; cannot verify the remote branch"));
+		}
+	}
+
+	let mut tracking_ref = None;
+	for refspec in remote.refspecs() {
+		if refspec.direction() != Direction::Fetch
+			|| !refspec.src_matches(destination)
+		{
+			continue;
+		}
+		let mapped =
+			refspec.transform(destination)?.as_str()?.to_owned();
+		if tracking_ref.as_ref().is_some_and(|old| old != &mapped) {
+			return Err(refuse("ambiguous remote-tracking refs; check fetch refspecs"));
+		}
+		tracking_ref = Some(mapped);
+	}
+	let tracking_ref = tracking_ref.ok_or_else(|| {
+		refuse("no matching fetch refspec for the destination branch")
+	})?;
+	let expected = repo
+		.find_reference(&tracking_ref)
+		.ok()
+		.and_then(|reference| reference.resolve().ok()?.target())
+		.ok_or_else(|| refuse(&format!("remote-tracking ref is missing; fetch '{remote_name}' and retry")))?;
+
+	let callbacks = Callbacks::new(None, basic_credential);
+	let mut connection = remote.connect_auth(
+		Direction::Push,
+		Some(callbacks.callbacks()),
+		Some(proxy_auto()),
+	)?;
+	let actual = connection
+		.list()?
+		.iter()
+		.find(|head| head.name() == destination)
+		.map(git2::RemoteHead::oid);
+	if actual != Some(expected) {
+		return Err(refuse(&format!("remote branch changed since last fetch; fetch '{remote_name}' and retry")));
+	}
+	connection.remote().push(&[push_ref], Some(options))?;
+	Ok(())
+}
+
 #[cfg(test)]
 pub fn push_branch(
 	repo_path: &RepoPath,
@@ -160,7 +229,7 @@ pub fn push_raw(
 	scope_time!("push");
 
 	let repo = repo(repo_path)?;
-	let mut remote = repo.find_remote(remote)?;
+	let mut remote_handle = repo.find_remote(remote)?;
 
 	let push_default_strategy =
 		push_default_strategy_config_repo(&repo)?;
@@ -168,7 +237,8 @@ pub fn push_raw(
 	let mut options = PushOptions::new();
 	options.proxy_options(proxy_auto());
 
-	let callbacks = Callbacks::new(progress_sender, basic_credential);
+	let callbacks =
+		Callbacks::new(progress_sender, basic_credential.clone());
 	options.remote_callbacks(callbacks.callbacks());
 	options.packbuilder_parallelism(0);
 
@@ -199,7 +269,23 @@ pub fn push_raw(
 	}
 
 	log::debug!("push to: {push_ref}");
-	remote.push(&[push_ref], Some(&mut options))?;
+	if force && !delete && ref_type == PushType::Branch {
+		let destination = push_ref.split_once(':').map_or_else(
+			|| format!("refs/heads/{branch}"),
+			|(_, dst)| dst.to_owned(),
+		);
+		push_with_checked_lease(
+			&repo,
+			&mut remote_handle,
+			remote,
+			&destination,
+			&push_ref,
+			&mut options,
+			basic_credential.clone(),
+		)?;
+	} else {
+		remote_handle.push(&[push_ref], Some(&mut options))?;
+	}
 
 	if let Some((reference, msg)) =
 		callbacks.get_stats()?.push_rejected_msg
@@ -273,6 +359,11 @@ mod tests {
 			None,
 		)
 		.unwrap();
+		other_repo
+			.find_remote("origin")
+			.unwrap()
+			.fetch(&[] as &[&str], None, None)
+			.unwrap();
 
 		let tmp_other_repo_file_path =
 			tmp_other_repo_dir.path().join("temp_file.txt");
@@ -379,6 +470,11 @@ mod tests {
 			None,
 		)
 		.unwrap();
+		other_repo
+			.find_remote("origin")
+			.unwrap()
+			.fetch(&[] as &[&str], None, None)
+			.unwrap();
 
 		let tmp_other_repo_file_path =
 			tmp_other_repo_dir.path().join("temp_file.txt");
@@ -454,6 +550,170 @@ mod tests {
 				.unwrap()
 				.id();
 		assert_eq!(new_upstream_parent, repo_2_parent,);
+	}
+
+	#[test]
+	fn test_force_push_requires_current_tracking_ref() {
+		let (first_dir, first_repo) = repo_init().unwrap();
+		let (second_dir, second_repo) = repo_init().unwrap();
+		let (remote_dir, remote_repo) = repo_init_bare().unwrap();
+		let remote_path = remote_dir.path().to_str().unwrap();
+		first_repo.remote("origin", remote_path).unwrap();
+		second_repo.remote("origin", remote_path).unwrap();
+		let first_path = &first_dir.path().to_str().unwrap().into();
+		let second_path = &second_dir.path().to_str().unwrap().into();
+
+		let initial = write_commit_file(
+			&first_repo,
+			"first.txt",
+			"initial",
+			"initial",
+		);
+		push_branch(
+			first_path, "origin", "master", false, false, None, None,
+		)
+		.unwrap();
+		write_commit_file(
+			&second_repo,
+			"second.txt",
+			"second",
+			"second",
+		);
+
+		// A local branch without a fetched view of the remote cannot lease it.
+		let missing = push_branch(
+			second_path,
+			"origin",
+			"master",
+			true,
+			false,
+			None,
+			None,
+		)
+		.unwrap_err()
+		.to_string();
+		assert!(missing.contains("remote-tracking ref is missing"));
+		assert_eq!(
+			remote_repo.refname_to_id("refs/heads/master").unwrap(),
+			initial.into()
+		);
+
+		second_repo
+			.find_remote("origin")
+			.unwrap()
+			.fetch(&[] as &[&str], None, None)
+			.unwrap();
+		let newer = write_commit_file(
+			&first_repo,
+			"first.txt",
+			"updated",
+			"updated",
+		);
+		push_branch(
+			first_path, "origin", "master", false, false, None, None,
+		)
+		.unwrap();
+
+		let stale = push_branch(
+			second_path,
+			"origin",
+			"master",
+			true,
+			false,
+			None,
+			None,
+		)
+		.unwrap_err()
+		.to_string();
+		assert!(
+			stale.contains("remote branch changed since last fetch")
+		);
+		assert_eq!(
+			remote_repo.refname_to_id("refs/heads/master").unwrap(),
+			newer.into()
+		);
+
+		// Once the user has fetched the new remote state, rewriting it is
+		// an informed choice and the lease passes.
+		second_repo
+			.find_remote("origin")
+			.unwrap()
+			.fetch(&[] as &[&str], None, None)
+			.unwrap();
+		push_branch(
+			second_path,
+			"origin",
+			"master",
+			true,
+			false,
+			None,
+			None,
+		)
+		.unwrap();
+		assert_eq!(
+			remote_repo.refname_to_id("refs/heads/master").unwrap(),
+			second_repo.refname_to_id("refs/heads/master").unwrap()
+		);
+	}
+
+	#[test]
+	fn test_force_push_leases_upstream_destination() {
+		let (local_dir, local_repo) = repo_init().unwrap();
+		let (remote_dir, remote_repo) = repo_init_bare().unwrap();
+		local_repo
+			.remote("origin", remote_dir.path().to_str().unwrap())
+			.unwrap();
+		let pushed = write_commit_file(
+			&local_repo,
+			"file.txt",
+			"first",
+			"first",
+		);
+		local_repo
+			.find_remote("origin")
+			.unwrap()
+			.push(&["refs/heads/master:refs/heads/review"], None)
+			.unwrap();
+		let mut config = local_repo.config().unwrap();
+		config.set_str("push.default", "upstream").unwrap();
+		config.set_str("branch.master.remote", "origin").unwrap();
+		config
+			.set_str("branch.master.merge", "refs/heads/review")
+			.unwrap();
+		local_repo
+			.find_remote("origin")
+			.unwrap()
+			.fetch(&[] as &[&str], None, None)
+			.unwrap();
+		assert_eq!(
+			local_repo
+				.refname_to_id("refs/remotes/origin/review")
+				.unwrap(),
+			pushed.into()
+		);
+		let rewritten = write_commit_file(
+			&local_repo,
+			"file.txt",
+			"rewrite",
+			"rewrite",
+		);
+		push_branch(
+			&local_dir.path().to_str().unwrap().into(),
+			"origin",
+			"master",
+			true,
+			false,
+			None,
+			None,
+		)
+		.unwrap();
+		assert_eq!(
+			remote_repo.refname_to_id("refs/heads/review").unwrap(),
+			rewritten.into()
+		);
+		assert!(remote_repo
+			.refname_to_id("refs/heads/master")
+			.is_err());
 	}
 
 	#[test]

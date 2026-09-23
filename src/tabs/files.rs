@@ -6,13 +6,19 @@ use crate::{
 		visibility_blocking, CommandBlocking, CommandInfo, Component,
 		DrawableComponent, EventState, RevisionFilesComponent,
 	},
+	keys::{key_match, SharedKeyConfig},
 	AsyncNotification,
 };
 use anyhow::Result;
-use asyncgit::sync::{self, RepoPathRef};
+use asyncgit::{
+	sync::{self, RepoPathRef},
+	Error as GitError,
+};
+use crossterm::event::Event;
 
 pub struct FilesTab {
 	repo: RepoPathRef,
+	key_config: SharedKeyConfig,
 	visible: bool,
 	files: RevisionFilesComponent,
 }
@@ -27,14 +33,25 @@ impl FilesTab {
 			visible: false,
 			files: RevisionFilesComponent::new(env, select_file),
 			repo: env.repo.clone(),
+			key_config: env.key_config.clone(),
 		}
 	}
 
 	///
 	pub fn update(&mut self) -> Result<()> {
 		if self.is_visible() {
-			if let Ok(head) = sync::get_head(&self.repo.borrow()) {
-				self.files.set_commit(head)?;
+			match sync::get_head(&self.repo.borrow()) {
+				Ok(head) => self.files.set_commit(head)?,
+				Err(GitError::NoHead) => self.files.set_no_commits(),
+				Err(GitError::Git(error))
+					if error.code()
+						== git2::ErrorCode::UnbornBranch =>
+				{
+					self.files.set_no_commits();
+				}
+				Err(error) => {
+					self.files.set_head_error(&error.to_string())
+				}
 			}
 		}
 
@@ -107,6 +124,15 @@ impl Component for FilesTab {
 		ev: &crossterm::event::Event,
 	) -> Result<EventState> {
 		if self.visible {
+			if let Event::Key(key) = ev {
+				if self.files.can_retry()
+					&& self.files.revision().is_none()
+					&& key_match(key, self.key_config.keys.enter)
+				{
+					self.update()?;
+					return Ok(EventState::Consumed);
+				}
+			}
 			return self.files.event(ev);
 		}
 
@@ -125,5 +151,43 @@ impl Component for FilesTab {
 		self.visible = true;
 		self.update()?;
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn unborn_head_shows_empty_state_and_can_retry_after_commit() {
+		let (dir, repo) = git2_testing::repo_init_empty();
+		let env = Environment::test_env();
+		*env.repo.borrow_mut() = dir.path().to_str().unwrap().into();
+		let mut tab = FilesTab::new(&env, None);
+		tab.show().unwrap();
+
+		assert!(tab.files.can_retry());
+		assert!(tab.files.revision().is_none());
+
+		let tree = repo.treebuilder(None).unwrap().write().unwrap();
+		let tree = repo.find_tree(tree).unwrap();
+		let signature = repo.signature().unwrap();
+		let head = repo
+			.commit(
+				Some("HEAD"),
+				&signature,
+				&signature,
+				"initial",
+				&tree,
+				&[],
+			)
+			.unwrap();
+
+		let enter = (&env.key_config.keys.enter).into();
+		assert!(tab.event(&Event::Key(enter)).unwrap().is_consumed());
+		assert_eq!(
+			tab.files.revision().map(|c| c.id),
+			Some(head.into())
+		);
 	}
 }
