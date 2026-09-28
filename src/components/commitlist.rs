@@ -46,6 +46,8 @@ pub struct CommitList {
 	highlighted_selection: Option<usize>,
 	items: ItemBatch,
 	highlights: Option<Rc<IndexSet<CommitId>>>,
+	all_commits: IndexSet<CommitId>,
+	filter: Option<Rc<IndexSet<CommitId>>>,
 	commits: IndexSet<CommitId>,
 	/// The marked commits.
 	/// `self.marked[].0` holds the commit index into `self.items.items` - used for ordering the list.
@@ -76,6 +78,8 @@ impl CommitList {
 			selection: 0,
 			highlighted_selection: None,
 			commits: IndexSet::new(),
+			all_commits: IndexSet::new(),
+			filter: None,
 			highlights: None,
 			scroll_state: (Instant::now(), 0_f32),
 			tags: None,
@@ -100,6 +104,7 @@ impl CommitList {
 	pub fn clear(&mut self) {
 		self.items.clear();
 		self.commits.clear();
+		self.all_commits.clear();
 	}
 
 	/// Start browsing a different history with no previous selection or marks.
@@ -109,6 +114,7 @@ impl CommitList {
 		self.title = title.into_boxed_str();
 		self.selection = 0;
 		self.highlights = None;
+		self.filter = None;
 		self.highlighted_selection = None;
 		self.clear_marked();
 		self.scroll_top.set(0);
@@ -118,7 +124,7 @@ impl CommitList {
 
 	///
 	pub fn copy_items(&self) -> Vec<CommitId> {
-		self.commits.iter().copied().collect_vec()
+		self.all_commits.iter().copied().collect_vec()
 	}
 
 	///
@@ -229,9 +235,10 @@ impl CommitList {
 
 	///
 	pub fn set_commits(&mut self, commits: IndexSet<CommitId>) {
-		if commits != self.commits {
+		if commits != self.all_commits {
 			self.items.clear();
-			self.commits = commits;
+			self.all_commits = commits;
+			self.rebuild_visible_commits();
 			self.fetch_commits(false);
 		}
 	}
@@ -239,7 +246,12 @@ impl CommitList {
 	///
 	pub fn refresh_extend_data(&mut self, commits: Vec<CommitId>) {
 		let new_commits = !commits.is_empty();
-		self.commits.extend(commits);
+		self.all_commits.extend(commits.iter().copied());
+		self.commits.extend(commits.into_iter().filter(|id| {
+			self.filter
+				.as_ref()
+				.is_none_or(|filter| filter.contains(id))
+		}));
 
 		let selection = self.selection();
 		let selection_max = self.selection_max();
@@ -247,6 +259,42 @@ impl CommitList {
 		if self.needs_data(selection, selection_max) || new_commits {
 			self.fetch_commits(false);
 		}
+	}
+
+	/// Limit the visible rows to the matching commits, keeping the full
+	/// history available for another search and for restoring the list.
+	pub fn set_filter(
+		&mut self,
+		filter: Option<Rc<IndexSet<CommitId>>>,
+	) {
+		if self.filter.is_none() && filter.is_none() {
+			return;
+		}
+		self.filter = filter;
+		self.rebuild_visible_commits();
+		self.clear_marked();
+		self.items.clear();
+		self.fetch_commits(true);
+	}
+
+	fn rebuild_visible_commits(&mut self) {
+		let selected =
+			self.commits.get_index(self.selection).copied();
+		self.commits = self
+			.all_commits
+			.iter()
+			.filter(|id| {
+				self.filter
+					.as_ref()
+					.is_none_or(|filter| filter.contains(*id))
+			})
+			.copied()
+			.collect();
+		self.selection = selected
+			.and_then(|id| self.commits.get_index_of(&id))
+			.unwrap_or(0);
+		self.scroll_top.set(0);
+		self.set_highlighted_selection_index();
 	}
 
 	///
@@ -313,9 +361,9 @@ impl CommitList {
 	fn set_highlighted_selection_index(&mut self) {
 		self.highlighted_selection =
 			self.highlights.as_ref().and_then(|highlights| {
-				highlights.iter().position(|entry| {
-					entry == &self.commits[self.selection]
-				})
+				let selected =
+					self.commits.get_index(self.selection)?;
+				highlights.iter().position(|entry| entry == selected)
 			});
 	}
 
@@ -765,11 +813,13 @@ impl CommitList {
 	}
 
 	fn selection_highlighted(&self) -> bool {
-		let commit = self.commits[self.selection];
-
-		self.highlights
-			.as_ref()
-			.is_some_and(|highlights| highlights.contains(&commit))
+		self.commits
+			.get_index(self.selection)
+			.is_some_and(|commit| {
+				self.highlights.as_ref().is_some_and(|highlights| {
+					highlights.contains(commit)
+				})
+			})
 	}
 
 	fn needs_data(&self, idx: usize, idx_max: usize) -> bool {
@@ -980,6 +1030,8 @@ mod tests {
 				tags: Option::None,
 				items: ItemBatch::default(),
 				commits: IndexSet::default(),
+				all_commits: IndexSet::default(),
+				filter: None,
 				marked: Vec::default(),
 				scroll_top: Cell::default(),
 				center_next_scroll: Cell::default(),

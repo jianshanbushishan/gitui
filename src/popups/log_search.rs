@@ -29,6 +29,7 @@ enum Selection {
 	EnterText,
 	FuzzyOption,
 	CaseOption,
+	FilterResultsOption,
 	SummarySearch,
 	MessageBodySearch,
 	FilenameSearch,
@@ -76,7 +77,7 @@ impl LogSearchPopupPopup {
 					| SearchFields::AUTHORS
 					| SearchFields::COMMIT_HASHES,
 				// Disable fuzzy search by default (use exact match)
-				SearchOptions::empty(),
+				SearchOptions::FILTER_RESULTS,
 			),
 			theme: env.theme.clone(),
 			find_text,
@@ -222,6 +223,13 @@ impl LogSearchPopupPopup {
 			} else {
 				" "
 			};
+		let x_filter_results =
+			if self.options.1.contains(SearchOptions::FILTER_RESULTS)
+			{
+				"X"
+			} else {
+				" "
+			};
 
 		vec![
 			Line::from(vec![Span::styled(
@@ -235,6 +243,16 @@ impl LogSearchPopupPopup {
 				format!("[{x_opt_casesensitive}] case sensitive"),
 				self.theme.text(
 					matches!(self.selection, Selection::CaseOption),
+					false,
+				),
+			)]),
+			Line::from(vec![Span::styled(
+				format!("[{x_filter_results}] filter results"),
+				self.theme.text(
+					matches!(
+						self.selection,
+						Selection::FilterResultsOption
+					),
 					false,
 				),
 			)]),
@@ -304,6 +322,9 @@ impl LogSearchPopupPopup {
 			Selection::CaseOption => {
 				self.options.1.toggle(SearchOptions::CASE_SENSITIVE);
 			}
+			Selection::FilterResultsOption => {
+				self.options.1.toggle(SearchOptions::FILTER_RESULTS);
+			}
 			Selection::SummarySearch => {
 				self.options.0.toggle(SearchFields::MESSAGE_SUMMARY);
 
@@ -355,7 +376,12 @@ impl LogSearchPopupPopup {
 				Selection::EnterText => Selection::CommitHashSearch,
 				Selection::FuzzyOption => Selection::EnterText,
 				Selection::CaseOption => Selection::FuzzyOption,
-				Selection::SummarySearch => Selection::CaseOption,
+				Selection::FilterResultsOption => {
+					Selection::CaseOption
+				}
+				Selection::SummarySearch => {
+					Selection::FilterResultsOption
+				}
 				Selection::MessageBodySearch => {
 					Selection::SummarySearch
 				}
@@ -371,7 +397,12 @@ impl LogSearchPopupPopup {
 			self.selection = match self.selection {
 				Selection::EnterText => Selection::FuzzyOption,
 				Selection::FuzzyOption => Selection::CaseOption,
-				Selection::CaseOption => Selection::SummarySearch,
+				Selection::CaseOption => {
+					Selection::FilterResultsOption
+				}
+				Selection::FilterResultsOption => {
+					Selection::SummarySearch
+				}
 				Selection::SummarySearch => {
 					Selection::MessageBodySearch
 				}
@@ -395,7 +426,7 @@ impl LogSearchPopupPopup {
 		f: &mut Frame,
 		area: Rect,
 	) -> Result<()> {
-		const SIZE: (u16, u16) = (60, 11);
+		const SIZE: (u16, u16) = (60, 12);
 		let area = ui::centered_rect_absolute(SIZE.0, SIZE.1, area);
 
 		f.render_widget(Clear, area);
@@ -678,6 +709,7 @@ impl Component for LogSearchPopupPopup {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::queue::InternalEvent;
 
 	#[test]
 	fn input_mode_requires_visible_popup_and_text_selection() {
@@ -696,5 +728,35 @@ mod tests {
 
 		popup.hide();
 		assert!(!popup.is_input_mode());
+	}
+
+	#[test]
+	fn filter_results_is_checked_by_default_and_can_be_toggled() {
+		let env = Environment::test_env();
+		let mut popup = LogSearchPopupPopup::new(&env);
+		assert!(popup
+			.options
+			.1
+			.contains(SearchOptions::FILTER_RESULTS));
+		popup.open().unwrap();
+		for _ in 0..3 {
+			popup.move_selection(false);
+		}
+		assert!(matches!(
+			popup.selection,
+			Selection::FilterResultsOption
+		));
+		popup.toggle_option();
+		assert!(!popup
+			.options
+			.1
+			.contains(SearchOptions::FILTER_RESULTS));
+		popup.find_text.set_text("term".into());
+		popup.execute_confirm();
+		assert!(matches!(
+			env.queue.pop(),
+			Some(InternalEvent::CommitSearch(options))
+				if !options.options.contains(SearchOptions::FILTER_RESULTS)
+		));
 	}
 }

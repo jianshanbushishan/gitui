@@ -18,7 +18,7 @@ use asyncgit::{
 	asyncjob::AsyncSingleJob,
 	sync::{
 		self, filter_commit_by_search, CommitId, LogFilterSearch,
-		LogFilterSearchOptions, RepoPathRef,
+		LogFilterSearchOptions, RepoPathRef, SearchOptions,
 	},
 	AsyncBranchesJob, AsyncCommitFilterJob, AsyncGitNotification,
 	AsyncLog, AsyncTags, CommitFilesParams, FetchStatus,
@@ -223,7 +223,11 @@ impl Revlog {
 				AsyncGitNotification::CommitFiles
 				| AsyncGitNotification::Log => self.update()?,
 				AsyncGitNotification::CommitFilter => {
+					let was_pending = self.is_search_pending();
 					self.update_search_state();
+					if was_pending && !self.is_search_pending() {
+						self.update()?;
+					}
 				}
 				AsyncGitNotification::Tags => {
 					if let Some(tags) = self.git_tags.last()? {
@@ -314,6 +318,9 @@ impl Revlog {
 			LogSearch::Off | LogSearch::Results(_)
 		) {
 			log::info!("start search: {options:?}");
+			if matches!(self.search, LogSearch::Results(_)) {
+				self.list.set_filter(None);
+			}
 
 			let filter = filter_commit_by_search(
 				LogFilterSearch::new(options.clone()),
@@ -376,14 +383,21 @@ impl Revlog {
 							self.search = if was_aborted {
 								LogSearch::Off
 							} else {
+								let matches = Rc::new(
+									search
+										.result
+										.into_iter()
+										.collect::<IndexSet<_>>(),
+								);
 								self.list.set_highlighting(Some(
-									Rc::new(
-										search
-											.result
-											.into_iter()
-											.collect::<IndexSet<_>>(),
-									),
+									Rc::clone(&matches),
 								));
+								if options.options.contains(
+									SearchOptions::FILTER_RESULTS,
+								) {
+									self.list
+										.set_filter(Some(matches));
+								}
 
 								LogSearch::Results(LogSearchResult {
 									options: options.clone(),
@@ -602,7 +616,9 @@ impl Component for Revlog {
 						self.cancel_search();
 					} else if self.can_close_search() {
 						self.list.set_highlighting(None);
+						self.list.set_filter(None);
 						self.search = LogSearch::Off;
+						self.update()?;
 					} else if self.viewing_branch.is_some() {
 						self.return_to_head()?;
 						self.update()?;
@@ -898,6 +914,7 @@ impl Component for Revlog {
 mod tests {
 	use super::*;
 	use crate::keys::GituiKeyEvent;
+	use asyncgit::sync::SearchFields;
 	use crossbeam_channel::{unbounded, Receiver};
 	use std::time::Instant;
 
@@ -963,6 +980,61 @@ mod tests {
 			.event(&Event::Key((&key).into()))
 			.unwrap()
 			.is_consumed());
+	}
+
+	fn finish_search(log: &mut Revlog) {
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while log.is_search_pending() {
+			assert!(
+				Instant::now() < deadline,
+				"search did not finish"
+			);
+			log.update_search_state();
+			std::thread::sleep(Duration::from_millis(5));
+		}
+	}
+
+	#[test]
+	fn search_filter_shows_matches_and_restores_full_history() {
+		let (_dir, env, _receiver, head, _branch) = fixture();
+		let mut log = Revlog::new(&env);
+		log.visible = true;
+		log.update().unwrap();
+		finish_loading(&mut log);
+		let all_commits = log.list.copy_items();
+		assert!(all_commits.len() > 1);
+
+		let options =
+			|pattern: &str, filter| LogFilterSearchOptions {
+				search_pattern: pattern.into(),
+				fields: SearchFields::MESSAGE_SUMMARY,
+				options: if filter {
+					SearchOptions::FILTER_RESULTS
+				} else {
+					SearchOptions::empty()
+				},
+			};
+
+		log.search(options("current branch", true));
+		finish_search(&mut log);
+		assert_eq!(log.selected_commit(), Some(head));
+		assert!(log.list.select_commit(all_commits[1]).is_err());
+		assert_eq!(log.list.copy_items(), all_commits);
+
+		log.search(options("never-matches-this-commit", true));
+		finish_search(&mut log);
+		assert!(log.list.selected_entry().is_none());
+		assert!(log.list.select_commit(head).is_err());
+		assert_eq!(log.list.copy_items(), all_commits);
+
+		press(&mut log, env.key_config.keys.exit_popup);
+		assert_eq!(log.list.copy_items(), all_commits);
+		assert!(log.list.select_commit(all_commits[1]).is_ok());
+
+		log.search(options("current branch", false));
+		finish_search(&mut log);
+		assert!(log.list.select_commit(all_commits[1]).is_ok());
+		assert_eq!(log.list.highlighted_selection_info().1, 1);
 	}
 
 	#[test]

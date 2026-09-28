@@ -88,6 +88,8 @@ bitflags! {
 		const CASE_SENSITIVE = 1 << 0;
 		///
 		const FUZZY_SEARCH = 1 << 1;
+		/// Show only matching commits in the log while search results are open.
+		const FILTER_RESULTS = 1 << 2;
 	}
 }
 
