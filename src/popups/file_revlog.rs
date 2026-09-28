@@ -36,6 +36,7 @@ const SLICE_SIZE: usize = 1200;
 pub struct FileRevOpen {
 	pub file_path: String,
 	pub selection: Option<usize>,
+	pub is_directory: bool,
 }
 
 impl FileRevOpen {
@@ -43,6 +44,15 @@ impl FileRevOpen {
 		Self {
 			file_path,
 			selection: None,
+			is_directory: false,
+		}
+	}
+
+	pub const fn new_directory(file_path: String) -> Self {
+		Self {
+			file_path,
+			selection: None,
+			is_directory: true,
 		}
 	}
 }
@@ -160,6 +170,13 @@ impl FileRevlogPopup {
 	}
 
 	pub fn update_diff(&mut self) -> Result<()> {
+		if self
+			.open_request
+			.as_ref()
+			.is_some_and(|request| request.is_directory)
+		{
+			return Ok(());
+		}
 		if self.is_visible() {
 			if let Some(commit_id) = self.selected_commit() {
 				if let Some(open_request) = &self.open_request {
@@ -249,9 +266,16 @@ impl FileRevlogPopup {
 
 	fn can_focus_diff(&self) -> bool {
 		self.selected_commit().is_some()
+			&& self
+				.open_request
+				.as_ref()
+				.is_some_and(|request| !request.is_directory)
 	}
 
 	fn open_external_diff(&self) {
+		if !self.can_focus_diff() {
+			return;
+		}
 		if let (Some(request), Some(commit_id)) =
 			(&self.open_request, self.selected_commit())
 		{
@@ -487,6 +511,7 @@ impl FileRevlogPopup {
 					StackablePopupOpen::FileRevlog(FileRevOpen {
 						file_path: open_request.file_path,
 						selection: self.get_selection(),
+						is_directory: open_request.is_directory,
 					}),
 				));
 			}
@@ -501,7 +526,13 @@ impl DrawableComponent for FileRevlogPopup {
 		if self.visible {
 			let left_ratio =
 				self.options.borrow().detail_left_ratio();
-			let percentages = if self.diff.focused() {
+			let is_directory = self
+				.open_request
+				.as_ref()
+				.is_some_and(|request| request.is_directory);
+			let percentages = if is_directory {
+				(100, 0)
+			} else if self.diff.focused() {
 				(0, 100)
 			} else {
 				(left_ratio, 100 - left_ratio)
@@ -518,7 +549,9 @@ impl DrawableComponent for FileRevlogPopup {
 			f.render_widget(Clear, area);
 
 			self.draw_revlog(f, chunks[0]);
-			self.diff.draw(f, chunks[1])?;
+			if !is_directory {
+				self.diff.draw(f, chunks[1])?;
+			}
 		}
 
 		Ok(())
@@ -565,7 +598,12 @@ impl Component for FileRevlogPopup {
 							),
 						));
 					}
-				} else if key_match(key, self.key_config.keys.blame) {
+				} else if key_match(key, self.key_config.keys.blame)
+					&& self
+						.open_request
+						.as_ref()
+						.is_some_and(|request| !request.is_directory)
+				{
 					if let Some(open_request) =
 						self.open_request.clone()
 					{
@@ -654,14 +692,22 @@ impl Component for FileRevlogPopup {
 				)
 				.order(1),
 			);
-			out.push(
-				CommandInfo::new(
-					strings::commands::blame_file(&self.key_config),
-					true,
-					self.selected_commit().is_some(),
-				)
-				.order(1),
-			);
+			if self
+				.open_request
+				.as_ref()
+				.is_some_and(|request| !request.is_directory)
+			{
+				out.push(
+					CommandInfo::new(
+						strings::commands::blame_file(
+							&self.key_config,
+						),
+						true,
+						self.selected_commit().is_some(),
+					)
+					.order(1),
+				);
+			}
 
 			out.push(CommandInfo::new(
 				strings::commands::diff_focus_right(&self.key_config),

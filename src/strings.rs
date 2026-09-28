@@ -1634,7 +1634,7 @@ pub mod commands {
 				"History [{}]",
 				key_config.get_hint(key_config.keys.file_history),
 			),
-			"open history of selected file",
+			"open history of selected file or directory",
 			CMD_GROUP_LOG,
 		)
 	}

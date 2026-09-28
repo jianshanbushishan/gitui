@@ -356,6 +356,34 @@ mod tests {
 	}
 
 	#[test]
+	fn directory_filter_includes_only_commits_below_directory(
+	) -> Result<()> {
+		let (_td, repo) = repo_init_empty()?;
+		std::fs::create_dir_all(
+			repo.workdir().unwrap().join("src/nested"),
+		)?;
+		let first =
+			write_commit_file(&repo, "src/one.rs", "a", "first");
+		let outside =
+			write_commit_file(&repo, "src-other.rs", "a", "outside");
+		let second = write_commit_file(
+			&repo,
+			"src/nested/two.rs",
+			"b",
+			"second",
+		);
+
+		let mut commits = Vec::new();
+		let mut walker = LogWalker::new(&repo, 100)?
+			.filter(Some(diff_contains_file("src".into())));
+		walker.read(&mut commits)?;
+
+		assert_eq!(commits, vec![second, first]);
+		assert!(!commits.contains(&outside));
+		Ok(())
+	}
+
+	#[test]
 	fn test_logwalker_with_filter_search() {
 		let (_td, repo) = repo_init_empty().unwrap();
 

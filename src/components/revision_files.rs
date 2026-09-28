@@ -308,11 +308,14 @@ impl RevisionFilesComponent {
 	}
 
 	fn file_history(&self) -> bool {
-		self.selected_file_path().is_some_and(|path| {
+		self.selected_item_path().is_some_and(|path| {
+			let is_directory = self.tree.selected_file().is_none();
 			self.queue.push(InternalEvent::OpenPopup(
-				StackablePopupOpen::FileRevlog(FileRevOpen::new(
-					path,
-				)),
+				StackablePopupOpen::FileRevlog(if is_directory {
+					FileRevOpen::new_directory(path)
+				} else {
+					FileRevOpen::new(path)
+				}),
 			));
 
 			true
@@ -865,6 +868,30 @@ fn tree_nav(
 mod tests {
 	use super::*;
 	use crate::keys::GituiKeyEvent;
+	use std::path::Path;
+
+	#[test]
+	fn directory_history_opens_for_selected_directory() {
+		let env = Environment::test_env();
+		let mut files = RevisionFilesComponent::new(&env, None);
+		let paths = [
+			Path::new("./src/one.rs"),
+			Path::new("./src/two.rs"),
+			Path::new("./other.rs"),
+		];
+		files.tree = FileTree::new(&paths, &BTreeSet::new()).unwrap();
+		files.tree.select_file(Path::new("./src"));
+
+		assert!(files.file_history());
+		let Some(InternalEvent::OpenPopup(
+			StackablePopupOpen::FileRevlog(request),
+		)) = env.queue.pop()
+		else {
+			panic!("expected directory history popup");
+		};
+		assert_eq!(request.file_path, "src");
+		assert!(request.is_directory);
+	}
 
 	#[test]
 	fn failed_tree_load_can_be_retried() {
