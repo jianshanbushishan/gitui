@@ -1731,7 +1731,7 @@ pub mod commands {
 		CommandText::new(
 			format!(
 				"Find [{}]",
-				key_config.get_hint(key_config.keys.file_find),
+				key_config.get_hint(key_config.keys.log_find),
 			),
 			"start commit search",
 			CMD_GROUP_LOG,

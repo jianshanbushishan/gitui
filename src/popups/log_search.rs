@@ -53,6 +53,8 @@ pub struct LogSearchPopupPopup {
 	options: (SearchFields, SearchOptions),
 	theme: SharedTheme,
 	jump_commit_id: Option<CommitId>,
+	file_history: bool,
+	previous_filter_results: Option<bool>,
 }
 
 impl LogSearchPopupPopup {
@@ -83,10 +85,35 @@ impl LogSearchPopupPopup {
 			find_text,
 			selection: Selection::EnterText,
 			jump_commit_id: None,
+			file_history: false,
+			previous_filter_results: None,
 		}
 	}
 
 	pub fn open(&mut self) -> Result<()> {
+		if let Some(previous) = self.previous_filter_results.take() {
+			self.options
+				.1
+				.set(SearchOptions::FILTER_RESULTS, previous);
+		}
+		self.file_history = false;
+		self.open_search()
+	}
+
+	pub fn open_for_file_history(&mut self) -> Result<()> {
+		if self.previous_filter_results.is_none() {
+			self.previous_filter_results = Some(
+				self.options
+					.1
+					.contains(SearchOptions::FILTER_RESULTS),
+			);
+		}
+		self.file_history = true;
+		self.options.1.insert(SearchOptions::FILTER_RESULTS);
+		self.open_search()
+	}
+
+	fn open_search(&mut self) -> Result<()> {
 		self.show()?;
 		self.selection = Selection::EnterText;
 		self.find_text.show()?;
@@ -129,16 +156,19 @@ impl LogSearchPopupPopup {
 
 		match self.mode {
 			PopupMode::Search => {
-				self.queue.push(InternalEvent::CommitSearch(
-					LogFilterSearchOptions {
-						fields: self.options.0,
-						options: self.options.1,
-						search_pattern: self
-							.find_text
-							.get_text()
-							.to_string(),
-					},
-				));
+				let options = LogFilterSearchOptions {
+					fields: self.options.0,
+					options: self.options.1,
+					search_pattern: self
+						.find_text
+						.get_text()
+						.to_string(),
+				};
+				self.queue.push(if self.file_history {
+					InternalEvent::FileHistorySearch(options)
+				} else {
+					InternalEvent::CommitSearch(options)
+				});
 			}
 			PopupMode::JumpCommitSha => {
 				let commit_id = self.jump_commit_id
@@ -231,7 +261,7 @@ impl LogSearchPopupPopup {
 				" "
 			};
 
-		vec![
+		let mut lines = vec![
 			Line::from(vec![Span::styled(
 				format!("[{x_opt_fuzzy}] fuzzy search"),
 				self.theme.text(
@@ -306,7 +336,11 @@ impl LogSearchPopupPopup {
 					false,
 				),
 			)]),
-		]
+		];
+		if self.file_history {
+			lines.remove(2);
+		}
+		lines
 	}
 
 	const fn option_selected(&self) -> bool {
@@ -416,6 +450,17 @@ impl LogSearchPopupPopup {
 				Selection::CommitHashSearch => Selection::EnterText,
 			};
 		}
+		if self.file_history
+			&& matches!(
+				self.selection,
+				Selection::FilterResultsOption
+			) {
+			self.selection = if arg {
+				Selection::CaseOption
+			} else {
+				Selection::SummarySearch
+			};
+		}
 
 		self.find_text
 			.enabled(matches!(self.selection, Selection::EnterText));
@@ -453,6 +498,11 @@ impl LogSearchPopupPopup {
 			}));
 
 		self.find_text.draw(f, chunks[0])?;
+		if !self.option_selected() {
+			// Keep the text and cursor colors while highlighting the input row.
+			f.buffer_mut()
+				.set_style(chunks[0], self.theme.text(false, true));
+		}
 
 		f.render_widget(
 			Paragraph::new(self.get_text_options())
@@ -506,6 +556,9 @@ impl LogSearchPopupPopup {
 			}));
 
 		self.find_text.draw(f, chunks[0])?;
+		// The SHA field always accepts text in this mode.
+		f.buffer_mut()
+			.set_style(chunks[0], self.theme.text(false, true));
 
 		if show_invalid {
 			self.draw_invalid_sha(f);
@@ -547,10 +600,11 @@ impl LogSearchPopupPopup {
 				self.execute_confirm();
 			} else if key_match(key, self.key_config.keys.popup_up) {
 				self.move_selection(true);
-			} else if key_match(
-				key,
-				self.key_config.keys.find_commit_sha,
-			) {
+			} else if !self.file_history
+				&& key_match(
+					key,
+					self.key_config.keys.find_commit_sha,
+				) {
 				self.set_mode(&PopupMode::JumpCommitSha);
 			} else if key_match(key, self.key_config.keys.popup_down)
 			{
@@ -647,16 +701,18 @@ impl Component for LogSearchPopupPopup {
 					)
 					.order(1),
 				);
-				out.push(
-					CommandInfo::new(
-						strings::commands::find_commit_sha(
-							&self.key_config,
-						),
-						true,
-						true,
-					)
-					.order(1),
-				);
+				if !self.file_history {
+					out.push(
+						CommandInfo::new(
+							strings::commands::find_commit_sha(
+								&self.key_config,
+							),
+							true,
+							true,
+						)
+						.order(1),
+					);
+				}
 			}
 
 			out.push(CommandInfo::new(
@@ -710,6 +766,42 @@ impl Component for LogSearchPopupPopup {
 mod tests {
 	use super::*;
 	use crate::queue::InternalEvent;
+	use ratatui::{backend::TestBackend, Terminal};
+
+	#[test]
+	fn search_input_highlight_tracks_text_selection() {
+		let env = Environment::test_env();
+		let mut popup = LogSearchPopupPopup::new(&env);
+		let mut terminal =
+			Terminal::new(TestBackend::new(80, 20)).unwrap();
+		popup.open().unwrap();
+
+		let input_background =
+			|popup: &LogSearchPopupPopup,
+			 terminal: &mut Terminal<TestBackend>| {
+				terminal
+					.draw(|frame| {
+						popup.draw(frame, frame.area()).unwrap()
+					})
+					.unwrap();
+				let area = popup.find_text.get_area();
+				terminal.backend().buffer()
+					[(area.x + area.width / 2, area.y)]
+					.bg
+			};
+
+		let focused = input_background(&popup, &mut terminal);
+		assert_eq!(
+			focused,
+			popup.theme.text(false, true).bg.unwrap()
+		);
+
+		popup.move_selection(false);
+		assert_ne!(input_background(&popup, &mut terminal), focused);
+
+		popup.move_selection(true);
+		assert_eq!(input_background(&popup, &mut terminal), focused);
+	}
 
 	#[test]
 	fn input_mode_requires_visible_popup_and_text_selection() {
@@ -758,5 +850,32 @@ mod tests {
 			Some(InternalEvent::CommitSearch(options))
 				if !options.options.contains(SearchOptions::FILTER_RESULTS)
 		));
+	}
+
+	#[test]
+	fn file_history_search_keeps_results_filtered_and_routes_to_history(
+	) {
+		let env = Environment::test_env();
+		let mut popup = LogSearchPopupPopup::new(&env);
+		popup.options.1.remove(SearchOptions::FILTER_RESULTS);
+		popup.open_for_file_history().unwrap();
+		for _ in 0..3 {
+			popup.move_selection(false);
+		}
+		assert!(matches!(popup.selection, Selection::SummarySearch));
+		popup.find_text.set_text("needle".into());
+		popup.execute_confirm();
+		assert!(matches!(
+			env.queue.pop(),
+			Some(InternalEvent::FileHistorySearch(options))
+				if options.search_pattern == "needle"
+					&& options.options.contains(SearchOptions::FILTER_RESULTS)
+		));
+		popup.open().unwrap();
+		assert!(!popup.file_history);
+		assert!(!popup
+			.options
+			.1
+			.contains(SearchOptions::FILTER_RESULTS));
 	}
 }

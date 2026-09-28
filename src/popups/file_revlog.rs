@@ -9,12 +9,18 @@ use crate::{
 	options::SharedOptions,
 	queue::{InternalEvent, NeedsUpdate, Queue, StackablePopupOpen},
 	strings,
-	ui::{draw_scrollbar, style::SharedTheme, Orientation},
+	ui::{
+		draw_scrollbar,
+		style::{SharedTheme, Theme},
+		Orientation,
+	},
 };
 use anyhow::Result;
 use asyncgit::{
 	sync::{
-		diff_contains_file, get_commits_info, CommitId, RepoPathRef,
+		diff_contains_file, filter_commit_by_search,
+		get_commits_info, CommitId, LogFilterSearch,
+		LogFilterSearchOptions, RepoPathRef, SharedCommitFilterFn,
 	},
 	AsyncDiff, AsyncGitNotification, AsyncLog, DiffParams, DiffType,
 };
@@ -22,21 +28,42 @@ use chrono::{DateTime, Local};
 use crossbeam_channel::Sender;
 use crossterm::event::Event;
 use ratatui::{
-	layout::{Constraint, Direction, Layout, Rect},
+	layout::{Alignment, Constraint, Direction, Layout, Rect},
 	text::{Line, Span, Text},
-	widgets::{Block, Borders, Cell, Clear, Row, Table, TableState},
+	widgets::{
+		Block, Borders, Cell, Clear, Paragraph, Row, Table,
+		TableState,
+	},
 	Frame,
 };
+use std::sync::Arc;
 
 use super::{BlameFileOpen, InspectCommitOpen};
 
 const SLICE_SIZE: usize = 1200;
+
+fn history_filter(
+	file_path: String,
+	search: Option<LogFilterSearchOptions>,
+) -> SharedCommitFilterFn {
+	let file_filter = diff_contains_file(file_path);
+	if let Some(options) = search {
+		let search_filter =
+			filter_commit_by_search(LogFilterSearch::new(options));
+		Arc::new(Box::new(move |repo, id| {
+			Ok(file_filter(repo, id)? && search_filter(repo, id)?)
+		}))
+	} else {
+		file_filter
+	}
+}
 
 #[derive(Clone, Debug)]
 pub struct FileRevOpen {
 	pub file_path: String,
 	pub selection: Option<usize>,
 	pub is_directory: bool,
+	pub search: Option<LogFilterSearchOptions>,
 }
 
 impl FileRevOpen {
@@ -45,6 +72,7 @@ impl FileRevOpen {
 			file_path,
 			selection: None,
 			is_directory: false,
+			search: None,
 		}
 	}
 
@@ -53,6 +81,7 @@ impl FileRevOpen {
 			file_path,
 			selection: None,
 			is_directory: true,
+			search: None,
 		}
 	}
 }
@@ -68,6 +97,7 @@ pub struct FileRevlogPopup {
 	visible: bool,
 	repo_path: RepoPathRef,
 	open_request: Option<FileRevOpen>,
+	search_options: Option<LogFilterSearchOptions>,
 	table_state: std::cell::Cell<TableState>,
 	items: ItemBatch,
 	count_total: usize,
@@ -93,6 +123,7 @@ impl FileRevlogPopup {
 			visible: false,
 			repo_path: env.repo.clone(),
 			open_request: None,
+			search_options: None,
 			table_state: std::cell::Cell::new(TableState::default()),
 			items: ItemBatch::default(),
 			count_total: 0,
@@ -110,8 +141,45 @@ impl FileRevlogPopup {
 	///
 	pub fn open(&mut self, open_request: FileRevOpen) -> Result<()> {
 		self.open_request = Some(open_request.clone());
+		self.search_options = open_request.search.clone();
+		self.reset_log(
+			open_request.search,
+			open_request.selection.unwrap_or(0),
+		)?;
 
-		let filter = diff_contains_file(open_request.file_path);
+		self.show()?;
+
+		self.diff.focus(false);
+
+		self.update()?;
+
+		Ok(())
+	}
+
+	/// Search only commits that changed the file or directory being viewed.
+	pub fn search(
+		&mut self,
+		options: LogFilterSearchOptions,
+	) -> Result<()> {
+		if self.open_request.is_some() && self.visible {
+			self.reset_log(Some(options.clone()), 0)?;
+			self.search_options = Some(options);
+			self.update()?;
+		}
+		Ok(())
+	}
+
+	fn reset_log(
+		&mut self,
+		search: Option<LogFilterSearchOptions>,
+		selection: usize,
+	) -> Result<()> {
+		let Some(open_request) = &self.open_request else {
+			return Ok(());
+		};
+		let filter =
+			history_filter(open_request.file_path.clone(), search);
+
 		self.git_log = Some(AsyncLog::new(
 			self.repo_path.borrow().clone(),
 			&self.sender,
@@ -119,15 +187,9 @@ impl FileRevlogPopup {
 		));
 
 		self.items.clear();
-		self.set_selection(open_request.selection.unwrap_or(0));
-
-		self.show()?;
-
-		self.diff.focus(false);
+		self.count_total = 0;
+		self.set_selection(selection);
 		self.diff.clear(false);
-
-		self.update()?;
-
 		Ok(())
 	}
 
@@ -313,6 +375,58 @@ impl FileRevlogPopup {
 				)
 			},
 		)
+	}
+
+	fn search_panel_content(&self) -> Option<(String, String)> {
+		let options = self.search_options.as_ref()?;
+		let log = self.git_log.as_ref()?;
+		if log.is_pending() {
+			return Some((
+				format!("'{}'", options.search_pattern),
+				"(0%)".into(),
+			));
+		}
+		let count = self.get_revisions_count();
+		let position = if count == 0 {
+			0
+		} else {
+			self.get_selection()
+				.unwrap_or_default()
+				.saturating_add(1)
+				.min(count)
+		};
+		let duration = log.get_last_duration().unwrap_or_default();
+		Some((
+			format!(
+				"'{}' (duration: {:?})",
+				options.search_pattern, duration
+			),
+			format!("({position}/{count})"),
+		))
+	}
+
+	fn draw_search(&self, f: &mut Frame, area: Rect) {
+		let Some((text, title)) = self.search_panel_content() else {
+			return;
+		};
+		f.render_widget(
+			Paragraph::new(text)
+				.block(
+					Block::default()
+						.title(Span::styled(
+							format!(
+								"{} {}",
+								strings::POPUP_TITLE_LOG_SEARCH,
+								title
+							),
+							self.theme.title(true),
+						))
+						.borders(Borders::ALL)
+						.border_style(Theme::attention_block()),
+				)
+				.alignment(Alignment::Left),
+			area,
+		);
 	}
 
 	fn get_rows(&self, now: DateTime<Local>) -> Vec<Row<'_>> {
@@ -512,6 +626,7 @@ impl FileRevlogPopup {
 						file_path: open_request.file_path,
 						selection: self.get_selection(),
 						is_directory: open_request.is_directory,
+						search: self.search_options.clone(),
 					}),
 				));
 			}
@@ -524,6 +639,19 @@ impl FileRevlogPopup {
 impl DrawableComponent for FileRevlogPopup {
 	fn draw(&self, f: &mut Frame, area: Rect) -> Result<()> {
 		if self.visible {
+			let search_chunks =
+				self.search_options.as_ref().map(|_| {
+					Layout::default()
+						.direction(Direction::Vertical)
+						.constraints([
+							Constraint::Min(1),
+							Constraint::Length(3),
+						])
+						.split(area)
+				});
+			let history_area = search_chunks
+				.as_ref()
+				.map_or(area, |chunks| chunks[0]);
 			let left_ratio =
 				self.options.borrow().detail_left_ratio();
 			let is_directory = self
@@ -544,13 +672,16 @@ impl DrawableComponent for FileRevlogPopup {
 					Constraint::Percentage(percentages.0),
 					Constraint::Percentage(percentages.1),
 				])
-				.split(area);
+				.split(history_area);
 
 			f.render_widget(Clear, area);
 
 			self.draw_revlog(f, chunks[0]);
 			if !is_directory {
 				self.diff.draw(f, chunks[1])?;
+			}
+			if let Some(chunks) = search_chunks {
+				self.draw_search(f, chunks[1]);
 			}
 		}
 
@@ -574,9 +705,19 @@ impl Component for FileRevlogPopup {
 				if key_match(key, self.key_config.keys.exit_popup) {
 					if self.diff.focused() {
 						self.diff.focus(false);
+					} else if self.search_options.is_some() {
+						self.reset_log(None, 0)?;
+						self.search_options = None;
+						self.update()?;
 					} else {
 						self.hide_stacked(false);
 					}
+				} else if !self.diff.focused()
+					&& key_match(key, self.key_config.keys.log_find)
+				{
+					self.queue.push(
+						InternalEvent::OpenFileHistorySearchPopup,
+					);
 				} else if key_match(
 					key,
 					self.key_config.keys.move_right,
@@ -676,7 +817,25 @@ impl Component for FileRevlogPopup {
 		if self.is_visible() || force_all {
 			out.push(
 				CommandInfo::new(
-					strings::commands::close_popup(&self.key_config),
+					strings::commands::log_find_commit(
+						&self.key_config,
+					),
+					true,
+					!self.diff.focused(),
+				)
+				.order(1),
+			);
+			out.push(
+				CommandInfo::new(
+					if self.search_options.is_some() {
+						strings::commands::log_close_search(
+							&self.key_config,
+						)
+					} else {
+						strings::commands::close_popup(
+							&self.key_config,
+						)
+					},
 					true,
 					true,
 				)
@@ -757,8 +916,117 @@ impl Component for FileRevlogPopup {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use asyncgit::sync::CommitInfo;
+	use asyncgit::sync::{CommitInfo, SearchFields, SearchOptions};
 	use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+	use std::{fs, path::Path};
+
+	#[test]
+	fn search_only_matches_commits_in_file_history() {
+		let (dir, repo) = git2_testing::repo_init();
+		let commit = |path: &str, message: &str| {
+			fs::write(dir.path().join(path), message).unwrap();
+			let mut index = repo.index().unwrap();
+			index.add_path(Path::new(path)).unwrap();
+			let tree_id = index.write_tree().unwrap();
+			let tree = repo.find_tree(tree_id).unwrap();
+			let parent =
+				repo.head().unwrap().peel_to_commit().unwrap();
+			let sig = repo.signature().unwrap();
+			repo.commit(
+				Some("HEAD"),
+				&sig,
+				&sig,
+				message,
+				&tree,
+				&[&parent],
+			)
+			.unwrap()
+		};
+		let first: CommitId = commit("tracked.txt", "first").into();
+		let other: CommitId = commit("other.txt", "needle").into();
+		let match_id: CommitId =
+			commit("tracked.txt", "needle").into();
+		let options = LogFilterSearchOptions {
+			search_pattern: "needle".into(),
+			fields: SearchFields::MESSAGE_SUMMARY,
+			options: SearchOptions::FILTER_RESULTS,
+		};
+		let filter = history_filter(
+			"tracked.txt".into(),
+			Some(options.clone()),
+		);
+		assert!(!filter(&repo, &first).unwrap());
+		assert!(!filter(&repo, &other).unwrap());
+		assert!(filter(&repo, &match_id).unwrap());
+		let unfiltered = history_filter("tracked.txt".into(), None);
+		assert!(unfiltered(&repo, &first).unwrap());
+
+		let mut env = Environment::test_env();
+		*env.repo.get_mut() = dir.path().to_path_buf().into();
+		let mut popup = FileRevlogPopup::new(&env);
+		let finish_loading = |popup: &mut FileRevlogPopup| {
+			let deadline = std::time::Instant::now()
+				+ std::time::Duration::from_secs(10);
+			while popup.git_log.as_ref().unwrap().is_pending() {
+				assert!(std::time::Instant::now() < deadline);
+				std::thread::sleep(std::time::Duration::from_millis(
+					5,
+				));
+			}
+			popup.update().unwrap();
+		};
+		popup.open(FileRevOpen::new("tracked.txt".into())).unwrap();
+		finish_loading(&mut popup);
+		assert_eq!(popup.get_revisions_count(), 2);
+		popup.search(options).unwrap();
+		finish_loading(&mut popup);
+		assert_eq!(popup.get_revisions_count(), 1);
+		assert_eq!(popup.selected_commit(), Some(match_id));
+		let (text, title) = popup.search_panel_content().unwrap();
+		assert!(text.starts_with("'needle' (duration: "));
+		assert_eq!(title, "(1/1)");
+		let mut terminal = ratatui::Terminal::new(
+			ratatui::backend::TestBackend::new(80, 20),
+		)
+		.unwrap();
+		terminal
+			.draw(|frame| popup.draw(frame, frame.area()).unwrap())
+			.unwrap();
+		let buffer = terminal.backend().buffer();
+		let title_row: String =
+			(0..80).map(|x| buffer[(x, 17)].symbol()).collect();
+		let text_row: String =
+			(0..80).map(|x| buffer[(x, 18)].symbol()).collect();
+		assert!(title_row.contains("Search (1/1)"));
+		assert!(text_row.contains("'needle' (duration: "));
+		popup
+			.event(&Event::Key(KeyEvent::new(
+				KeyCode::Esc,
+				KeyModifiers::empty(),
+			)))
+			.unwrap();
+		finish_loading(&mut popup);
+		assert_eq!(popup.get_revisions_count(), 2);
+		assert!(popup.is_visible());
+		assert!(popup.search_panel_content().is_none());
+	}
+
+	#[test]
+	fn find_opens_search_from_history() {
+		let env = Environment::test_env();
+		let mut popup = FileRevlogPopup::new(&env);
+		popup.visible = true;
+		popup.open_request = Some(FileRevOpen::new("file.rs".into()));
+		let event = Event::Key(KeyEvent::new(
+			KeyCode::Char('f'),
+			KeyModifiers::empty(),
+		));
+		popup.event(&event).unwrap();
+		assert!(matches!(
+			env.queue.pop(),
+			Some(InternalEvent::OpenFileHistorySearchPopup)
+		));
+	}
 
 	#[test]
 	fn external_diff_uses_selected_revision_before_preview_loads() {

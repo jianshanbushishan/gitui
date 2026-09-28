@@ -146,6 +146,8 @@ pub enum InternalEvent {
 	OpenFuzzyFinder(Vec<String>, FuzzyFinderTarget),
 	///
 	OpenLogSearchPopup,
+	/// Search commits in the open file or directory history.
+	OpenFileHistorySearchPopup,
 	///
 	OpenContentSearch(Vec<String>),
 	///
@@ -176,6 +178,7 @@ pub enum InternalEvent {
 	RewordCommit(CommitId),
 	///
 	CommitSearch(LogFilterSearchOptions),
+	FileHistorySearch(LogFilterSearchOptions),
 	///
 	OpenGotoLinePopup(usize),
 	///

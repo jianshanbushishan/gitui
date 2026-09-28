@@ -34,6 +34,12 @@ type FilteredEntries = Vec<(usize, Vec<usize>)>;
 type SearchResult =
 	Arc<Mutex<Option<(u64, String, FilteredEntries)>>>;
 
+fn is_exact_directory_match(path: &str, query: &str) -> bool {
+	path.strip_suffix('/')
+		.and_then(|path| path.rsplit('/').next())
+		.is_some_and(|name| name.eq_ignore_ascii_case(query))
+}
+
 pub struct FuzzyFindPopup {
 	queue: Queue,
 	visible: bool,
@@ -148,6 +154,8 @@ impl FuzzyFindPopup {
 		let search_generation = Arc::clone(&self.search_generation);
 		let search_result = Arc::clone(&self.search_result);
 		let app_sender = self.app_sender.clone();
+		let search_files =
+			matches!(self.target, Some(FuzzyFinderTarget::Files));
 		rayon_core::spawn(move || {
 			let matcher =
 				fuzzy_matcher::skim::SkimMatcherV2::default();
@@ -163,15 +171,31 @@ impl FuzzyFindPopup {
 				if let Some((score, matched)) =
 					matcher.fuzzy_indices(&contents[index], &query)
 				{
-					scored.push((score, index, matched));
+					let exact_directory = search_files
+						&& is_exact_directory_match(
+							&contents[index],
+							&query,
+						);
+					scored.push((
+						exact_directory,
+						score,
+						index,
+						matched,
+					));
 				}
 			}
 			scored.sort_unstable_by(
-				|(score1, _, _), (score2, _, _)| score2.cmp(score1),
+				|(exact1, score1, index1, _),
+				 (exact2, score2, index2, _)| {
+					exact2
+						.cmp(exact1)
+						.then_with(|| score2.cmp(score1))
+						.then_with(|| index1.cmp(index2))
+				},
 			);
 			let filtered = scored
 				.into_iter()
-				.map(|(_, index, matched)| (index, matched))
+				.map(|(_, _, index, matched)| (index, matched))
 				.collect();
 			if let Ok(mut result) = search_result.lock() {
 				if search_generation.load(Ordering::Relaxed)
@@ -463,6 +487,14 @@ impl Component for FuzzyFindPopup {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn exact_directory_match_uses_folder_name() {
+		assert!(is_exact_directory_match("./nested/docs/", "docs"));
+		assert!(is_exact_directory_match("./Docs/", "docs"));
+		assert!(!is_exact_directory_match("./docs/guide.md", "docs"));
+		assert!(!is_exact_directory_match("./mydocs/", "docs"));
+	}
 
 	#[test]
 	fn input_mode_follows_popup_visibility() {

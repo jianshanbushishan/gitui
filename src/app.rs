@@ -942,6 +942,11 @@ impl App {
 				flags
 					.insert(NeedsUpdate::ALL | NeedsUpdate::COMMANDS);
 			}
+			InternalEvent::OpenFileHistorySearchPopup => {
+				self.log_search_popup.open_for_file_history()?;
+				flags
+					.insert(NeedsUpdate::ALL | NeedsUpdate::COMMANDS);
+			}
 			InternalEvent::OpenContentSearch(lines) => {
 				self.content_search_popup.open(lines)?;
 				flags
@@ -1053,6 +1058,11 @@ impl App {
 			}
 			InternalEvent::CommitSearch(options) => {
 				self.revlog.search(options);
+			}
+			InternalEvent::FileHistorySearch(options) => {
+				self.file_revlog_popup.search(options)?;
+				flags
+					.insert(NeedsUpdate::ALL | NeedsUpdate::COMMANDS);
 			}
 			InternalEvent::OpenGotoLinePopup(max_line) => {
 				self.goto_line_popup.open(max_line);

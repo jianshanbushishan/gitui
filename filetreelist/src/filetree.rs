@@ -112,6 +112,15 @@ impl FileTree {
 			.map(|index| self.items.tree_items[index].info())
 	}
 
+	/// Returns the selectable folders in the tree, excluding the root.
+	pub fn directory_paths(&self) -> impl Iterator<Item = &Path> {
+		self.items.tree_items.iter().filter_map(|item| {
+			let path = item.info().full_path();
+			(item.kind().is_path() && path != Path::new("."))
+				.then_some(path)
+		})
+	}
+
 	///
 	pub fn collapse_recursive(&mut self) {
 		if let Some(selection) = self.selection {

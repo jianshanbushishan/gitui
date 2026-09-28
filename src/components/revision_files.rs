@@ -323,17 +323,12 @@ impl RevisionFilesComponent {
 	}
 
 	fn open_finder(&self) {
-		if let Some(files) = self.files.clone() {
+		if let Some(files) = self.files.as_ref() {
 			self.queue.push(InternalEvent::OpenFuzzyFinder(
-				files
-					.iter()
-					.map(|a| {
-						a.path
-							.to_str()
-							.unwrap_or_default()
-							.to_string()
-					})
-					.collect(),
+				finder_paths(
+					&self.tree,
+					files.iter().map(|file| file.path.as_path()),
+				),
 				FuzzyFinderTarget::Files,
 			));
 		}
@@ -355,6 +350,9 @@ impl RevisionFilesComponent {
 
 	pub fn find_file(&mut self, file: &Path) {
 		self.tree.collapse_but_root();
+		let path =
+			file.to_str().and_then(|path| path.strip_suffix('/'));
+		let file = path.map_or(file, Path::new);
 		if self.tree.select_file(file) {
 			self.selection_changed();
 		}
@@ -844,6 +842,23 @@ fn tree_nav_cmds(
 	);
 }
 
+fn finder_paths<'a>(
+	tree: &FileTree,
+	files: impl Iterator<Item = &'a Path>,
+) -> Vec<String> {
+	let mut paths: Vec<String> = tree
+		.directory_paths()
+		.filter_map(Path::to_str)
+		.map(|path| format!("{path}/"))
+		.collect();
+	paths.extend(
+		files.map(|path| {
+			path.to_str().unwrap_or_default().to_string()
+		}),
+	);
+	paths
+}
+
 //TODO: reuse for other tree usages
 fn tree_nav(
 	tree: &mut FileTree,
@@ -869,6 +884,31 @@ mod tests {
 	use super::*;
 	use crate::keys::GituiKeyEvent;
 	use std::path::Path;
+
+	#[test]
+	fn finder_lists_directories_and_can_select_them() {
+		let env = Environment::test_env();
+		let mut component = RevisionFilesComponent::new(&env, None);
+		let paths = [
+			Path::new("./docs/guide.md"),
+			Path::new("./src/main.rs"),
+		];
+		component.tree =
+			FileTree::new(&paths, &BTreeSet::new()).unwrap();
+
+		let entries =
+			finder_paths(&component.tree, paths.into_iter());
+		assert!(entries.contains(&"./docs/".to_string()));
+		assert!(entries.contains(&"./docs/guide.md".to_string()));
+		assert!(!entries.contains(&"./".to_string()));
+
+		component.find_file(Path::new("./docs/"));
+		assert_eq!(
+			component.selected_item_path().as_deref(),
+			Some("docs")
+		);
+		assert!(component.tree.selected_file().is_none());
+	}
 
 	#[test]
 	fn directory_history_opens_for_selected_directory() {
