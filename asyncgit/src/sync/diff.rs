@@ -230,6 +230,78 @@ pub fn get_staged_line_stats(
 	diff_line_stats(&diff)
 }
 
+/// Return a bounded UTF-8 description of staged changes for AI.
+///
+/// An unborn HEAD is compared against the empty tree. Text changes retain
+/// their patch; binary files are represented by their path only. Returns an
+/// error instead of a partial patch when output exceeds `max_bytes`.
+pub fn get_staged_diff_for_ai(
+	repo_path: &RepoPath,
+	max_bytes: usize,
+) -> Result<String> {
+	let repo = repo(repo_path)?;
+	let diff = staged_diff_raw(&repo, None)?;
+	if diff.deltas().len() == 0 {
+		return Err(Error::Generic(String::from(
+			"no staged changes to summarize",
+		)));
+	}
+	let mut output = Vec::new();
+
+	for (idx, delta) in diff.deltas().enumerate() {
+		let path = delta
+			.new_file()
+			.path_bytes()
+			.or_else(|| delta.old_file().path_bytes())
+			.unwrap_or(b"<unknown>");
+		let file_label = || {
+			format!(
+				"Changed file: {}\n",
+				String::from_utf8_lossy(path)
+			)
+		};
+
+		let chunk = if let Some(mut patch) =
+			Patch::from_diff(&diff, idx)?
+		{
+			if patch.delta().flags().contains(git2::DiffFlags::BINARY)
+			{
+				file_label().into_bytes()
+			} else {
+				// Avoid allocating a second, unbounded copy of an
+				// oversized patch in `to_buf`.
+				if patch.size(true, true, true)
+					> max_bytes.saturating_sub(output.len())
+				{
+					return Err(Error::Generic(format!(
+							"staged diff exceeds the {max_bytes}-byte AI input limit"
+						)));
+				}
+				// A patch can be classified as text by libgit2 while its
+				// encoding is not UTF-8. Do not pass lossy code lines to the AI.
+				let buf = patch.to_buf()?;
+				match std::str::from_utf8(&buf) {
+					Ok(_) => buf.to_vec(),
+					Err(_) => file_label().into_bytes(),
+				}
+			}
+		} else {
+			// libgit2 returns no text patch for binary files (and
+			// occasionally for metadata-only changes).
+			file_label().into_bytes()
+		};
+
+		if chunk.len() > max_bytes.saturating_sub(output.len()) {
+			return Err(Error::Generic(format!(
+				"staged diff exceeds the {max_bytes}-byte AI input limit"
+			)));
+		}
+		output.extend_from_slice(&chunk);
+	}
+
+	Ok(String::from_utf8(output)?)
+}
+
 /// total (added, deleted) lines across unstaged tracked files.
 /// Untracked (new) files are excluded so the count reflects only
 /// changes to files git already knows about.
@@ -515,8 +587,8 @@ fn new_file_content(path: &Path) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
 	use super::{
-		get_diff, get_diff_commit, get_staged_line_stats,
-		get_unstaged_line_stats,
+		get_diff, get_diff_commit, get_staged_diff_for_ai,
+		get_staged_line_stats, get_unstaged_line_stats,
 	};
 	use crate::{
 		error::Result,
@@ -600,6 +672,83 @@ mod tests {
 			get_staged_line_stats(repo_path, None).unwrap(),
 			(0, 0)
 		);
+	}
+
+	#[test]
+	fn test_staged_diff_for_ai_initial_commit_uses_index_only() {
+		let (_td, repo) = repo_init_empty().unwrap();
+		let root = repo.path().parent().unwrap();
+		let repo_path: &RepoPath =
+			&root.as_os_str().to_str().unwrap().into();
+
+		fs::write(root.join("new.txt"), b"staged line\n").unwrap();
+		stage_add_file(repo_path, Path::new("new.txt")).unwrap();
+		fs::write(
+			root.join("new.txt"),
+			b"staged line\nunstaged line\n",
+		)
+		.unwrap();
+
+		let patch =
+			get_staged_diff_for_ai(repo_path, 65_536).unwrap();
+		assert!(patch.contains("diff --git a/new.txt b/new.txt"));
+		assert!(patch.contains("+staged line"));
+		assert!(!patch.contains("unstaged line"));
+	}
+
+	#[test]
+	fn test_staged_diff_for_ai_rejects_empty_index() {
+		let (_td, repo) = repo_init_empty().unwrap();
+		let root = repo.path().parent().unwrap();
+		let repo_path: &RepoPath =
+			&root.as_os_str().to_str().unwrap().into();
+
+		let error =
+			get_staged_diff_for_ai(repo_path, 65_536).unwrap_err();
+		assert!(error.to_string().contains("no staged changes"));
+	}
+
+	#[test]
+	fn test_staged_diff_for_ai_binary_path_only() {
+		let (_td, repo) = repo_init_empty().unwrap();
+		let root = repo.path().parent().unwrap();
+		let repo_path: &RepoPath =
+			&root.as_os_str().to_str().unwrap().into();
+
+		fs::write(
+			root.join("image.bin"),
+			b"\0secret binary payload\0",
+		)
+		.unwrap();
+		stage_add_file(repo_path, Path::new("image.bin")).unwrap();
+
+		let patch =
+			get_staged_diff_for_ai(repo_path, 65_536).unwrap();
+		assert_eq!(patch, "Changed file: image.bin\n");
+	}
+
+	#[test]
+	fn test_staged_diff_for_ai_limit_is_all_or_nothing() {
+		let (_td, repo) = repo_init_empty().unwrap();
+		let root = repo.path().parent().unwrap();
+		let repo_path: &RepoPath =
+			&root.as_os_str().to_str().unwrap().into();
+
+		fs::write(root.join("a.txt"), b"first\n").unwrap();
+		stage_add_file(repo_path, Path::new("a.txt")).unwrap();
+		fs::write(root.join("b.txt"), b"second\n").unwrap();
+		stage_add_file(repo_path, Path::new("b.txt")).unwrap();
+
+		let patch =
+			get_staged_diff_for_ai(repo_path, 65_536).unwrap();
+		assert_eq!(
+			get_staged_diff_for_ai(repo_path, patch.len()).unwrap(),
+			patch
+		);
+		let error =
+			get_staged_diff_for_ai(repo_path, patch.len() - 1)
+				.unwrap_err();
+		assert!(error.to_string().contains("AI input limit"));
 	}
 
 	#[test]

@@ -441,6 +441,7 @@ impl App {
 	) -> Result<()> {
 		log::trace!("update_async: {ev:?}");
 		self.status_tab.update_async(ev);
+		self.commit_popup.update_async(ev);
 		self.inspect_commit_popup.update_async(ev);
 
 		if let AsyncNotification::Git(ev) = ev {
@@ -486,6 +487,7 @@ impl App {
 	///
 	pub fn any_work_pending(&self) -> bool {
 		self.status_tab.anything_pending()
+			|| self.commit_popup.any_work_pending()
 			|| self.revlog.any_work_pending()
 			|| self.stashing_tab.anything_pending()
 			|| self.files_tab.anything_pending()
@@ -970,7 +972,8 @@ impl App {
 			}
 			InternalEvent::OptionSwitched(o) => {
 				match o {
-					AppOption::ExternalDiffTool => {}
+					AppOption::ExternalDiffTool
+					| AppOption::AiCommitBackend => {}
 					AppOption::StatusShowUntracked => {
 						self.status_tab.update()?;
 					}

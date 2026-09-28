@@ -59,6 +59,7 @@
 //TODO:
 // #![deny(clippy::expect_used)]
 
+mod ai_commit;
 mod ansi;
 mod app;
 mod args;
@@ -135,6 +136,8 @@ pub enum SyntaxHighlightProgress {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AsyncAppNotification {
+	/// An external AI commit-message command finished.
+	AiCommitMessage,
 	///
 	SyntaxHighlighting(SyntaxHighlightProgress),
 	/// A fuzzy file/path search completed.

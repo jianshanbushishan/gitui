@@ -16,6 +16,7 @@ Create a `key_bindings.ron` file like this:
     open_help: Some(( code: F(1), modifiers: "")),
 
     status_reset_item: Some(( code: Char('U'), modifiers: "SHIFT")),
+    generate_commit_message: Some(( code: Char('g'), modifiers: "CONTROL")),
 )
 ```
 

@@ -1280,6 +1280,20 @@ pub mod commands {
 		)
 		.hide_help()
 	}
+	pub fn commit_generate(
+		key_config: &SharedKeyConfig,
+	) -> CommandText {
+		CommandText::new(
+			format!(
+				"Generate Msg [{}]",
+				key_config.get_hint(
+					key_config.keys.generate_commit_message
+				),
+			),
+			"generate a commit message from staged changes",
+			CMD_GROUP_COMMIT_POPUP,
+		)
+	}
 	pub fn newline(key_config: &SharedKeyConfig) -> CommandText {
 		CommandText::new(
 			format!(

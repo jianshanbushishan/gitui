@@ -3,12 +3,14 @@ use crate::components::{
 	DrawableComponent, EventState, TextInputComponent,
 };
 use crate::{
+	ai_commit,
 	app::Environment,
 	keys::{key_match, SharedKeyConfig},
-	options::SharedOptions,
+	options::{AiCommitBackend, SharedOptions},
 	queue::{InternalEvent, NeedsUpdate, Queue},
 	strings, try_or_popup,
 	ui::style::SharedTheme,
+	AsyncAppNotification, AsyncNotification,
 };
 use anyhow::{bail, Ok, Result};
 use asyncgit::sync::commit::commit_message_prettify;
@@ -20,6 +22,7 @@ use asyncgit::{
 	},
 	StatusItem, StatusItemType,
 };
+use crossbeam_channel::Sender;
 use crossterm::event::Event;
 use easy_cast::Cast;
 use ratatui::{
@@ -34,6 +37,11 @@ use std::{
 	io::{Read, Write},
 	path::PathBuf,
 	str::FromStr,
+	sync::{
+		atomic::{AtomicU64, Ordering},
+		Arc, Mutex,
+	},
+	thread,
 };
 
 use super::ExternalEditorPopup;
@@ -51,6 +59,14 @@ enum Mode {
 	Reword(CommitId),
 }
 
+type AiGenerationResult = Result<(String, String)>;
+
+struct AiGeneration {
+	id: u64,
+	initial_input: String,
+	result: AiGenerationResult,
+}
+
 pub struct CommitPopup {
 	repo: RepoPathRef,
 	input: TextInputComponent,
@@ -63,9 +79,14 @@ pub struct CommitPopup {
 	commit_msg_history_idx: usize,
 	options: SharedOptions,
 	verify: bool,
+	ai_sender: Sender<AsyncAppNotification>,
+	ai_result: Arc<Mutex<Option<AiGeneration>>>,
+	ai_generation: Arc<AtomicU64>,
+	ai_pending: bool,
 }
 
 const FIRST_LINE_LIMIT: usize = 50;
+const MAX_AI_DIFF_BYTES: usize = 64 * 1024;
 
 impl CommitPopup {
 	///
@@ -89,6 +110,141 @@ impl CommitPopup {
 			commit_msg_history_idx: 0,
 			options: env.options.clone(),
 			verify: true,
+			ai_sender: env.sender_app.clone(),
+			ai_result: Arc::new(Mutex::new(None)),
+			ai_generation: Arc::new(AtomicU64::new(0)),
+			ai_pending: false,
+		}
+	}
+
+	pub const fn any_work_pending(&self) -> bool {
+		self.ai_pending
+	}
+
+	fn invalidate_ai_generation(&mut self) {
+		self.ai_generation.fetch_add(1, Ordering::Relaxed);
+		self.ai_pending = false;
+		if let std::result::Result::Ok(mut result) =
+			self.ai_result.lock()
+		{
+			*result = None;
+		}
+	}
+
+	fn generate_commit_message(&mut self) -> Result<()> {
+		if !matches!(self.mode, Mode::Normal) || self.ai_pending {
+			return Ok(());
+		}
+		let initial_input = self.input.get_text().to_owned();
+		if !initial_input.trim().is_empty()
+			&& self.commit_template.as_deref()
+				!= Some(initial_input.as_str())
+		{
+			self.queue.push(InternalEvent::ShowInfoMsg(
+				"Clear the current commit message before generating a new one."
+					.to_owned(),
+			));
+			return Ok(());
+		}
+		let command = self.options.borrow().ai_commit_command()?;
+		let repo = self.repo.borrow().clone();
+		let result_slot = Arc::clone(&self.ai_result);
+		let current_id = Arc::clone(&self.ai_generation);
+		let sender = self.ai_sender.clone();
+		let id = current_id.fetch_add(1, Ordering::Relaxed) + 1;
+		thread::Builder::new()
+			.name("gitui-ai-commit".to_owned())
+			.spawn(move || {
+				let result = (|| {
+					let diff =
+						asyncgit::sync::diff::get_staged_diff_for_ai(
+							&repo,
+							MAX_AI_DIFF_BYTES,
+						)?;
+					let workdir =
+						asyncgit::sync::utils::repo_work_dir(&repo)?;
+					let message = ai_commit::run(
+						&command,
+						std::path::Path::new(&workdir),
+						&diff,
+						|| current_id.load(Ordering::Relaxed) != id,
+					)?;
+					Ok((diff, message))
+				})();
+				if current_id.load(Ordering::Relaxed) == id {
+					if let std::result::Result::Ok(mut slot) =
+						result_slot.lock()
+					{
+						*slot = Some(AiGeneration {
+							id,
+							initial_input,
+							result,
+						});
+						let _ = sender.send(
+							AsyncAppNotification::AiCommitMessage,
+						);
+					}
+				}
+			})?;
+		self.ai_pending = true;
+		self.input.set_title(format!(
+			"{} (generating...)",
+			strings::commit_title()
+		));
+		Ok(())
+	}
+
+	pub fn update_async(&mut self, ev: AsyncNotification) {
+		if ev
+			!= AsyncNotification::App(
+				AsyncAppNotification::AiCommitMessage,
+			) {
+			return;
+		}
+		let finished = self
+			.ai_result
+			.lock()
+			.ok()
+			.and_then(|mut slot| slot.take());
+		let Some(finished) = finished else {
+			return;
+		};
+		if finished.id != self.ai_generation.load(Ordering::Relaxed) {
+			return;
+		}
+		self.ai_pending = false;
+		if !self.is_visible() || !matches!(self.mode, Mode::Normal) {
+			return;
+		}
+		self.input.set_title(strings::commit_title());
+		match finished.result {
+			std::result::Result::Ok((diff, message)) => {
+				if self.input.get_text() != finished.initial_input {
+					self.queue.push(InternalEvent::ShowInfoMsg(
+						"Commit message changed while AI was running; suggestion discarded."
+							.to_owned(),
+						));
+					return;
+				}
+				match asyncgit::sync::diff::get_staged_diff_for_ai(
+					&self.repo.borrow(),
+					MAX_AI_DIFF_BYTES,
+				) {
+					std::result::Result::Ok(current) if current == diff => {
+						self.input.set_text(message);
+						self.persist_draft();
+					}
+					_ => self.queue.push(InternalEvent::ShowInfoMsg(
+						"Staged changes changed while AI was running; suggestion discarded."
+							.to_owned(),
+					)),
+				}
+			}
+			Err(error) => {
+				self.queue.push(InternalEvent::ShowErrorMsg(
+					format!("AI commit message error:\n{error:#}"),
+				));
+			}
 		}
 	}
 
@@ -370,6 +526,7 @@ impl CommitPopup {
 	fn amend(&mut self) -> Result<()> {
 		if self.can_amend() {
 			let id = sync::get_head(&self.repo.borrow())?;
+			self.invalidate_ai_generation();
 			self.mode = Mode::Amend(id);
 
 			let details =
@@ -399,6 +556,7 @@ impl CommitPopup {
 
 	#[allow(clippy::too_many_lines)]
 	pub fn open(&mut self, reword: Option<CommitId>) -> Result<()> {
+		self.invalidate_ai_generation();
 		// Cursor position to restore once the textarea is shown.
 		// Set when a saved draft is loaded in the Normal branch below.
 		let mut pending_cursor: Option<(u16, u16)> = None;
@@ -627,6 +785,15 @@ impl Component for CommitPopup {
 			));
 
 			out.push(CommandInfo::new(
+				strings::commands::commit_generate(&self.key_config),
+				matches!(self.mode, Mode::Normal)
+					&& !self.ai_pending
+					&& self.options.borrow().ai_commit_backend()
+						!= AiCommitBackend::Disabled,
+				true,
+			));
+
+			out.push(CommandInfo::new(
 				strings::commands::newline(&self.key_config),
 				true,
 				true,
@@ -639,6 +806,9 @@ impl Component for CommitPopup {
 	fn event(&mut self, ev: &Event) -> Result<EventState> {
 		if self.is_visible() {
 			if let Event::Key(e) = ev {
+				let input_before = self
+					.ai_pending
+					.then(|| self.input.get_text().to_owned());
 				let input_consumed =
 					if key_match(e, self.key_config.keys.commit)
 						&& self.can_commit()
@@ -647,6 +817,21 @@ impl Component for CommitPopup {
 							self,
 							"commit error:",
 							self.commit()
+						);
+						true
+					} else if key_match(
+						e,
+						self.key_config.keys.generate_commit_message,
+					) && self
+						.options
+						.borrow()
+						.ai_commit_backend()
+						!= AiCommitBackend::Disabled
+					{
+						try_or_popup!(
+							self,
+							"AI commit message error:",
+							self.generate_commit_message()
 						);
 						true
 					} else if key_match(
@@ -703,8 +888,16 @@ impl Component for CommitPopup {
 					self.input.event(ev)?;
 					if was_visible && !self.input.is_visible() {
 						// popup was just hidden (c-q / exit_popup)
+						self.invalidate_ai_generation();
 						self.persist_draft();
 					}
+				}
+				if self.ai_pending
+					&& input_before.as_deref().is_some_and(|before| {
+						before != self.input.get_text()
+					}) {
+					self.invalidate_ai_generation();
+					self.input.set_title(strings::commit_title());
 				}
 
 				// stop key event propagation
@@ -724,11 +917,89 @@ impl Component for CommitPopup {
 	}
 
 	fn hide(&mut self) {
+		self.invalidate_ai_generation();
 		self.input.hide();
 	}
 
 	fn show(&mut self) -> Result<()> {
 		self.open(None)?;
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod ai_tests {
+	use super::*;
+	use asyncgit::sync::RepoPath;
+	use std::path::Path;
+
+	fn staged_popup(
+	) -> (tempfile::TempDir, git2::Repository, CommitPopup, String) {
+		let dir = tempfile::tempdir().unwrap();
+		let repo = git2::Repository::init(dir.path()).unwrap();
+		std::fs::write(dir.path().join("change.txt"), "first\n")
+			.unwrap();
+		let mut index = repo.index().unwrap();
+		index.add_path(Path::new("change.txt")).unwrap();
+		index.write().unwrap();
+		let mut env = Environment::test_env();
+		*env.repo.borrow_mut() =
+			RepoPath::Path(dir.path().to_path_buf());
+		env.options = crate::options::Options::new(env.repo.clone());
+		let mut popup = CommitPopup::new(&env);
+		popup.input.show().unwrap();
+		let diff = asyncgit::sync::diff::get_staged_diff_for_ai(
+			&env.repo.borrow(),
+			MAX_AI_DIFF_BYTES,
+		)
+		.unwrap();
+		(dir, repo, popup, diff)
+	}
+
+	fn finish(popup: &mut CommitPopup, diff: String) {
+		popup.ai_generation.store(1, Ordering::Relaxed);
+		popup.ai_pending = true;
+		*popup.ai_result.lock().unwrap() = Some(AiGeneration {
+			id: 1,
+			initial_input: String::new(),
+			result: std::result::Result::Ok((
+				diff,
+				"Summarize staged change".to_owned(),
+			)),
+		});
+		popup.update_async(AsyncNotification::App(
+			AsyncAppNotification::AiCommitMessage,
+		));
+	}
+
+	#[test]
+	fn generated_message_becomes_an_editable_draft() {
+		let (_dir, _repo, mut popup, diff) = staged_popup();
+		finish(&mut popup, diff);
+		assert_eq!(popup.input.get_text(), "Summarize staged change");
+		assert_eq!(
+			popup.options.borrow().commit_draft().map(String::as_str),
+			Some("Summarize staged change")
+		);
+	}
+
+	#[test]
+	fn staged_change_during_generation_discards_result() {
+		let (dir, repo, mut popup, diff) = staged_popup();
+		std::fs::write(dir.path().join("change.txt"), "second\n")
+			.unwrap();
+		let mut index = repo.index().unwrap();
+		index.add_path(Path::new("change.txt")).unwrap();
+		index.write().unwrap();
+		finish(&mut popup, diff);
+		assert!(popup.input.get_text().is_empty());
+	}
+
+	#[test]
+	fn input_change_during_generation_discards_result() {
+		let (_dir, _repo, mut popup, diff) = staged_popup();
+		popup.input.set_text("My draft".to_owned());
+		finish(&mut popup, diff);
+		assert_eq!(popup.input.get_text(), "My draft");
 	}
 }

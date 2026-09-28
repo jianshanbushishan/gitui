@@ -1,5 +1,5 @@
 use crate::{args::get_app_config_path, components::DiffMode};
-use anyhow::Result;
+use anyhow::{bail, Result};
 use asyncgit::sync::{
 	diff::DiffOptions, repo_dir, RepoPathRef,
 	ShowUntrackedFilesConfig,
@@ -68,6 +68,37 @@ pub struct ExternalDiffCommand {
 	pub args: Vec<String>,
 }
 
+/// Command used to generate a commit message from a staged diff on stdin.
+/// Arguments are passed directly to the executable, without a shell.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiCommitCommand {
+	pub command: String,
+	pub args: Vec<String>,
+}
+
+#[derive(
+	Default, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize,
+)]
+pub enum AiCommitBackend {
+	#[default]
+	Disabled,
+	Pi,
+	Command,
+}
+
+impl AiCommitBackend {
+	pub const ALL: [Self; 3] =
+		[Self::Disabled, Self::Pi, Self::Command];
+
+	pub const fn label(self) -> &'static str {
+		match self {
+			Self::Disabled => "Disabled",
+			Self::Pi => "Pi coding agent",
+			Self::Command => "Custom command",
+		}
+	}
+}
+
 #[derive(Default, Clone, Serialize, Deserialize)]
 struct ExternalDiffTools {
 	pub beyondcompare: Option<ExternalDiffCommand>,
@@ -81,6 +112,8 @@ struct ExternalDiffTools {
 struct GlobalOptions {
 	pub external_diff_tool: Option<ExternalDiffTool>,
 	pub external_diff_tools: Option<ExternalDiffTools>,
+	pub ai_commit_backend: Option<AiCommitBackend>,
+	pub ai_commit_command: Option<AiCommitCommand>,
 	pub status_left_ratio: Option<u16>,
 	pub log_left_ratio: Option<u16>,
 	pub detail_left_ratio: Option<u16>,
@@ -93,6 +126,7 @@ struct GlobalOptions {
 #[derive(Default, Clone, Serialize, Deserialize)]
 struct OptionsData {
 	pub external_diff_tool: Option<ExternalDiffTool>,
+	pub ai_commit_backend: Option<AiCommitBackend>,
 	pub tab: usize,
 	pub diff: DiffOptions,
 	pub status_show_untracked: Option<ShowUntrackedFilesConfig>,
@@ -170,6 +204,67 @@ impl Options {
 				ExternalDiffTool::Vscode => tools.vscode,
 			});
 		Ok(configured.unwrap_or_else(|| tool.default_command()))
+	}
+
+	pub fn ai_commit_backend(&self) -> AiCommitBackend {
+		self.data
+			.ai_commit_backend
+			.or_else(|| {
+				Self::read_global()
+					.ok()
+					.and_then(|g| g.ai_commit_backend)
+			})
+			.unwrap_or_default()
+	}
+
+	pub fn set_ai_commit_backend(
+		&mut self,
+		backend: AiCommitBackend,
+	) {
+		self.data.ai_commit_backend = Some(backend);
+		self.save();
+	}
+
+	pub fn ai_commit_command(&self) -> Result<AiCommitCommand> {
+		match self.ai_commit_backend() {
+			AiCommitBackend::Disabled => {
+				bail!("AI commit message generation is disabled")
+			}
+			AiCommitBackend::Pi => Ok(AiCommitCommand {
+				command: "pi".to_owned(),
+				args: [
+					"--print",
+					"--no-session",
+					"--no-tools",
+					"--no-extensions",
+					"--no-skills",
+					"--no-prompt-templates",
+					"--no-context-files",
+					"--no-approve",
+					"Write a concise Git commit message for the staged diff on standard input. Return only the commit message, with a short subject and an optional body.",
+				]
+				.into_iter()
+				.map(str::to_owned)
+				.collect(),
+			}),
+			AiCommitBackend::Command => {
+				let path = get_app_config_path()?.join("config.ron");
+				let global = if path.try_exists()? {
+					Self::read_global()?
+				} else {
+					GlobalOptions::default()
+				};
+				let command = global
+					.ai_commit_command
+					.ok_or_else(|| anyhow::anyhow!(
+						"AI commit command is not configured; set ai_commit_command in config.ron"
+					))?;
+				if command.command.trim().is_empty() {
+					bail!("ai_commit_command.command in config.ron must not be empty");
+				}
+				Ok(command)
+			}
+		}
 	}
 
 	pub fn set_current_tab(&mut self, tab: usize) {
@@ -399,10 +494,7 @@ mod tests {
 		let tools = config.external_diff_tools.unwrap();
 		let beyondcompare = tools.beyondcompare.unwrap();
 		assert_eq!(beyondcompare.command, "BComp.exe");
-		assert_eq!(
-			beyondcompare.args,
-			vec!["{left}", "{right}"]
-		);
+		assert_eq!(beyondcompare.args, vec!["{left}", "{right}"]);
 		#[cfg(windows)]
 		assert_eq!(
 			beyondcompare,
@@ -435,6 +527,59 @@ mod tests {
 		assert_eq!(
 			Options::new(repo).borrow().external_diff_tool(),
 			ExternalDiffTool::Vscode
+		);
+	}
+
+	#[test]
+	fn ai_commit_configuration_and_default_command() {
+		use super::{
+			AiCommitBackend, AiCommitCommand, GlobalOptions,
+		};
+		let config: GlobalOptions = ron::from_str(
+			r#"(
+				ai_commit_backend: Some(Command),
+				ai_commit_command: Some((
+					command: "my-agent",
+					args: ["generate", "--quiet"],
+				)),
+			)"#,
+		)
+		.unwrap();
+		assert_eq!(
+			config.ai_commit_backend,
+			Some(AiCommitBackend::Command)
+		);
+		assert_eq!(
+			config.ai_commit_command,
+			Some(AiCommitCommand {
+				command: "my-agent".to_owned(),
+				args: vec![
+					"generate".to_owned(),
+					"--quiet".to_owned()
+				],
+			})
+		);
+
+		let mut opts = Options::test_env();
+		opts.set_ai_commit_backend(AiCommitBackend::Pi);
+		let command = opts.ai_commit_command().unwrap();
+		assert_eq!(command.command, "pi");
+		assert!(command.args.contains(&"--print".to_owned()));
+		assert!(command.args.contains(&"--no-tools".to_owned()));
+	}
+
+	#[test]
+	fn ai_commit_selection_persists() {
+		use super::AiCommitBackend;
+		let td = TempDir::new().unwrap();
+		init_repo(&td);
+		let repo =
+			RefCell::new(RepoPath::Path(td.path().to_path_buf()));
+		let opts = Options::new(repo.clone());
+		opts.borrow_mut().set_ai_commit_backend(AiCommitBackend::Pi);
+		assert_eq!(
+			Options::new(repo).borrow().ai_commit_backend(),
+			AiCommitBackend::Pi
 		);
 	}
 

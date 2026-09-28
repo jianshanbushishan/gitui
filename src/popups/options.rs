@@ -6,7 +6,7 @@ use crate::{
 		DrawableComponent, EventState,
 	},
 	keys::{key_match, SharedKeyConfig},
-	options::{ExternalDiffTool, SharedOptions},
+	options::{AiCommitBackend, ExternalDiffTool, SharedOptions},
 	queue::{InternalEvent, Queue},
 	strings,
 	ui::{self, style::SharedTheme},
@@ -30,11 +30,13 @@ pub enum AppOption {
 	DiffContextLines,
 	DiffInterhunkLines,
 	ExternalDiffTool,
+	AiCommitBackend,
 }
 
 pub struct OptionsPopup {
 	selection: AppOption,
 	tool_selection: Option<usize>,
+	ai_backend_selection: Option<usize>,
 	queue: Queue,
 	visible: bool,
 	key_config: SharedKeyConfig,
@@ -48,6 +50,7 @@ impl OptionsPopup {
 		Self {
 			selection: AppOption::StatusShowUntracked,
 			tool_selection: None,
+			ai_backend_selection: None,
 			queue: env.queue.clone(),
 			visible: false,
 			key_config: env.key_config.clone(),
@@ -57,7 +60,7 @@ impl OptionsPopup {
 	}
 
 	fn get_text(&self, width: u16) -> Vec<Line<'_>> {
-		let mut txt: Vec<Line> = Vec::with_capacity(10);
+		let mut txt: Vec<Line> = Vec::with_capacity(16);
 
 		self.add_status(&mut txt, width);
 
@@ -135,6 +138,29 @@ impl OptionsPopup {
 			}
 			Self::add_header(txt, "Enter: select   Esc: cancel");
 		}
+
+		Self::add_header(txt, "AI commit message");
+		self.add_entry(
+			txt,
+			width,
+			"Backend",
+			self.options.borrow().ai_commit_backend().label(),
+			self.is_select(AppOption::AiCommitBackend),
+		);
+		if let Some(selected) = self.ai_backend_selection {
+			for (index, backend) in
+				AiCommitBackend::ALL.iter().enumerate()
+			{
+				self.add_entry(
+					txt,
+					width,
+					"",
+					backend.label(),
+					selected == index,
+				);
+			}
+			Self::add_header(txt, "Enter: select   Esc: cancel");
+		}
 	}
 
 	fn is_select(&self, kind: AppOption) -> bool {
@@ -174,6 +200,9 @@ impl OptionsPopup {
 		if up {
 			self.selection = match self.selection {
 				AppOption::StatusShowUntracked => {
+					AppOption::AiCommitBackend
+				}
+				AppOption::AiCommitBackend => {
 					AppOption::ExternalDiffTool
 				}
 				AppOption::ExternalDiffTool => {
@@ -203,6 +232,9 @@ impl OptionsPopup {
 					AppOption::DiffInterhunkLines
 				}
 				AppOption::ExternalDiffTool => {
+					AppOption::AiCommitBackend
+				}
+				AppOption::AiCommitBackend => {
 					AppOption::StatusShowUntracked
 				}
 				AppOption::DiffInterhunkLines => {
@@ -215,7 +247,8 @@ impl OptionsPopup {
 	fn switch_option(&self, right: bool) {
 		if right {
 			match self.selection {
-				AppOption::ExternalDiffTool => return,
+				AppOption::ExternalDiffTool
+				| AppOption::AiCommitBackend => return,
 				AppOption::StatusShowUntracked => {
 					let untracked =
 						self.options.borrow().status_show_untracked();
@@ -260,7 +293,8 @@ impl OptionsPopup {
 			}
 		} else {
 			match self.selection {
-				AppOption::ExternalDiffTool => return,
+				AppOption::ExternalDiffTool
+				| AppOption::AiCommitBackend => return,
 				AppOption::StatusShowUntracked => {
 					let untracked =
 						self.options.borrow().status_show_untracked();
@@ -335,10 +369,12 @@ impl DrawableComponent for OptionsPopup {
 		if self.is_visible() {
 			let size = (
 				54,
-				if self.tool_selection.is_some() {
-					16
+				if self.tool_selection.is_some()
+					|| self.ai_backend_selection.is_some()
+				{
+					19
 				} else {
-					12
+					15
 				},
 			);
 			let area =
@@ -396,12 +432,48 @@ impl Component for OptionsPopup {
 		visibility_blocking(self)
 	}
 
+	#[allow(clippy::too_many_lines)]
 	fn event(
 		&mut self,
 		event: &crossterm::event::Event,
 	) -> Result<EventState> {
 		if self.is_visible() {
 			if let Event::Key(key) = &event {
+				if let Some(selected) = self.ai_backend_selection {
+					if key_match(key, self.key_config.keys.exit_popup)
+					{
+						self.ai_backend_selection = None;
+					} else if key_match(
+						key,
+						self.key_config.keys.enter,
+					) {
+						self.options
+							.borrow_mut()
+							.set_ai_commit_backend(
+								AiCommitBackend::ALL[selected],
+							);
+						self.ai_backend_selection = None;
+					} else if key_match(
+						key,
+						self.key_config.keys.move_up,
+					) || key_match(
+						key,
+						self.key_config.keys.popup_up,
+					) {
+						self.ai_backend_selection =
+							Some((selected + 2) % 3);
+					} else if key_match(
+						key,
+						self.key_config.keys.move_down,
+					) || key_match(
+						key,
+						self.key_config.keys.popup_down,
+					) {
+						self.ai_backend_selection =
+							Some((selected + 1) % 3);
+					}
+					return Ok(EventState::Consumed);
+				}
 				if let Some(selected) = self.tool_selection {
 					if key_match(key, self.key_config.keys.exit_popup)
 					{
@@ -447,6 +519,16 @@ impl Component for OptionsPopup {
 						.position(|candidate| *candidate == tool);
 					return Ok(EventState::Consumed);
 				}
+				if self.selection == AppOption::AiCommitBackend
+					&& key_match(key, self.key_config.keys.enter)
+				{
+					let backend =
+						self.options.borrow().ai_commit_backend();
+					self.ai_backend_selection = AiCommitBackend::ALL
+						.iter()
+						.position(|candidate| *candidate == backend);
+					return Ok(EventState::Consumed);
+				}
 				if key_match(key, self.key_config.keys.exit_popup) {
 					self.hide();
 				} else if key_match(key, self.key_config.keys.move_up)
@@ -487,6 +569,7 @@ impl Component for OptionsPopup {
 	fn hide(&mut self) {
 		self.visible = false;
 		self.tool_selection = None;
+		self.ai_backend_selection = None;
 	}
 
 	fn show(&mut self) -> Result<()> {
@@ -509,6 +592,7 @@ mod tests {
 			.set_external_diff_tool(ExternalDiffTool::BeyondCompare);
 		let mut popup = OptionsPopup::new(&env);
 		popup.show().unwrap();
+		popup.move_selection(true);
 		popup.move_selection(true);
 		assert_eq!(popup.selection, AppOption::ExternalDiffTool);
 		let press = |popup: &mut OptionsPopup, code| {
@@ -536,6 +620,42 @@ mod tests {
 			ExternalDiffTool::Nvim
 		);
 		assert_eq!(popup.tool_selection, None);
+	}
+
+	#[test]
+	fn ai_commit_backend_dropdown_confirms_and_cancels() {
+		use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+		let env = Environment::test_env();
+		env.options
+			.borrow_mut()
+			.set_ai_commit_backend(AiCommitBackend::Disabled);
+		let mut popup = OptionsPopup::new(&env);
+		popup.show().unwrap();
+		popup.move_selection(true);
+		assert_eq!(popup.selection, AppOption::AiCommitBackend);
+		let press = |popup: &mut OptionsPopup, code| {
+			popup
+				.event(&Event::Key(KeyEvent::new(
+					code,
+					KeyModifiers::NONE,
+				)))
+				.unwrap();
+		};
+		press(&mut popup, KeyCode::Enter);
+		press(&mut popup, KeyCode::Down);
+		press(&mut popup, KeyCode::Esc);
+		assert_eq!(
+			env.options.borrow().ai_commit_backend(),
+			AiCommitBackend::Disabled
+		);
+		press(&mut popup, KeyCode::Enter);
+		press(&mut popup, KeyCode::Down);
+		press(&mut popup, KeyCode::Enter);
+		assert_eq!(
+			env.options.borrow().ai_commit_backend(),
+			AiCommitBackend::Pi
+		);
+		assert_eq!(popup.ai_backend_selection, None);
 	}
 
 	#[test]

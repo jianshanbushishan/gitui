@@ -153,6 +153,40 @@ Snapshots are discarded when the viewer closes, so edits there do not modify
 the worktree. The `external_diff` key binding is configurable; the default
 binding for resetting selected diff lines is now `Alt+d` (Vim preset: `u`).
 
+#### AI commit messages
+
+In **Options**, select **AI commit message → Backend** and choose **Pi coding
+agent** or **Custom command**. The choice is saved per repository and defaults
+to **Disabled**. In the commit popup, clear any existing message and press
+`Ctrl+g` to generate an editable draft from staged changes. Review and edit the
+draft, then use the usual commit key. Generation never commits automatically.
+The selected agent may send the staged patch to its model provider.
+
+The Pi backend requires `pi` on `PATH` and uses Pi's configured model and
+credentials. GitUI runs Pi once in print mode without tools, extensions,
+skills, project context files, or a saved session. The staged patch is passed
+on stdin; only the final text on stdout becomes the draft.
+
+For a different agent, configure a command in your global `config.ron`:
+
+```ron
+(
+    ai_commit_command: Some((
+        command: "my-commit-message-agent",
+        args: ["--print"],
+    )),
+)
+```
+
+Select **Custom command** in Options. The program receives the staged patch
+on stdin, runs from the repository root, and must write only the commit
+message to stdout. Arguments are passed directly, without a shell. You can also set
+`ai_commit_backend: Some(Pi)` or `Some(Command)` in global `config.ron` as a
+default for repositories without a saved selection. The patch is limited to
+64 KiB; larger staged changes produce an error. Binary content is omitted,
+and the command times out after 90 seconds. A result is discarded if the
+draft or staged changes changed while it was running.
+
 #### Miscellaneous
 
 - The binary version string is derived from `git describe` and refreshes on every commit/checkout/tag.
