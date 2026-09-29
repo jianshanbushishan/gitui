@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Fixed
+* development builds refresh the Git revision and `-dirty` marker after a commit on the current branch; the build script now watches the branch ref as well as `HEAD`.
+
 ## [0.30.0] - 2026-09-28
 
 ### Added

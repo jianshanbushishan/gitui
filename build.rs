@@ -1,5 +1,17 @@
 use std::process::Command;
 
+fn track_git_path(path: &str) {
+	if let Ok(output) = Command::new("git")
+		.args(["rev-parse", "--git-path", path])
+		.output()
+	{
+		if output.status.success() {
+			let path = String::from_utf8_lossy(&output.stdout);
+			println!("cargo:rerun-if-changed={}", path.trim());
+		}
+	}
+}
+
 fn get_version() -> String {
 	let package_version = env!("CARGO_PKG_VERSION");
 	if let Ok(commit) = std::env::var("BUILD_GIT_COMMIT_ID") {
@@ -51,7 +63,19 @@ fn main() {
 	println!("cargo:rustc-env=GITUI_BUILD_NAME={build_name}");
 
 	println!("cargo:rerun-if-changed=build.rs");
-	// git 状态（tag/commit/分支）变化时刷新版本号。
-	// git 在 commit/checkout 时会重写 .git/HEAD，借此触发重跑。
-	println!("cargo:rerun-if-changed=.git/HEAD");
+	println!("cargo:rerun-if-env-changed=BUILD_GIT_COMMIT_ID");
+	println!("cargo:rerun-if-env-changed=GITUI_RELEASE");
+	track_git_path("HEAD");
+	track_git_path("logs/HEAD");
+	track_git_path("refs/tags");
+	track_git_path("packed-refs");
+	if let Ok(output) = Command::new("git")
+		.args(["symbolic-ref", "--quiet", "HEAD"])
+		.output()
+	{
+		if output.status.success() {
+			let branch = String::from_utf8_lossy(&output.stdout);
+			track_git_path(branch.trim());
+		}
+	}
 }
