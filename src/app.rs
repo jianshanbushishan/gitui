@@ -57,6 +57,7 @@ use std::{
 	cell::{Cell, RefCell},
 	path::{Path, PathBuf},
 	rc::Rc,
+	time::Instant,
 };
 
 #[derive(Clone)]
@@ -507,6 +508,14 @@ impl App {
 	/// a push is currently running (drives ticker-based popup redraws)
 	pub const fn is_push_in_progress(&self) -> bool {
 		self.push_popup.is_active()
+	}
+
+	/// Advance the search cursor animation on the existing spinner tick.
+	pub fn update_search_cursor_blink(
+		&mut self,
+		now: Instant,
+	) -> bool {
+		self.log_search_popup.update_cursor_blink(now)
 	}
 
 	///

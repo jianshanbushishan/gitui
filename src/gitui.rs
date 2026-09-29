@@ -102,9 +102,14 @@ impl Gitui {
 			{
 				if matches!(event, QueueEvent::SpinnerUpdate) {
 					spinner.update();
+					let cursor_changed = self
+						.app
+						.update_search_cursor_blink(Instant::now());
 					// keep the push popup alive (elapsed time,
 					// progress) even when git reports nothing
-					if self.app.is_push_in_progress() {
+					if self.app.is_push_in_progress()
+						|| cursor_changed
+					{
 						self.draw(terminal)?;
 					}
 					spinner.draw(terminal)?;

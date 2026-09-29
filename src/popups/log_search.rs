@@ -24,6 +24,9 @@ use ratatui::{
 	widgets::{Block, Borders, Clear, Paragraph},
 	Frame,
 };
+use std::time::{Duration, Instant};
+
+const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 
 enum Selection {
 	EnterText,
@@ -55,6 +58,8 @@ pub struct LogSearchPopupPopup {
 	jump_commit_id: Option<CommitId>,
 	file_history: bool,
 	previous_filter_results: Option<bool>,
+	blink_started: Instant,
+	blink_visible: bool,
 }
 
 impl LogSearchPopupPopup {
@@ -87,6 +92,8 @@ impl LogSearchPopupPopup {
 			jump_commit_id: None,
 			file_history: false,
 			previous_filter_results: None,
+			blink_started: Instant::now(),
+			blink_visible: true,
 		}
 	}
 
@@ -145,6 +152,31 @@ impl LogSearchPopupPopup {
 				self.selection = Selection::EnterText;
 			}
 		}
+		self.reset_cursor_blink();
+	}
+
+	fn reset_cursor_blink(&mut self) {
+		self.blink_started = Instant::now();
+		self.blink_visible = true;
+		self.find_text.set_cursor_visible(true);
+	}
+
+	/// Return whether the cursor changed and the popup needs a redraw.
+	pub fn update_cursor_blink(&mut self, now: Instant) -> bool {
+		if !self.is_input_mode() {
+			return false;
+		}
+		let elapsed =
+			now.saturating_duration_since(self.blink_started);
+		let visible = (elapsed.as_millis()
+			/ CURSOR_BLINK_INTERVAL.as_millis())
+			% 2 == 0;
+		if visible == self.blink_visible {
+			return false;
+		}
+		self.blink_visible = visible;
+		self.find_text.set_cursor_visible(visible);
+		true
 	}
 
 	fn execute_confirm(&mut self) {
@@ -403,7 +435,7 @@ impl LogSearchPopupPopup {
 		}
 	}
 
-	const fn move_selection(&mut self, arg: bool) {
+	fn move_selection(&mut self, arg: bool) {
 		if arg {
 			//up
 			self.selection = match self.selection {
@@ -464,6 +496,12 @@ impl LogSearchPopupPopup {
 
 		self.find_text
 			.enabled(matches!(self.selection, Selection::EnterText));
+		if matches!(self.selection, Selection::EnterText) {
+			self.reset_cursor_blink();
+		} else {
+			self.blink_visible = false;
+			self.find_text.set_cursor_visible(false);
+		}
 	}
 
 	fn draw_search_mode(
@@ -498,11 +536,6 @@ impl LogSearchPopupPopup {
 			}));
 
 		self.find_text.draw(f, chunks[0])?;
-		if !self.option_selected() {
-			// Keep the text and cursor colors while highlighting the input row.
-			f.buffer_mut()
-				.set_style(chunks[0], self.theme.text(false, true));
-		}
 
 		f.render_widget(
 			Paragraph::new(self.get_text_options())
@@ -556,9 +589,6 @@ impl LogSearchPopupPopup {
 			}));
 
 		self.find_text.draw(f, chunks[0])?;
-		// The SHA field always accepts text in this mode.
-		f.buffer_mut()
-			.set_style(chunks[0], self.theme.text(false, true));
 
 		if show_invalid {
 			self.draw_invalid_sha(f);
@@ -616,7 +646,9 @@ impl LogSearchPopupPopup {
 			{
 				self.toggle_option();
 			} else if !self.option_selected() {
-				self.find_text.event(event)?;
+				if self.find_text.event(event)?.is_consumed() {
+					self.reset_cursor_blink();
+				}
 			}
 		}
 
@@ -640,6 +672,7 @@ impl LogSearchPopupPopup {
 				self.find_text.enabled(
 					!self.find_text.get_text().trim().is_empty(),
 				);
+				self.reset_cursor_blink();
 			}
 		}
 
@@ -766,17 +799,18 @@ impl Component for LogSearchPopupPopup {
 mod tests {
 	use super::*;
 	use crate::queue::InternalEvent;
+	use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 	use ratatui::{backend::TestBackend, Terminal};
 
 	#[test]
-	fn search_input_highlight_tracks_text_selection() {
+	fn search_cursor_blinks_only_while_editable() {
 		let env = Environment::test_env();
 		let mut popup = LogSearchPopupPopup::new(&env);
 		let mut terminal =
 			Terminal::new(TestBackend::new(80, 20)).unwrap();
 		popup.open().unwrap();
 
-		let input_background =
+		let cursor_is_visible =
 			|popup: &LogSearchPopupPopup,
 			 terminal: &mut Terminal<TestBackend>| {
 				terminal
@@ -785,22 +819,45 @@ mod tests {
 					})
 					.unwrap();
 				let area = popup.find_text.get_area();
-				terminal.backend().buffer()
-					[(area.x + area.width / 2, area.y)]
-					.bg
+				let (_, col) = popup.find_text.cursor().unwrap();
+				terminal.backend().buffer()[(area.x + col, area.y)]
+					.modifier
+					.contains(ratatui::style::Modifier::REVERSED)
 			};
 
-		let focused = input_background(&popup, &mut terminal);
-		assert_eq!(
-			focused,
-			popup.theme.text(false, true).bg.unwrap()
-		);
+		assert!(cursor_is_visible(&popup, &mut terminal));
+		let started = popup.blink_started;
+		assert!(!popup.update_cursor_blink(
+			started + Duration::from_millis(499)
+		));
+		assert!(popup.update_cursor_blink(
+			started + Duration::from_millis(500)
+		));
+		assert!(!cursor_is_visible(&popup, &mut terminal));
+		assert!(popup.update_cursor_blink(
+			started + Duration::from_millis(1000)
+		));
+		assert!(cursor_is_visible(&popup, &mut terminal));
 
 		popup.move_selection(false);
-		assert_ne!(input_background(&popup, &mut terminal), focused);
+		assert!(!cursor_is_visible(&popup, &mut terminal));
+		assert!(!popup
+			.update_cursor_blink(started + Duration::from_secs(3)));
 
 		popup.move_selection(true);
-		assert_eq!(input_background(&popup, &mut terminal), focused);
+		assert!(cursor_is_visible(&popup, &mut terminal));
+		popup
+			.event(&Event::Key(KeyEvent::new(
+				KeyCode::Char('a'),
+				KeyModifiers::NONE,
+			)))
+			.unwrap();
+		assert_eq!(popup.find_text.get_text(), "a");
+		assert!(cursor_is_visible(&popup, &mut terminal));
+		assert!(popup.update_cursor_blink(
+			popup.blink_started + CURSOR_BLINK_INTERVAL
+		));
+		assert!(!cursor_is_visible(&popup, &mut terminal));
 	}
 
 	#[test]

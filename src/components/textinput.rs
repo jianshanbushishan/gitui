@@ -15,6 +15,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::{Block, Borders};
 use ratatui::{
 	layout::{Alignment, Rect},
+	style::{Modifier, Style},
 	widgets::{Clear, Paragraph},
 	Frame,
 };
@@ -140,6 +141,18 @@ impl TextInputComponent {
 	///
 	pub const fn enabled(&mut self, enable: bool) {
 		self.selected = Some(enable);
+	}
+
+	/// Show or hide the software cursor without changing the input text.
+	pub fn set_cursor_visible(&mut self, visible: bool) {
+		if let Some(ta) = &mut self.textarea {
+			let style = if visible {
+				Style::default().add_modifier(Modifier::REVERSED)
+			} else {
+				ta.cursor_line_style()
+			};
+			ta.set_cursor_style(style);
+		}
 	}
 
 	fn show_inner_textarea(&mut self) {
