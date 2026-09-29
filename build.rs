@@ -1,8 +1,12 @@
 use std::process::Command;
 
 fn get_version() -> String {
+	let package_version = env!("CARGO_PKG_VERSION");
 	if let Ok(commit) = std::env::var("BUILD_GIT_COMMIT_ID") {
-		return commit[..7].to_string();
+		return format!(
+			"{package_version}-{}",
+			commit.chars().take(8).collect::<String>()
+		);
 	}
 
 	let describe = Command::new("git")
@@ -10,23 +14,30 @@ fn get_version() -> String {
 		.arg("--tags")
 		.arg("--always")
 		.arg("--dirty")
+		.arg("--match")
+		.arg(format!("v{package_version}"))
+		.arg("--match")
+		.arg(package_version)
 		.output();
 
-	let version = match describe {
+	match describe {
 		Ok(output) => {
 			let raw = String::from_utf8_lossy(&output.stdout);
 			let line = raw.lines().next().unwrap_or("").trim();
 			if line.is_empty() {
-				return "unknown".to_string();
+				return package_version.to_string();
 			}
-			line.trim_start_matches('v').to_string()
+			if let Some(suffix) = line
+				.strip_prefix(&format!("v{package_version}"))
+				.or_else(|| line.strip_prefix(package_version))
+			{
+				format!("{package_version}{suffix}")
+			} else {
+				format!("{package_version}-{line}")
+			}
 		}
-		Err(e) => {
-			panic!("Can not get git describe: {e}");
-		}
-	};
-
-	version
+		Err(_) => package_version.to_string(),
+	}
 }
 
 fn main() {

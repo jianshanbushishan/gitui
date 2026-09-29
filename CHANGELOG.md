@@ -7,10 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [0.30.0] - 2026-09-28
+
 ### Added
-* the `bat` file preview and the `delta` diff renderer now follow the Windows light/dark system theme. At startup gitui reads the `AppsUseLightTheme` registry value (which Windows Terminal mirrors when its `theme` is `system`, the default). Because both tools are launched with piped stdout and cannot query the terminal themselves, gitui passes `light`/`dark` to bat and `--light`/`--dark` plus true-color output to delta. This keeps bat's automatic syntax-theme choice and delta's complete palette (including addition/deletion backgrounds) consistent with direct terminal execution. The scheme is detected once at launch, so switching the OS theme requires reopening gitui. On macOS/Linux the detection returns "unknown" and the tools retain their previous behavior.
+* the `bat` file preview and the `delta` diff renderer now follow the OS light/dark system theme. At startup gitui reads the `AppsUseLightTheme` registry value on Windows, or queries the desktop portal and then `gsettings` on Linux. Because both tools are launched with piped stdout and cannot query the terminal themselves, gitui passes `light`/`dark` to bat and `--light`/`--dark` plus true-color output to delta. The scheme is detected once at launch, so switching the OS theme requires reopening gitui. On macOS, or when Linux detection is unavailable, the tools retain their previous behavior.
 * xterm palette colors 16–255 emitted by external preview tools are expanded to their exact RGB values before rendering. This prevents the Windows crossterm path from reducing bat's 256-color syntax output to the nearest 16-color terminal entry (for example, bat color 197 `#ff005f` previously appeared as the terminal's pale bright red), making gitui's preview match direct bat output.
 * external preview-tool discovery now honors Windows `PATHEXT`. Previously gitui searched PATH for the literal extensionless names `bat`/`batcat`/`eza`; Scoop installs `bat.exe`, so Windows silently fell back to the built-in Syntect highlighter even though running `bat` directly worked. BAT startup and exit failures are now also recorded in the debug log.
+* Logs can browse a selected local or remote branch without checking it out. The focused pane border and title, and the selected tab, use distinct theme colors.
+* File history now works for directories as well as files. Directory history shows only commits that changed the selected directory, without a diff or blame pane. File and directory history can be searched with `f`; matches remain scoped to the selected path. The fuzzy file finder now includes directories and ranks exact folder-name matches first.
+* The commit popup can generate an editable message draft from staged changes with `Ctrl+g`. Choose the Pi coding agent or a custom command in Options; generation is disabled by default and never commits automatically.
+* External diff tools can compare a file's old and new versions from the diff view or file lists. Choose Beyond Compare, Neovim or VS Code in Options; the choice is saved per repository and tool commands can be configured in `config.ron`.
+
+### Changed
+* Log search now filters the commit list to matching results by default. Uncheck **filter results** to keep the full history visible with matches highlighted; `Esc` clears the search and restores the full list. File and directory history search always filters results.
+* Background status work is coalesced and only visible content is rendered during updates. Fetch and push show more detailed progress.
+* `--version` now starts with the Cargo package version (0.30.0) rather than an older Git tag; development builds retain the Git revision and dirty marker.
+
+### Fixed
+* Force push checks the remote-tracking lease and reports when the remote has changed or a fetch is needed.
+* Status-scan and file-tree loading failures show an error instead of leaving the UI stuck loading; the file tree can be retried with Enter.
+* SSH authentication falls back to default private keys when the agent has no usable key; Windows uses the OpenSSL-backed libssh2 build. Preview navigation keys act only when their pane has focus, and printable quit keys no longer exit while typing.
 
 ## [v2.15] - 2026-07-22
 

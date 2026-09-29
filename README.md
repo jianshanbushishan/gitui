@@ -72,13 +72,13 @@ Everything in this section is added or changed on top of upstream gitui (the for
 - Delta rendering is async with an LRU cache and request dedupe; same-file stage/unstage re-renders synchronously, so the cursor never jumps and the view never flickers or shows stale content after staging hunks/lines.
 - All gitui workflows work inside the delta preview: stage/unstage hunk & lines, reset hunk, per-file `(+added -deleted)` line counters in the diff title, and correct rendering of deleted files.
 - Line wrapping, background highlighting and horizontal scrolling behave correctly in both delta modes, including CJK/double-width characters (wrapping uses unicode display width, not char count).
-- delta (and bat) previews follow the **OS light/dark theme**, detected once at startup (on Windows via the `AppsUseLightTheme` registry key), so gitui's piped delta/bat output matches direct terminal runs.
+- delta (and bat) previews follow the **OS light/dark theme**, detected once at startup (on Windows via the `AppsUseLightTheme` registry key, and on Linux via the desktop portal or `gsettings`), so gitui's piped delta/bat output matches direct terminal runs.
 
 #### File previews: bat, eza, images, in-content search
 
 - File previews are syntax-highlighted by [bat](https://github.com/sharkdp/bat) when available (ANSI output rendered through gitui's own pipeline, `$BAT_THEME` respected), falling back to the built-in syntect highlighter — including bat line numbers in the file-history preview, and no plain-text flash before the highlighted result.
 - **Images render inline** in preview panes via [ratatui-image](https://github.com/benjajaja/ratatui-image) terminal image protocols; newly added files are previewed at full content, including images. Image encoding runs on a background thread.
-- Focusing a folder shows a directory listing (`eza`, falling back to `ls`) — as a depth-limited tree, configurable via `preview_tree_depth`.
+- Focusing a folder shows a directory listing (`eza` renders a depth-limited tree configurable via `preview_tree_depth`; the `ls` fallback is flat).
 - Press `f` while the preview pane is focused to **search within the file content** and jump between matches.
 - bat's 256-color syntax output is expanded to exact RGB values so previews match direct bat output (notably on Windows), and external-tool discovery honors Windows `PATHEXT` (e.g. scoop's `bat.exe`).
 
@@ -100,7 +100,9 @@ Everything in this section is added or changed on top of upstream gitui (the for
 - The log title shows `viewing` while browsing another branch. `Esc` clears an active search first, then returns to `HEAD` history. Navigation, commit details, diffs, copying and search remain available; reset, reword, revert, checkout, tag and push actions in the log are disabled in this mode.
 - Commit details has a 3-way focus cycle `Info → Message → Files`; `y` copies the commit hash, the full commit message, or the whole author/date/sha/tags block, depending on which pane is focused.
 - The Info pane is focusable with its own scrollbar and shows tags inline on one line; the author column keeps a stable fixed width; focused Files/Message panes show scrollbars when content overflows.
-- Log search: `Ctrl+N`/`Ctrl+P` jump between matches with viewport centering, `j`/`k`/`g`/`G` move freely instead of being locked to matches, and the search status shows the cursor's position in the match range. Filename search is disabled by default for speed, and per-thread mailmap caching speeds up huge/NFS repositories.
+- Log search filters the commit list to matches by default. Uncheck **filter results** in the search popup to keep the full history visible with matching commits highlighted; `Ctrl+N`/`Ctrl+P` jump between matches with viewport centering, and `j`/`k`/`g`/`G` navigate the visible list. `Esc` clears the search and restores the full history. Filename search is disabled by default for speed, and per-thread mailmap caching speeds up huge/NFS repositories.
+- In the Files tab, select a file or directory and press `Shift+H` (**History**) to browse commits that changed that path. Directory history shows the commit list without a diff or blame pane. Press `f` in the history popup to search within that file or directory's history; results stay filtered until `Esc` clears the search.
+- The fuzzy file finder includes directories, so you can select a folder in the Files tab and open its history; an exact directory-name match appears first.
 
 #### Copy popup
 
@@ -113,11 +115,13 @@ Tuned on giant working trees such as Unreal Engine projects:
 - Status refreshes are coalesced and remote-progress notifications throttled, keeping the UI responsive during fetch/push.
 - Line stats, log search and image encoding are moved off the UI thread; revlog and preview layout/rendering are cached.
 - Fixed a stage/unstage hang and slow staging on large repos; commit search caches mailmap per thread.
+- Only visible content is rendered during background updates; status-scan errors are shown instead of leaving the file list loading indefinitely.
 
 #### Windows & CJK robustness
 
 - Wide (CJK/emoji) graphemes no longer visually overflow popup borders, truncate wrapped delta lines, or break layout — a class of fixes across the diff view and popups.
 - OS-theme detection for bat/delta, `PATHEXT`-aware tool discovery and true-color output as described above.
+- SSH authentication falls back to default private keys when the agent has no usable key; Windows uses the OpenSSL-backed libssh2 build.
 
 #### New configuration options
 
@@ -189,7 +193,9 @@ draft or staged changes changed while it was running.
 
 #### Miscellaneous
 
-- The binary version string is derived from `git describe` and refreshes on every commit/checkout/tag.
+- The binary version starts with the Cargo package version; development builds append the current Git revision (and `-dirty` for tracked changes). Release builds use the package version alone.
+- The focused pane border and title, and the selected tab, use distinct theme colors.
+- Fetch and push show progress; force push checks the remote-tracking lease and reports when a fetch is needed.
 - Dependency stack kept ahead of upstream: `git2` 0.21, `gix` 0.86, ratatui 0.30.
 
 ## 2. <a name="motivation"></a> Motivation <small><sup>[Top ▲](#table-of-contents)</sup></small>
