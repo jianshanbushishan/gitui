@@ -77,7 +77,7 @@ Everything in this section is added or changed on top of upstream gitui (the for
 #### File previews: bat, eza, images, in-content search
 
 - File previews are syntax-highlighted by [bat](https://github.com/sharkdp/bat) when available (ANSI output rendered through gitui's own pipeline, `$BAT_THEME` respected), falling back to the built-in syntect highlighter — including bat line numbers in the file-history preview, and no plain-text flash before the highlighted result.
-- **Images render inline** in preview panes via [ratatui-image](https://github.com/benjajaja/ratatui-image) terminal image protocols; newly added files are previewed at full content, including images. Image encoding runs on a background thread.
+- **Images render inline** in preview panes via [ratatui-image](https://github.com/benjajaja/ratatui-image) terminal image protocols; newly added files are previewed at full content, including images. SVG files are rasterized with [resvg](https://github.com/linebender/resvg), with system fonts and embedded images supported; external image files are omitted so previews stay consistent with Git blob content. Rendering and image encoding run on a background thread, with preview dimensions capped at 800 pixels per edge.
 - Focusing a folder shows a directory listing (`eza` renders a depth-limited tree configurable via `preview_tree_depth`; the `ls` fallback is flat).
 - Press `f` while the preview pane is focused to **search within the file content** and jump between matches.
 - bat's 256-color syntax output is expanded to exact RGB values so previews match direct bat output (notably on Windows), and external-tool discovery honors Windows `PATHEXT` (e.g. scoop's `bat.exe`).

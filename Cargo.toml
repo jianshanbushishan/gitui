@@ -69,6 +69,11 @@ ratatui-image = { version = "11.0.0", default-features = false, features = [
 ] }
 ratatui-textarea = "0.8"
 rayon-core = "1.13"
+resvg = { version = "0.48.1", default-features = false, features = [
+  "text",
+  "system-fonts",
+  "raster-images",
+] }
 ron = "0.12"
 scopeguard = "1.2"
 scopetime = { path = "./scopetime", version = "0.1" }

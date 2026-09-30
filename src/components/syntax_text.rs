@@ -479,7 +479,7 @@ impl SyntaxTextComponent {
 			return;
 		}
 
-		if ui::is_image(bytes) {
+		if ui::is_image(Path::new(&path), bytes) {
 			self.cancel_highlighting();
 			self.image_preview.get_mut().set(bytes, content_hash);
 			self.current_file = Some((path, PreviewContent::Image));
@@ -1093,11 +1093,22 @@ mod tests {
 		));
 		let mut encoded = Cursor::new(Vec::new());
 		source.write_to(&mut encoded, ImageFormat::Png).unwrap();
+		assert_image_preview("preview.png", encoded.get_ref());
+	}
 
+	#[test]
+	fn renders_svg_with_terminal_fallback() {
+		assert_image_preview(
+			"preview.SVG",
+			b"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 40 40\">\
+			<rect width=\"40\" height=\"40\" fill=\"#1478dc\"/></svg>",
+		);
+	}
+
+	fn assert_image_preview(path: &str, bytes: &[u8]) {
 		let env = Environment::test_env();
 		let mut component = SyntaxTextComponent::new(&env);
-		component
-			.load_bytes("preview.png".to_string(), encoded.get_ref());
+		component.load_bytes(path.to_string(), bytes);
 		assert!(component.is_image());
 
 		let backend = TestBackend::new(20, 10);

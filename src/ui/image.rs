@@ -13,6 +13,7 @@ use ratatui_image::{
 use std::{
 	collections::VecDeque,
 	io::Cursor,
+	path::Path,
 	sync::{
 		atomic::{AtomicU64, Ordering},
 		Arc, Mutex,
@@ -20,6 +21,8 @@ use std::{
 };
 
 static IMAGE_PICKER: OnceCell<Picker> = OnceCell::new();
+static SVG_OPTIONS: OnceCell<resvg::usvg::Options<'static>> =
+	OnceCell::new();
 const MAX_PREVIEW_EDGE: u32 = 800;
 const CACHE_ENTRIES: usize = 4;
 
@@ -36,16 +39,60 @@ pub fn init_terminal_image_support() {
 	let _ = IMAGE_PICKER.set(picker);
 }
 
-/// Recognize image signatures without decoding on the UI thread.
-pub fn is_image(bytes: &[u8]) -> bool {
+/// Recognize raster signatures and SVG extensions without decoding on the UI thread.
+pub fn is_image(path: &Path, bytes: &[u8]) -> bool {
 	image::guess_format(bytes).is_ok()
+		|| path.extension().is_some_and(|extension| {
+			extension.eq_ignore_ascii_case("svg")
+		})
 }
 
-fn decode(bytes: &[u8]) -> image::ImageResult<DynamicImage> {
-	let mut reader =
-		ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
+fn decode(bytes: &[u8]) -> Result<DynamicImage, String> {
+	// Decode by content so the cache remains valid when identical bytes
+	// are loaded under different file names.
+	if image::guess_format(bytes).is_err() {
+		return decode_svg(bytes);
+	}
+	let mut reader = ImageReader::new(Cursor::new(bytes))
+		.with_guessed_format()
+		.map_err(|error| error.to_string())?;
 	reader.limits(image::Limits::default());
-	reader.decode()
+	reader.decode().map_err(|error| error.to_string())
+}
+
+fn decode_svg(bytes: &[u8]) -> Result<DynamicImage, String> {
+	let options = SVG_OPTIONS.get_or_init(|| {
+		let mut options = resvg::usvg::Options::default();
+		options.fontdb_mut().load_system_fonts();
+		// Previews use Git blob bytes. External files could belong to a
+		// different revision; only embedded images are resolved.
+		options.image_href_resolver.resolve_string =
+			Box::new(|_, _| None);
+		options
+	});
+	let tree = resvg::usvg::Tree::from_data(bytes, options)
+		.map_err(|error| error.to_string())?;
+	let size = tree.size();
+	let scale = (MAX_PREVIEW_EDGE as f32
+		/ size.width().max(size.height()))
+	.min(1.0);
+	// Limit dimensions before allocating, including SVGs with enormous viewports.
+	let width = (size.width() * scale).round().max(1.0) as u32;
+	let height = (size.height() * scale).round().max(1.0) as u32;
+	let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)
+		.ok_or_else(|| {
+			"could not allocate SVG preview".to_string()
+		})?;
+	resvg::render(
+		&tree,
+		resvg::tiny_skia::Transform::from_scale(scale, scale),
+		&mut pixmap.as_mut(),
+	);
+	// image expects straight alpha; tiny-skia renders premultiplied RGBA.
+	let pixels = pixmap.take_demultiplied();
+	let image = image::RgbaImage::from_raw(width, height, pixels)
+		.ok_or_else(|| "invalid SVG pixel buffer".to_string())?;
+	Ok(DynamicImage::ImageRgba8(image))
 }
 
 fn thumbnail(image: DynamicImage) -> DynamicImage {
@@ -270,9 +317,7 @@ fn worker(
 			cache.push_back(entry);
 			encoded
 		} else {
-			let image = decode(&request.bytes)
-				.map(thumbnail)
-				.map_err(|error| error.to_string());
+			let image = decode(&request.bytes).map(thumbnail);
 			// Switching files or resizing while decoding skips the expensive encoder.
 			if request.generation
 				!= shared.generation.load(Ordering::Relaxed)
@@ -334,10 +379,46 @@ mod tests {
 
 	#[test]
 	fn detects_signatures_without_decoding() {
-		assert!(is_image(b"\x89PNG\r\n\x1a\n"));
+		assert!(is_image(Path::new("image"), b"\x89PNG\r\n\x1a\n"));
 		assert!(decode(b"\x89PNG\r\n\x1a\n").is_err());
-		assert!(!is_image(b"plain text"));
+		assert!(!is_image(Path::new("file.txt"), b"plain text"));
 		assert_eq!(decode(&png()).unwrap().width(), 20);
+	}
+
+	#[test]
+	fn detects_svg_extensions_without_treating_xml_as_images() {
+		let xml = b"<?xml version=\"1.0\"?><document/>";
+		assert!(is_image(Path::new("preview.svg"), xml));
+		assert!(is_image(Path::new("preview.SVG"), xml));
+		assert!(!is_image(Path::new("preview.xml"), xml));
+	}
+
+	#[test]
+	fn svg_preserves_colors_and_straight_alpha() {
+		let svg = b"\xef\xbb\xbf<?xml version=\"1.0\"?>\n<!-- preview -->\n\
+			<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"20\" height=\"10\">\
+			<rect width=\"10\" height=\"10\" fill=\"red\" opacity=\"0.5\"/>\
+			</svg>";
+		let image = decode(svg).unwrap().into_rgba8();
+		assert_eq!(image.dimensions(), (20, 10));
+		let pixel = image.get_pixel(5, 5).0;
+		assert_eq!(&pixel[..3], &[255, 0, 0]);
+		assert!((127..=128).contains(&pixel[3]));
+		assert_eq!(image.get_pixel(15, 5).0, [0, 0, 0, 0]);
+	}
+
+	#[test]
+	fn svg_caps_allocation_and_handles_viewbox_only_sizes() {
+		let huge = b"<svg xmlns=\"http://www.w3.org/2000/svg\" \
+			width=\"2000000\" height=\"1000000\">\
+			<rect width=\"2000000\" height=\"1000000\" fill=\"blue\"/></svg>";
+		let image = decode(huge).unwrap().into_rgba8();
+		assert_eq!(image.dimensions(), (800, 400));
+		assert_eq!(image.get_pixel(400, 200).0, [0, 0, 255, 255]);
+		let viewbox = b"<svg xmlns=\"http://www.w3.org/2000/svg\" \
+			viewBox=\"0 0 40 20\"/>";
+		let image = decode(viewbox).unwrap();
+		assert_eq!((image.width(), image.height()), (40, 20));
 	}
 
 	#[test]
@@ -474,16 +555,19 @@ mod tests {
 	}
 	#[test]
 	fn corrupt_image_reports_an_error() {
-		let (sender, receiver) = bounded(8);
-		let mut preview = ImagePreview::new(sender);
-		preview.set(b"\x89PNG\r\n\x1a\n", 1);
-		let area = Rect::new(0, 0, 60, 2);
-		let mut buf = Buffer::empty(area);
-		preview.render(area, &mut buf);
-		receiver.recv_timeout(Duration::from_secs(5)).unwrap();
-		preview.render(area, &mut buf);
-		assert!(!preview.is_pending());
-		assert!(preview.encoded.as_ref().unwrap().is_err());
-		assert_eq!(buf[(0, 0)].symbol(), "I");
+		for bytes in [b"\x89PNG\r\n\x1a\n".as_slice(), b"<svg broken"]
+		{
+			let (sender, receiver) = bounded(8);
+			let mut preview = ImagePreview::new(sender);
+			preview.set(bytes, 1);
+			let area = Rect::new(0, 0, 60, 2);
+			let mut buf = Buffer::empty(area);
+			preview.render(area, &mut buf);
+			receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+			preview.render(area, &mut buf);
+			assert!(!preview.is_pending());
+			assert!(preview.encoded.as_ref().unwrap().is_err());
+			assert_eq!(buf[(0, 0)].symbol(), "I");
+		}
 	}
 }
