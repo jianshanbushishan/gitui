@@ -4,7 +4,7 @@ use image::{DynamicImage, ImageReader};
 use once_cell::sync::OnceCell;
 use ratatui::{
 	buffer::Buffer,
-	layout::{Rect, Size},
+	layout::{Constraint, Rect, Size},
 	widgets::{Paragraph, Widget},
 };
 use ratatui_image::{
@@ -267,7 +267,12 @@ impl ImagePreview {
 		}
 		match self.encoded.as_ref() {
 			Some(Ok(protocol)) => {
-				Image::new(protocol).render(area, buf);
+				let size = protocol.size();
+				let centered = area.centered(
+					Constraint::Length(size.width),
+					Constraint::Length(size.height),
+				);
+				Image::new(protocol).render(centered, buf);
 			}
 			Some(Err(error)) => Paragraph::new(format!(
 				"Image preview failed: {error}"
