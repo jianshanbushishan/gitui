@@ -11,7 +11,7 @@ use ron::{
 use serde::{Deserialize, Serialize};
 use std::{
 	cell::RefCell,
-	fs::File,
+	fs::{self, File},
 	io::{Read, Write},
 	path::PathBuf,
 	rc::Rc,
@@ -124,14 +124,20 @@ struct GlobalOptions {
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct GlobalPreferences {
+	external_diff_tool: Option<ExternalDiffTool>,
+	ai_commit_backend: Option<AiCommitBackend>,
+	diff: DiffOptions,
+	status_show_untracked: Option<ShowUntrackedFilesConfig>,
+	diff_mode: DiffMode,
+}
+
+#[derive(Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
 struct OptionsData {
-	pub external_diff_tool: Option<ExternalDiffTool>,
-	pub ai_commit_backend: Option<AiCommitBackend>,
 	pub tab: usize,
-	pub diff: DiffOptions,
-	pub status_show_untracked: Option<ShowUntrackedFilesConfig>,
 	pub commit_msgs: Vec<String>,
-	pub diff_mode: DiffMode,
 	pub commit_draft: Option<String>,
 	pub commit_draft_cursor: Option<(u16, u16)>,
 }
@@ -142,15 +148,23 @@ const COMMIT_MSG_HISTORY_LENGTH: usize = 20;
 pub struct Options {
 	repo: RepoPathRef,
 	data: OptionsData,
+	preferences: GlobalPreferences,
+	config_dir: Option<PathBuf>,
+	#[cfg(test)]
+	_test_dir: Option<Rc<tempfile::TempDir>>,
 }
 
 #[cfg(test)]
 impl Options {
 	pub fn test_env() -> Self {
-		use asyncgit::sync::RepoPath;
+		let (dir, _repo) = git2_testing::repo_init();
+		let dir = Rc::new(dir);
 		Self {
-			repo: RefCell::new(RepoPath::Path(Default::default())),
+			repo: RefCell::new(dir.path().to_path_buf().into()),
 			data: Default::default(),
+			preferences: Default::default(),
+			config_dir: Some(dir.path().join("config")),
+			_test_dir: Some(dir),
 		}
 	}
 }
@@ -159,17 +173,35 @@ pub type SharedOptions = Rc<RefCell<Options>>;
 
 impl Options {
 	pub fn new(repo: RepoPathRef) -> SharedOptions {
-		Rc::new(RefCell::new(Self {
+		Self::with_config_dir(repo, get_app_config_path().ok())
+	}
+
+	fn with_config_dir(
+		repo: RepoPathRef,
+		config_dir: Option<PathBuf>,
+	) -> SharedOptions {
+		let mut options = Self {
 			data: Self::read(&repo).unwrap_or_default(),
 			repo,
-		}))
+			preferences: Default::default(),
+			config_dir,
+			#[cfg(test)]
+			_test_dir: None,
+		};
+		match options.read_preferences() {
+			Ok(preferences) => options.preferences = preferences,
+			Err(error) => {
+				log::error!("global options read error: {error}")
+			}
+		}
+		Rc::new(RefCell::new(options))
 	}
 
 	pub fn external_diff_tool(&self) -> ExternalDiffTool {
-		self.data
+		self.preferences
 			.external_diff_tool
 			.or_else(|| {
-				Self::read_global()
+				self.read_global()
 					.ok()
 					.and_then(|g| g.external_diff_tool)
 			})
@@ -177,21 +209,22 @@ impl Options {
 	}
 
 	pub fn set_external_diff_tool(&mut self, tool: ExternalDiffTool) {
-		self.data.external_diff_tool = Some(tool);
-		self.save();
+		self.update_preferences(|preferences| {
+			preferences.external_diff_tool = Some(tool);
+		});
 	}
 
 	pub fn external_diff_command(
 		&self,
 	) -> Result<ExternalDiffCommand> {
-		let path = get_app_config_path()?.join("config.ron");
+		let path = self.global_file("config.ron")?;
 		let global = if path.try_exists()? {
-			Self::read_global()?
+			self.read_global()?
 		} else {
 			GlobalOptions::default()
 		};
 		let tool = self
-			.data
+			.preferences
 			.external_diff_tool
 			.or(global.external_diff_tool)
 			.unwrap_or_default();
@@ -207,10 +240,10 @@ impl Options {
 	}
 
 	pub fn ai_commit_backend(&self) -> AiCommitBackend {
-		self.data
+		self.preferences
 			.ai_commit_backend
 			.or_else(|| {
-				Self::read_global()
+				self.read_global()
 					.ok()
 					.and_then(|g| g.ai_commit_backend)
 			})
@@ -221,8 +254,9 @@ impl Options {
 		&mut self,
 		backend: AiCommitBackend,
 	) {
-		self.data.ai_commit_backend = Some(backend);
-		self.save();
+		self.update_preferences(|preferences| {
+			preferences.ai_commit_backend = Some(backend);
+		});
 	}
 
 	pub fn ai_commit_command(&self) -> Result<AiCommitCommand> {
@@ -248,9 +282,9 @@ impl Options {
 				.collect(),
 			}),
 			AiCommitBackend::Command => {
-				let path = get_app_config_path()?.join("config.ron");
+				let path = self.global_file("config.ron")?;
 				let global = if path.try_exists()? {
-					Self::read_global()?
+					self.read_global()?
 				} else {
 					GlobalOptions::default()
 				};
@@ -277,73 +311,71 @@ impl Options {
 	}
 
 	pub const fn diff_options(&self) -> DiffOptions {
-		self.data.diff
+		self.preferences.diff
 	}
 
 	pub const fn status_show_untracked(
 		&self,
 	) -> Option<ShowUntrackedFilesConfig> {
-		self.data.status_show_untracked
+		self.preferences.status_show_untracked
 	}
 
 	pub fn set_status_show_untracked(
 		&mut self,
 		value: Option<ShowUntrackedFilesConfig>,
 	) {
-		self.data.status_show_untracked = value;
-		self.save();
+		self.update_preferences(|preferences| {
+			preferences.status_show_untracked = value;
+		});
 	}
 
 	pub fn diff_context_change(&mut self, increase: bool) {
-		self.data.diff.context = if increase {
-			self.data.diff.context.saturating_add(1)
-		} else {
-			self.data.diff.context.saturating_sub(1)
-		};
-
-		self.save();
+		self.update_preferences(|preferences| {
+			preferences.diff.context = if increase {
+				preferences.diff.context.saturating_add(1)
+			} else {
+				preferences.diff.context.saturating_sub(1)
+			};
+		});
 	}
 
 	pub fn diff_hunk_lines_change(&mut self, increase: bool) {
-		self.data.diff.interhunk_lines = if increase {
-			self.data.diff.interhunk_lines.saturating_add(1)
-		} else {
-			self.data.diff.interhunk_lines.saturating_sub(1)
-		};
-
-		self.save();
+		self.update_preferences(|preferences| {
+			preferences.diff.interhunk_lines = if increase {
+				preferences.diff.interhunk_lines.saturating_add(1)
+			} else {
+				preferences.diff.interhunk_lines.saturating_sub(1)
+			};
+		});
 	}
 
 	pub fn diff_toggle_whitespace(&mut self) {
-		self.data.diff.ignore_whitespace =
-			!self.data.diff.ignore_whitespace;
-
-		self.save();
+		self.update_preferences(|preferences| {
+			preferences.diff.ignore_whitespace =
+				!preferences.diff.ignore_whitespace;
+		});
 	}
 
 	pub const fn diff_mode(&self) -> DiffMode {
-		self.data.diff_mode
+		self.preferences.diff_mode
 	}
 
-	#[allow(clippy::unused_self)]
 	pub fn status_left_ratio(&self) -> u16 {
-		Self::read_global()
+		self.read_global()
 			.ok()
 			.and_then(|g| g.status_left_ratio)
 			.map_or(50, |r| r.clamp(10, 90))
 	}
 
-	#[allow(clippy::unused_self)]
 	pub fn log_left_ratio(&self) -> u16 {
-		Self::read_global()
+		self.read_global()
 			.ok()
 			.and_then(|g| g.log_left_ratio)
 			.map_or(60, |r| r.clamp(10, 90))
 	}
 
-	#[allow(clippy::unused_self)]
 	pub fn detail_left_ratio(&self) -> u16 {
-		Self::read_global()
+		self.read_global()
 			.ok()
 			.and_then(|g| g.detail_left_ratio)
 			.map_or(50, |r| r.clamp(10, 90))
@@ -353,9 +385,9 @@ impl Options {
 	/// when a folder is focused. Defaults to 2; clamped to `[1, 10]` so a
 	/// misconfigured value can't flood the preview pane. The clamp also
 	/// guarantees the `u16` fits in a `u8` without truncation.
-	#[allow(clippy::unused_self)]
 	pub fn preview_tree_depth(&self) -> u8 {
-		let depth = Self::read_global()
+		let depth = self
+			.read_global()
 			.ok()
 			.and_then(|g| g.preview_tree_depth)
 			.map_or(2u16, |d| d.clamp(1, 10));
@@ -363,8 +395,9 @@ impl Options {
 	}
 
 	pub fn set_diff_mode(&mut self, mode: DiffMode) {
-		self.data.diff_mode = mode;
-		self.save();
+		self.update_preferences(|preferences| {
+			preferences.diff_mode = mode;
+		});
 	}
 
 	pub fn add_commit_msg(&mut self, msg: &str) {
@@ -447,12 +480,73 @@ impl Options {
 		Ok(from_bytes(&buffer)?)
 	}
 
-	fn read_global() -> Result<GlobalOptions> {
-		let path = get_app_config_path()?.join("config.ron");
+	fn global_file(&self, name: &str) -> Result<PathBuf> {
+		self.config_dir
+			.as_ref()
+			.map(|dir| dir.join(name))
+			.ok_or_else(|| {
+				anyhow::anyhow!("gitui config directory unavailable")
+			})
+	}
+
+	fn read_global(&self) -> Result<GlobalOptions> {
+		let path = self.global_file("config.ron")?;
 		let mut f = File::open(path)?;
 		let mut buffer = Vec::new();
 		f.read_to_end(&mut buffer)?;
 		Ok(from_bytes(&buffer)?)
+	}
+
+	fn read_preferences(&self) -> Result<GlobalPreferences> {
+		match fs::read(self.global_file("options.ron")?) {
+			Ok(buffer) => Ok(from_bytes(&buffer)?),
+			Err(error)
+				if error.kind() == std::io::ErrorKind::NotFound =>
+			{
+				Ok(GlobalPreferences::default())
+			}
+			Err(error) => Err(error.into()),
+		}
+	}
+
+	fn update_preferences(
+		&mut self,
+		update: impl FnOnce(&mut GlobalPreferences),
+	) {
+		if let Err(error) = self.update_preferences_failable(update) {
+			log::error!("global options save error: {error}");
+		}
+	}
+
+	fn update_preferences_failable(
+		&mut self,
+		update: impl FnOnce(&mut GlobalPreferences),
+	) -> Result<()> {
+		let path = self.global_file("options.ron")?;
+		let dir = path
+			.parent()
+			.ok_or_else(|| anyhow::anyhow!("invalid options path"))?;
+		fs::create_dir_all(dir)?;
+		// Lock a stable sidecar: options.ron itself is replaced on each save.
+		// Keep the lock across the entire read/modify/write transaction so
+		// simultaneous instances cannot overwrite each other's changes.
+		let lock = fs::OpenOptions::new()
+			.read(true)
+			.write(true)
+			.create(true)
+			.truncate(false)
+			.open(dir.join("options.lock"))?;
+		fs2::FileExt::lock_exclusive(&lock)?;
+		let mut preferences = self.read_preferences()?;
+		update(&mut preferences);
+		let data =
+			to_string_pretty(&preferences, PrettyConfig::default())?;
+		let mut file = tempfile::NamedTempFile::new_in(dir)?;
+		file.write_all(data.as_bytes())?;
+		file.as_file().sync_all()?;
+		file.persist(path)?;
+		self.preferences = preferences;
+		Ok(())
 	}
 
 	fn save_failable(&self) -> Result<()> {
@@ -521,11 +615,17 @@ mod tests {
 		init_repo(&td);
 		let repo =
 			RefCell::new(RepoPath::Path(td.path().to_path_buf()));
-		let opts = Options::new(repo.clone());
+		let config_dir = Some(td.path().join("config"));
+		let opts = Options::with_config_dir(
+			repo.clone(),
+			config_dir.clone(),
+		);
 		opts.borrow_mut()
 			.set_external_diff_tool(ExternalDiffTool::Vscode);
 		assert_eq!(
-			Options::new(repo).borrow().external_diff_tool(),
+			Options::with_config_dir(repo, config_dir)
+				.borrow()
+				.external_diff_tool(),
 			ExternalDiffTool::Vscode
 		);
 	}
@@ -575,11 +675,187 @@ mod tests {
 		init_repo(&td);
 		let repo =
 			RefCell::new(RepoPath::Path(td.path().to_path_buf()));
-		let opts = Options::new(repo.clone());
+		let config_dir = Some(td.path().join("config"));
+		let opts = Options::with_config_dir(
+			repo.clone(),
+			config_dir.clone(),
+		);
 		opts.borrow_mut().set_ai_commit_backend(AiCommitBackend::Pi);
 		assert_eq!(
-			Options::new(repo).borrow().ai_commit_backend(),
+			Options::with_config_dir(repo, config_dir)
+				.borrow()
+				.ai_commit_backend(),
 			AiCommitBackend::Pi
+		);
+	}
+
+	#[test]
+	fn popup_preferences_are_global_and_repository_state_stays_local()
+	{
+		use super::{AiCommitBackend, ExternalDiffTool};
+		use crate::components::DiffMode;
+		use asyncgit::sync::ShowUntrackedFilesConfig;
+
+		let (first_dir, _first_repo) = git2_testing::repo_init();
+		let (second_dir, _second_repo) = git2_testing::repo_init();
+		let config_dir = TempDir::new().unwrap();
+		let config = "(status_left_ratio: Some(41), ai_commit_command: Some((command: \"my-agent\", args: [])))";
+		std::fs::write(config_dir.path().join("config.ron"), config)
+			.unwrap();
+		let legacy = "(tab: 1, commit_msgs: [\"old message\"], commit_draft: Some(\"second draft\"), ai_commit_backend: Some(Disabled), external_diff_tool: Some(BeyondCompare), diff_mode: DeltaSideBySide, diff: (context: 99, interhunk_lines: 8, ignore_whitespace: false), status_show_untracked: Some(All))";
+		std::fs::write(second_dir.path().join(".git/gitui"), legacy)
+			.unwrap();
+		let first_repo =
+			RefCell::new(first_dir.path().to_path_buf().into());
+		let second_repo =
+			RefCell::new(second_dir.path().to_path_buf().into());
+		let config_path = Some(config_dir.path().to_path_buf());
+		let first = Options::with_config_dir(
+			first_repo.clone(),
+			config_path.clone(),
+		);
+		let second = Options::with_config_dir(
+			second_repo.clone(),
+			config_path.clone(),
+		);
+		{
+			let mut options = first.borrow_mut();
+			options.set_ai_commit_backend(AiCommitBackend::Pi);
+			options.set_external_diff_tool(ExternalDiffTool::Vscode);
+			options.set_status_show_untracked(Some(
+				ShowUntrackedFilesConfig::No,
+			));
+			options.set_diff_mode(DiffMode::Unified);
+			options.diff_toggle_whitespace();
+			options.diff_context_change(true);
+			options.diff_hunk_lines_change(true);
+		}
+		assert!(!first_dir.path().join(".git/gitui").exists());
+		assert_eq!(
+			std::fs::read_to_string(
+				second_dir.path().join(".git/gitui")
+			)
+			.unwrap(),
+			legacy
+		);
+		// Saving state from an older instance must not overwrite global choices.
+		second.borrow_mut().set_current_tab(2);
+		second.borrow_mut().diff_context_change(true);
+		for repo in [first_repo, second_repo] {
+			let options =
+				Options::with_config_dir(repo, config_path.clone());
+			let options = options.borrow();
+			assert_eq!(
+				options.ai_commit_backend(),
+				AiCommitBackend::Pi
+			);
+			assert_eq!(
+				options.external_diff_tool(),
+				ExternalDiffTool::Vscode
+			);
+			assert!(
+				options.status_show_untracked()
+					== Some(ShowUntrackedFilesConfig::No)
+			);
+			assert_eq!(options.diff_mode(), DiffMode::Unified);
+			let diff = options.diff_options();
+			assert!(diff.ignore_whitespace);
+			assert_eq!(diff.context, 5);
+			assert_eq!(diff.interhunk_lines, 1);
+			assert_eq!(options.status_left_ratio(), 41);
+		}
+		let first_state = Options::read(&RefCell::new(
+			first_dir.path().to_path_buf().into(),
+		));
+		assert!(first_state.is_err());
+		let second_state = Options::read(&RefCell::new(
+			second_dir.path().to_path_buf().into(),
+		))
+		.unwrap();
+		assert_eq!(second_state.tab, 2);
+		assert_eq!(second_state.commit_msgs, ["old message"]);
+		assert_eq!(
+			second_state.commit_draft.as_deref(),
+			Some("second draft")
+		);
+		let saved_state = std::fs::read_to_string(
+			second_dir.path().join(".git/gitui"),
+		)
+		.unwrap();
+		assert!(!saved_state.contains("ai_commit_backend"));
+		assert!(!saved_state.contains("diff_mode"));
+		assert_eq!(
+			std::fs::read_to_string(
+				config_dir.path().join("config.ron")
+			)
+			.unwrap(),
+			config
+		);
+	}
+
+	#[test]
+	fn concurrent_global_preference_updates_preserve_both_changes() {
+		use super::{AiCommitBackend, ExternalDiffTool};
+		use std::{sync::mpsc, thread, time::Duration};
+
+		let config_dir = TempDir::new().unwrap();
+		let first_path = config_dir.path().to_path_buf();
+		let second_path = first_path.clone();
+		let (first_entered_tx, first_entered_rx) = mpsc::channel();
+		let (release_tx, release_rx) = mpsc::channel();
+		let (second_started_tx, second_started_rx) = mpsc::channel();
+		let (second_entered_tx, second_entered_rx) = mpsc::channel();
+		let first = thread::spawn(move || {
+			let mut options = Options::test_env();
+			options.config_dir = Some(first_path);
+			options
+				.update_preferences_failable(|preferences| {
+					preferences.ai_commit_backend =
+						Some(AiCommitBackend::Pi);
+					first_entered_tx.send(()).unwrap();
+					release_rx
+						.recv_timeout(Duration::from_secs(5))
+						.unwrap();
+				})
+				.unwrap();
+		});
+		first_entered_rx
+			.recv_timeout(Duration::from_secs(5))
+			.unwrap();
+		let second = thread::spawn(move || {
+			let mut options = Options::test_env();
+			options.config_dir = Some(second_path);
+			second_started_tx.send(()).unwrap();
+			options
+				.update_preferences_failable(|preferences| {
+					preferences.external_diff_tool =
+						Some(ExternalDiffTool::Vscode);
+					second_entered_tx.send(()).unwrap();
+				})
+				.unwrap();
+		});
+		second_started_rx
+			.recv_timeout(Duration::from_secs(5))
+			.unwrap();
+		let second_was_blocked = matches!(
+			second_entered_rx
+				.recv_timeout(Duration::from_millis(150)),
+			Err(mpsc::RecvTimeoutError::Timeout)
+		);
+		release_tx.send(()).unwrap();
+		first.join().unwrap();
+		second.join().unwrap();
+		assert!(second_was_blocked);
+		let mut options = Options::test_env();
+		options.config_dir = Some(config_dir.path().to_path_buf());
+		let preferences = options.read_preferences().unwrap();
+		assert_eq!(
+			preferences.ai_commit_backend,
+			Some(AiCommitBackend::Pi)
+		);
+		assert_eq!(
+			preferences.external_diff_tool,
+			Some(ExternalDiffTool::Vscode)
 		);
 	}
 

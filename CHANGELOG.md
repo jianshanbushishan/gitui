@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Changed
+* All Options popup settings are now shared across repositories and saved in the user configuration directory's `options.ron`. This includes untracked-file visibility, diff mode and settings, the external diff tool, and the AI commit backend. Saved choices override tool/backend defaults in `config.ron`; repository state retains only the last tab, commit message history, and draft. Old repository preferences are no longer read or migrated, so set your preferences once in Options after upgrading.
+
 ### Fixed
+* AI commit message generation accepts complete staged text patches larger than 64 KiB. Binary and non-UTF-8 files remain represented by paths; command timeout and output limits still apply.
 * development builds refresh the Git revision and `-dirty` marker after a commit on the current branch; the build script now watches the branch ref as well as `HEAD`.
 
 ## [0.30.0] - 2026-09-28

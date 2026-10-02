@@ -2,8 +2,8 @@
 // In a file diff, press d to launch the selected viewer. Reset defaults to Alt+d;
 // custom key configurations can override external_diff (Vim reset remains u).
 // Options -> External diff tool: Enter opens the dropdown; Up/Down choose;
-// Enter saves the choice for this repository; Esc cancels.
-// The repository choice overrides external_diff_tool below.
+// Enter saves the global choice in options.ron; Esc cancels.
+// The saved choice overrides the external_diff_tool default below.
 // Executables must be on PATH, or use an absolute command path.
 // Each argument is passed separately, without shell expansion. {left}/{right}
 // are replaced with temporary snapshots. Keep a wait/blocking option so the

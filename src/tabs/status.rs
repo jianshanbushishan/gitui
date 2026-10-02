@@ -23,7 +23,7 @@ use asyncgit::{
 	sync::{BranchCompare, CommitId},
 	AsyncBranchCompareJob, AsyncDiff, AsyncGitNotification,
 	AsyncLineStats, AsyncStatusPair, DiffParams, DiffType, LineStats,
-	StatusItem, StatusItemType,
+	StatusItem, StatusItemType, StatusPair,
 };
 use crossterm::event::Event;
 use itertools::Itertools;
@@ -725,11 +725,7 @@ impl Status {
 		}
 
 		let status = self.changes_fetcher.last()?;
-		self.index.set_items(&status.staged)?;
-		self.index_wd.set_items(&status.workdir)?;
-
-		self.update_diff()?;
-		self.request_branch_compare();
+		self.apply_status_snapshot(&status)?;
 
 		if self.git_action_executed {
 			self.git_action_executed = false;
@@ -746,6 +742,17 @@ impl Status {
 			}
 		}
 
+		Ok(())
+	}
+
+	fn apply_status_snapshot(
+		&mut self,
+		status: &StatusPair,
+	) -> Result<()> {
+		self.index.set_items(&status.staged)?;
+		self.index_wd.set_items(&status.workdir)?;
+		self.update_diff()?;
+		self.request_branch_compare();
 		Ok(())
 	}
 
@@ -1065,6 +1072,130 @@ mod tests {
 		uses_full_file_preview, PreviewResult, RightPane, Status,
 	};
 	use asyncgit::{AsyncGitNotification, StatusItemType};
+	use std::time::{Duration, Instant};
+
+	fn wait_for_status_scan(
+		receiver: &crossbeam_channel::Receiver<AsyncGitNotification>,
+	) -> AsyncGitNotification {
+		loop {
+			let notification = receiver
+				.recv_timeout(Duration::from_secs(5))
+				.unwrap();
+			if matches!(
+				notification,
+				AsyncGitNotification::StatusPairChanged
+					| AsyncGitNotification::StatusPairUnchanged
+					| AsyncGitNotification::StatusPairFailed
+			) {
+				return notification;
+			}
+		}
+	}
+
+	fn wait_for_status_jobs(status: &Status) {
+		let deadline = Instant::now() + Duration::from_secs(5);
+		while status.anything_pending() {
+			assert!(Instant::now() < deadline);
+			std::thread::sleep(Duration::from_millis(10));
+		}
+	}
+
+	#[test]
+	fn show_restores_status_completed_while_hidden() {
+		use crate::{app::Environment, components::Component};
+
+		for with_changes in [false, true] {
+			let (dir, _repo) = git2_testing::repo_init();
+			if with_changes {
+				std::fs::write(dir.path().join("new.txt"), "new\n")
+					.unwrap();
+			}
+			let mut env = Environment::test_env();
+			*env.repo.get_mut() = dir.path().to_path_buf().into();
+			let (sender, receiver) = crossbeam_channel::unbounded();
+			env.sender_git = sender;
+			let (sender, _app_receiver) =
+				crossbeam_channel::unbounded();
+			env.sender_app = sender;
+			let mut status = Status::new(&env);
+
+			status.show().unwrap();
+			let initially_loading = status.index.is_pending()
+				&& status.index_wd.is_pending();
+			status.hide();
+			let notification = wait_for_status_scan(&receiver);
+			assert_eq!(
+				notification,
+				AsyncGitNotification::StatusPairChanged
+			);
+			status.update_git(notification).unwrap();
+
+			status.show().unwrap();
+			let still_loading = status.index.is_pending()
+				|| status.index_wd.is_pending();
+			let workdir_empty = status.index_wd.is_empty();
+			let notification = wait_for_status_scan(&receiver);
+			wait_for_status_jobs(&status);
+
+			assert!(initially_loading);
+			assert_eq!(
+				notification,
+				AsyncGitNotification::StatusPairUnchanged
+			);
+			assert!(!still_loading);
+			assert!(status.index.is_empty());
+			assert_eq!(workdir_empty, !with_changes);
+		}
+	}
+
+	#[test]
+	fn show_restores_status_updated_while_hidden() {
+		use crate::{app::Environment, components::Component};
+
+		let (dir, _repo) = git2_testing::repo_init();
+		std::fs::write(dir.path().join("before.txt"), "before\n")
+			.unwrap();
+		let mut env = Environment::test_env();
+		*env.repo.get_mut() = dir.path().to_path_buf().into();
+		let (sender, receiver) = crossbeam_channel::unbounded();
+		env.sender_git = sender;
+		let (sender, _app_receiver) = crossbeam_channel::unbounded();
+		env.sender_app = sender;
+		let mut status = Status::new(&env);
+		status.changes_fetcher.fetch(None).unwrap();
+		let notification = wait_for_status_scan(&receiver);
+		status.update_git(notification).unwrap();
+		wait_for_status_jobs(&status);
+		let before = status.index_wd.selection().unwrap();
+		assert_eq!(before.info.full_path, "before.txt");
+
+		status.hide();
+		std::fs::remove_file(dir.path().join("before.txt")).unwrap();
+		std::fs::write(dir.path().join("after.txt"), "after\n")
+			.unwrap();
+		status.changes_fetcher.fetch(None).unwrap();
+		let notification = wait_for_status_scan(&receiver);
+		assert_eq!(
+			notification,
+			AsyncGitNotification::StatusPairChanged
+		);
+		status.update_git(notification).unwrap();
+
+		status.git_action_executed = true;
+		status.show().unwrap();
+		let after = status.index_wd.selection().unwrap();
+		let preview = status.preview.key.clone();
+		let action_pending = status.git_action_executed;
+		let notification = wait_for_status_scan(&receiver);
+		wait_for_status_jobs(&status);
+		assert_eq!(
+			notification,
+			AsyncGitNotification::StatusPairUnchanged
+		);
+		assert_eq!(after.info.full_path, "after.txt");
+		assert_eq!(preview, Some(("after.txt".into(), false)));
+		assert!(action_pending);
+	}
 
 	#[test]
 	fn fetch_is_available_without_an_upstream_branch() {
@@ -1673,6 +1804,14 @@ impl Component for Status {
 		self.visible = true;
 		self.index.show()?;
 		self.index_wd.show()?;
+
+		// A completed scan's notification may have arrived while this tab was
+		// hidden. Restore its snapshot even if the next scan is unchanged, but
+		// keep Loading until the first successful scan actually completes.
+		if let Some(status) = self.changes_fetcher.last_completed()? {
+			self.request_line_stats()?;
+			self.apply_status_snapshot(&status)?;
+		}
 
 		self.check_remotes();
 		self.update()?;

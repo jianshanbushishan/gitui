@@ -125,6 +125,18 @@ Tuned on giant working trees such as Unreal Engine projects:
 
 #### New configuration options
 
+All Options popup settings are shared across repositories: **Show untracked**,
+**Diff Mode**, **Ignore whitespaces**, **Context lines**, **Inter hunk lines**,
+**External diff tool**, and **AI commit message → Backend**. Selections are saved
+to `options.ron` in the user configuration directory (`%APPDATA%\gitui\options.ron`
+on Windows, typically `~/.config/gitui/options.ron` on Linux).
+
+`config.ron` keeps layout settings, external diff commands, and custom AI
+commands. Its tool/backend defaults apply until a selection is saved in
+`options.ron`. Repository state in `.git/gitui` keeps the last tab, commit
+message history, and commit draft. Old repository preferences are no longer
+read or migrated; set your preferences once in Options after upgrading.
+
 In the global `config.ron` (all optional):
 
 ```ron
@@ -146,7 +158,7 @@ With a file diff focused, or a file selected in a list offering `Diff →`, pres
 `d` (`ExternalDiff`) to compare its complete old/new versions in
 Beyond Compare (default), Neovim, or VS Code. In Options, select **External diff
 tool**, press Enter to open the dropdown, use Up/Down, then Enter to save (Esc
-cancels). The choice is saved per repository.
+cancels). The choice is saved globally in `options.ron`.
 
 Merge the settings in [external-diff.ron](external-diff.ron) into your global
 `config.ron` to customize executable paths and argument arrays. `{left}` and
@@ -160,7 +172,7 @@ binding for resetting selected diff lines is now `Alt+d` (Vim preset: `u`).
 #### AI commit messages
 
 In **Options**, select **AI commit message → Backend** and choose **Pi coding
-agent** or **Custom command**. The choice is saved per repository and defaults
+agent** or **Custom command**. The choice is saved globally and defaults
 to **Disabled**. In the commit popup, clear any existing message and press
 `Ctrl+g` to generate an editable draft from staged changes. Review and edit the
 draft, then use the usual commit key. Generation never commits automatically.
@@ -186,9 +198,10 @@ Select **Custom command** in Options. The program receives the staged patch
 on stdin, runs from the repository root, and must write only the commit
 message to stdout. Arguments are passed directly, without a shell. You can also set
 `ai_commit_backend: Some(Pi)` or `Some(Command)` in global `config.ron` as a
-default for repositories without a saved selection. The patch is limited to
-64 KiB; larger staged changes produce an error. Binary content is omitted,
-and the command times out after 90 seconds. A result is discarded if the
+default until a backend is selected in Options. GitUI sends the complete
+UTF-8 text patch without an input byte limit; the configured agent's model
+context limit still applies. Binary files and non-UTF-8 text are represented
+by their paths. The command times out after 90 seconds. A result is discarded if the
 draft or staged changes changed while it was running.
 
 #### Miscellaneous

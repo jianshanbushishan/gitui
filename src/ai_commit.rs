@@ -165,6 +165,31 @@ mod tests {
 	}
 
 	#[test]
+	fn command_receives_large_patch_without_truncation() {
+		let dir = tempfile::tempdir().unwrap();
+		let command = AiCommitCommand {
+			command: "git".to_owned(),
+			args: vec![
+				"hash-object".to_owned(),
+				"--stdin".to_owned(),
+			],
+		};
+		let patch = format!(
+			"{}last staged line\n",
+			"large staged line\n".repeat(8192)
+		);
+		assert!(patch.len() > 65_536);
+		let result =
+			run(&command, dir.path(), &patch, || false).unwrap();
+		let expected = git2::Oid::hash_object(
+			git2::ObjectType::Blob,
+			patch.as_bytes(),
+		)
+		.unwrap();
+		assert_eq!(result, expected.to_string());
+	}
+
+	#[test]
 	fn cancelled_request_does_not_start_command() {
 		let command = AiCommitCommand {
 			command: "missing-ai-command".to_owned(),

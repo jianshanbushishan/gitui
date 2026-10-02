@@ -386,7 +386,7 @@ impl DrawableComponent for OptionsPopup {
 			let block = Block::default()
 				.borders(Borders::ALL)
 				.title(Span::styled(
-					"Options",
+					"Global Options",
 					self.theme.title(true),
 				))
 				.border_style(self.theme.block(true));

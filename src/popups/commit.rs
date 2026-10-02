@@ -86,7 +86,6 @@ pub struct CommitPopup {
 }
 
 const FIRST_LINE_LIMIT: usize = 50;
-const MAX_AI_DIFF_BYTES: usize = 64 * 1024;
 
 impl CommitPopup {
 	///
@@ -159,7 +158,6 @@ impl CommitPopup {
 					let diff =
 						asyncgit::sync::diff::get_staged_diff_for_ai(
 							&repo,
-							MAX_AI_DIFF_BYTES,
 						)?;
 					let workdir =
 						asyncgit::sync::utils::repo_work_dir(&repo)?;
@@ -228,7 +226,6 @@ impl CommitPopup {
 				}
 				match asyncgit::sync::diff::get_staged_diff_for_ai(
 					&self.repo.borrow(),
-					MAX_AI_DIFF_BYTES,
 				) {
 					std::result::Result::Ok(current) if current == diff => {
 						self.input.set_text(message);
@@ -950,7 +947,6 @@ mod ai_tests {
 		popup.input.show().unwrap();
 		let diff = asyncgit::sync::diff::get_staged_diff_for_ai(
 			&env.repo.borrow(),
-			MAX_AI_DIFF_BYTES,
 		)
 		.unwrap();
 		(dir, repo, popup, diff)

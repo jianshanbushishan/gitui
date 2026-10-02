@@ -308,7 +308,12 @@ impl AsyncStatusPair {
 
 	/// Returns the latest completed pair, or an empty pair before first load.
 	pub fn last(&self) -> Result<StatusPair> {
-		Ok(self.last.lock()?.clone().unwrap_or_default())
+		Ok(self.last_completed()?.unwrap_or_default())
+	}
+
+	/// Returns the latest successful scan, or `None` before one completes.
+	pub fn last_completed(&self) -> Result<Option<StatusPair>> {
+		Ok(self.last.lock()?.clone())
 	}
 
 	/// Takes the oldest status error that has not yet been presented.
