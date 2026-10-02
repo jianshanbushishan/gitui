@@ -58,7 +58,8 @@ pub use commit_filter::{
 };
 pub use commit_revert::{commit_revert, revert_commit, revert_head};
 pub use commits_info::{
-	get_commit_info, get_commits_info, CommitId, CommitInfo,
+	get_commit_info, get_commits_info, get_recent_commit_messages,
+	CommitId, CommitInfo,
 };
 pub use config::{
 	get_config_string, untracked_files_config,

@@ -176,12 +176,17 @@ agent** or **Custom command**. The choice is saved globally and defaults
 to **Disabled**. In the commit popup, clear any existing message and press
 `Ctrl+g` to generate an editable draft from staged changes. Review and edit the
 draft, then use the usual commit key. Generation never commits automatically.
-The selected agent may send the staged patch to its model provider.
+The draft follows the language and format of the 5 most recent repository
+commit messages, including their subject conventions and body structure.
+The selected agent may send the staged patch and those messages to its model
+provider.
 
 The Pi backend requires `pi` on `PATH` and uses Pi's configured model and
 credentials. GitUI runs Pi once in print mode without tools, extensions,
-skills, project context files, or a saved session. The staged patch is passed
-on stdin; only the final text on stdout becomes the draft.
+skills, project context files, or a saved session. Style instructions, recent
+commit messages, and the staged patch are passed on stdin. Surrounding backticks
+and Markdown code fences are removed from the final text before it becomes the
+draft.
 
 For a different agent, configure a command in your global `config.ron`:
 
@@ -194,9 +199,10 @@ For a different agent, configure a command in your global `config.ron`:
 )
 ```
 
-Select **Custom command** in Options. The program receives the staged patch
-on stdin, runs from the repository root, and must write only the commit
-message to stdout. Arguments are passed directly, without a shell. You can also set
+Select **Custom command** in Options. The program receives style instructions,
+recent commit messages, and the staged patch on stdin, runs from the repository
+root, and must write only the commit message to stdout. Arguments are passed
+directly, without a shell. You can also set
 `ai_commit_backend: Some(Pi)` or `Some(Command)` in global `config.ron` as a
 default until a backend is selected in Options. GitUI sends the complete
 UTF-8 text patch without an input byte limit; the configured agent's model

@@ -86,6 +86,7 @@ pub struct CommitPopup {
 }
 
 const FIRST_LINE_LIMIT: usize = 50;
+const AI_COMMIT_HISTORY_LENGTH: usize = 5;
 
 impl CommitPopup {
 	///
@@ -161,10 +162,19 @@ impl CommitPopup {
 						)?;
 					let workdir =
 						asyncgit::sync::utils::repo_work_dir(&repo)?;
+					let recent_messages =
+						sync::get_recent_commit_messages(
+							&repo,
+							AI_COMMIT_HISTORY_LENGTH,
+						)?;
+					let input = ai_commit::build_input(
+						&diff,
+						&recent_messages,
+					);
 					let message = ai_commit::run(
 						&command,
 						std::path::Path::new(&workdir),
-						&diff,
+						&input,
 						|| current_id.load(Ordering::Relaxed) != id,
 					)?;
 					Ok((diff, message))

@@ -68,7 +68,7 @@ pub struct ExternalDiffCommand {
 	pub args: Vec<String>,
 }
 
-/// Command used to generate a commit message from a staged diff on stdin.
+/// Command used to generate a commit message from history and a staged diff on stdin.
 /// Arguments are passed directly to the executable, without a shell.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AiCommitCommand {
@@ -275,7 +275,7 @@ impl Options {
 					"--no-prompt-templates",
 					"--no-context-files",
 					"--no-approve",
-					"Write a concise Git commit message for the staged diff on standard input. Return only the commit message, with a short subject and an optional body.",
+					crate::ai_commit::PROMPT,
 				]
 				.into_iter()
 				.map(str::to_owned)

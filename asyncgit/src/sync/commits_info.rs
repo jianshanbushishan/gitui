@@ -163,6 +163,37 @@ pub fn get_commits_info(
 	Ok(res)
 }
 
+/// Full messages from the most recent commits reachable from HEAD.
+/// Repositories without any commits return an empty list.
+pub fn get_recent_commit_messages(
+	repo_path: &RepoPath,
+	limit: usize,
+) -> Result<Vec<String>> {
+	let repo = repo(repo_path)?;
+	let head = match repo.head() {
+		Ok(head) => head,
+		Err(error)
+			if matches!(
+				error.code(),
+				git2::ErrorCode::UnbornBranch
+					| git2::ErrorCode::NotFound
+			) =>
+		{
+			return Ok(Vec::new());
+		}
+		Err(error) => return Err(error.into()),
+	};
+	let mut walk = repo.revwalk()?;
+	walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
+	walk.push(head.peel_to_commit()?.id())?;
+	walk.take(limit)
+		.map(|id| {
+			let commit = repo.find_commit(id?)?;
+			Ok(get_message(&commit, None))
+		})
+		.collect()
+}
+
 ///
 pub fn get_commit_info(
 	repo_path: &RepoPath,
@@ -231,7 +262,7 @@ pub fn gix_get_message(
 
 #[cfg(test)]
 mod tests {
-	use super::get_commits_info;
+	use super::{get_commits_info, get_recent_commit_messages};
 	use crate::{
 		error::Result,
 		sync::{
@@ -240,6 +271,72 @@ mod tests {
 		},
 	};
 	use std::{fs::File, io::Write, path::Path};
+
+	#[test]
+	fn recent_messages_preserve_language_body_order_and_limit() {
+		let (dir, repo) = repo_init_empty().unwrap();
+		let repo_path = dir.path().to_path_buf().into();
+		let tree_id = repo.index().unwrap().write_tree().unwrap();
+		let tree = repo.find_tree(tree_id).unwrap();
+		let sig = repo.signature().unwrap();
+		let messages = [
+			"feat: 添加搜索\n\n支持中文提交日志。\n\n- 增加过滤\n- 保留格式",
+			"fix(ui): 修复光标位置\n\n恢复输入光标。",
+			"docs: 更新说明",
+		];
+		let mut parent_id = None;
+		for message in messages {
+			let parent =
+				parent_id.map(|id| repo.find_commit(id).unwrap());
+			let parents = parent.iter().collect::<Vec<_>>();
+			parent_id = Some(
+				repo.commit(
+					Some("HEAD"),
+					&sig,
+					&sig,
+					message,
+					&tree,
+					&parents,
+				)
+				.unwrap(),
+			);
+		}
+		// A commit on an unrelated branch must not become a style example.
+		repo.commit(
+			Some("refs/heads/unrelated"),
+			&sig,
+			&sig,
+			"unrelated style",
+			&tree,
+			&[],
+		)
+		.unwrap();
+		assert_eq!(
+			get_recent_commit_messages(&repo_path, 10).unwrap(),
+			messages.into_iter().rev().collect::<Vec<_>>()
+		);
+		assert_eq!(
+			get_recent_commit_messages(&repo_path, 2).unwrap(),
+			vec![messages[2], messages[1]]
+		);
+		assert!(get_recent_commit_messages(&repo_path, 0)
+			.unwrap()
+			.is_empty());
+		repo.set_head_detached(parent_id.unwrap()).unwrap();
+		assert_eq!(
+			get_recent_commit_messages(&repo_path, 1).unwrap(),
+			vec![messages[2]]
+		);
+	}
+
+	#[test]
+	fn recent_messages_allow_initial_commit() {
+		let (dir, _repo) = repo_init_empty().unwrap();
+		let repo_path = dir.path().to_path_buf().into();
+		assert!(get_recent_commit_messages(&repo_path, 10)
+			.unwrap()
+			.is_empty());
+	}
 
 	#[test]
 	fn test_log() -> Result<()> {
