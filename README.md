@@ -127,7 +127,7 @@ Tuned on giant working trees such as Unreal Engine projects:
 
 All Options popup settings are shared across repositories: **Show untracked**,
 **Diff Mode**, **Ignore whitespaces**, **Context lines**, **Inter hunk lines**,
-**External diff tool**, and **AI commit message → Backend**. Selections are saved
+**External diff tool**, and **AI Backend**. Selections are saved
 to `options.ron` in the user configuration directory (`%APPDATA%\gitui\options.ron`
 on Windows, typically `~/.config/gitui/options.ron` on Linux).
 
@@ -157,8 +157,8 @@ In the global `config.ron` (all optional):
 With a file diff focused, or a file selected in a list offering `Diff →`, press
 `d` (`ExternalDiff`) to compare its complete old/new versions in
 Beyond Compare (default), Neovim, or VS Code. In Options, select **External diff
-tool**, press Enter to open the dropdown, use Up/Down, then Enter to save (Esc
-cancels). The choice is saved globally in `options.ron`.
+tool** and use Left/Right to cycle through the tools. The choice is saved
+immediately and globally in `options.ron`.
 
 Merge the settings in [external-diff.ron](external-diff.ron) into your global
 `config.ron` to customize executable paths and argument arrays. `{left}` and
@@ -171,9 +171,9 @@ binding for resetting selected diff lines is now `Alt+d` (Vim preset: `u`).
 
 #### AI commit messages
 
-In **Options**, select **AI commit message → Backend** and choose **Pi coding
-agent** or **Custom command**. The choice is saved globally and defaults
-to **Disabled**. In the commit popup, clear any existing message and press
+In **Options**, select **AI Backend** and use Left/Right to choose **Pi coding
+agent** or **Custom command**. The choice defaults to **Disabled** and is saved
+immediately and globally. In the commit popup, clear any existing message and press
 `Ctrl+g` to generate an editable draft from staged changes. Review and edit the
 draft, then use the usual commit key. Generation never commits automatically.
 The draft follows the language and format of the 5 most recent repository
