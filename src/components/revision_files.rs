@@ -160,7 +160,7 @@ impl RevisionFilesComponent {
 	}
 
 	/// Whether Enter should retry a failed or unavailable tree.
-	pub fn can_retry(&self) -> bool {
+	pub const fn can_retry(&self) -> bool {
 		matches!(
 			self.load_state,
 			TreeLoadState::Failed(_) | TreeLoadState::NoCommits
@@ -184,20 +184,18 @@ impl RevisionFilesComponent {
 	}
 
 	///
-	pub fn update(&mut self, ev: AsyncNotification) -> Result<()> {
+	pub fn update(&mut self, ev: AsyncNotification) {
 		self.current_file.update(ev);
 
 		if matches!(
 			ev,
 			AsyncNotification::Git(AsyncGitNotification::TreeFiles)
 		) {
-			self.refresh_files()?;
+			self.refresh_files();
 		}
-
-		Ok(())
 	}
 
-	fn refresh_files(&mut self) -> Result<(), anyhow::Error> {
+	fn refresh_files(&mut self) {
 		if let Some(last) = self.async_treefiles.take_last() {
 			if let Some(result) = last.result() {
 				if self
@@ -211,8 +209,6 @@ impl RevisionFilesComponent {
 				}
 			}
 		}
-
-		Ok(())
 	}
 
 	fn apply_tree_result(
@@ -821,7 +817,7 @@ impl Component for RevisionFilesComponent {
 
 	fn show(&mut self) -> Result<()> {
 		self.visible = true;
-		self.refresh_files()?;
+		self.refresh_files();
 		Ok(())
 	}
 }

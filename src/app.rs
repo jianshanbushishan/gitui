@@ -460,11 +460,11 @@ impl App {
 			self.select_branch_popup.update_git(ev)?;
 		}
 
-		self.files_tab.update_async(ev)?;
+		self.files_tab.update_async(ev);
 		self.fuzzy_find_popup.update(ev);
 		self.content_search_popup.update(ev);
 		self.blame_file_popup.update_async(ev)?;
-		self.revision_files_popup.update(ev)?;
+		self.revision_files_popup.update(ev);
 		self.tags_popup.update(ev);
 
 		//TODO: better system for this
@@ -1097,6 +1097,9 @@ impl App {
 		match action {
 			Action::Reset(r) => {
 				self.status_tab.reset(&r);
+			}
+			Action::ResetAll => {
+				self.status_tab.reset_all();
 			}
 			Action::StashDrop(_)
 			| Action::StashPop(_)

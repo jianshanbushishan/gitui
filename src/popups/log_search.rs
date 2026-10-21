@@ -170,7 +170,7 @@ impl LogSearchPopupPopup {
 			now.saturating_duration_since(self.blink_started);
 		let visible = (elapsed.as_millis()
 			/ CURSOR_BLINK_INTERVAL.as_millis())
-			% 2 == 0;
+		.is_multiple_of(2);
 		if visible == self.blink_visible {
 			return false;
 		}
@@ -645,10 +645,10 @@ impl LogSearchPopupPopup {
 			) && self.option_selected()
 			{
 				self.toggle_option();
-			} else if !self.option_selected() {
-				if self.find_text.event(event)?.is_consumed() {
-					self.reset_cursor_blink();
-				}
+			} else if !self.option_selected()
+				&& self.find_text.event(event)?.is_consumed()
+			{
+				self.reset_cursor_blink();
 			}
 		}
 

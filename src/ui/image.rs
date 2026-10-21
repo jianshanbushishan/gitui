@@ -23,7 +23,7 @@ use std::{
 static IMAGE_PICKER: OnceCell<Picker> = OnceCell::new();
 static SVG_OPTIONS: OnceCell<resvg::usvg::Options<'static>> =
 	OnceCell::new();
-const MAX_PREVIEW_EDGE: u32 = 800;
+const MAX_PREVIEW_EDGE: u16 = 800;
 const CACHE_ENTRIES: usize = 4;
 
 /// Detect the terminal's best image protocol before starting the input thread.
@@ -73,12 +73,18 @@ fn decode_svg(bytes: &[u8]) -> Result<DynamicImage, String> {
 	let tree = resvg::usvg::Tree::from_data(bytes, options)
 		.map_err(|error| error.to_string())?;
 	let size = tree.size();
-	let scale = (MAX_PREVIEW_EDGE as f32
+	let scale = (f32::from(MAX_PREVIEW_EDGE)
 		/ size.width().max(size.height()))
 	.min(1.0);
 	// Limit dimensions before allocating, including SVGs with enormous viewports.
-	let width = (size.width() * scale).round().max(1.0) as u32;
-	let height = (size.height() * scale).round().max(1.0) as u32;
+	let pixel_size = resvg::tiny_skia::Size::from_wh(
+		(size.width() * scale).max(1.0),
+		(size.height() * scale).max(1.0),
+	)
+	.ok_or_else(|| "invalid SVG preview size".to_string())?
+	.to_int_size();
+	let width = pixel_size.width();
+	let height = pixel_size.height();
 	let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)
 		.ok_or_else(|| {
 			"could not allocate SVG preview".to_string()
@@ -96,8 +102,9 @@ fn decode_svg(bytes: &[u8]) -> Result<DynamicImage, String> {
 }
 
 fn thumbnail(image: DynamicImage) -> DynamicImage {
-	if image.width().max(image.height()) > MAX_PREVIEW_EDGE {
-		image.thumbnail(MAX_PREVIEW_EDGE, MAX_PREVIEW_EDGE)
+	let max_edge = u32::from(MAX_PREVIEW_EDGE);
+	if image.width().max(image.height()) > max_edge {
+		image.thumbnail(max_edge, max_edge)
 	} else {
 		image
 	}
@@ -432,6 +439,19 @@ mod tests {
 		assert_eq!((resized.width(), resized.height()), (800, 400));
 		let small = thumbnail(DynamicImage::new_rgba8(20, 30));
 		assert_eq!((small.width(), small.height()), (20, 30));
+	}
+
+	#[test]
+	fn svg_rounds_fractional_sizes_and_keeps_thin_images_nonzero() {
+		for (width, height, expected) in
+			[("0.5", "1.5", (1, 2)), ("2000000", "1", (800, 1))]
+		{
+			let svg = format!(
+				"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\"/>"
+			);
+			let image = decode(svg.as_bytes()).unwrap();
+			assert_eq!((image.width(), image.height()), expected);
+		}
 	}
 
 	fn complete(

@@ -16,11 +16,16 @@ Create a `key_bindings.ron` file like this:
     open_help: Some(( code: F(1), modifiers: "")),
 
     status_reset_item: Some(( code: Char('U'), modifiers: "SHIFT")),
+    status_reset_all: Some(( code: Char('d'), modifiers: "CONTROL")),
     generate_commit_message: Some(( code: Char('g'), modifiers: "CONTROL")),
 )
 ```
 
 The config file format based on the [Ron file format](https://github.com/ron-rs/ron).
+
+`status_reset_all` defaults to `Ctrl+D` in Unstaged changes. After confirmation,
+it discards all unstaged changes and deletes untracked files, keeping staged changes.
+
 The location of the file depends on your OS:
 * `$HOME/.config/gitui/key_bindings.ron` (mac)
 * `$XDG_CONFIG_HOME/gitui/key_bindings.ron` (linux using XDG)

@@ -281,7 +281,7 @@ pub fn push_raw(
 			&destination,
 			&push_ref,
 			&mut options,
-			basic_credential.clone(),
+			basic_credential,
 		)?;
 	} else {
 		remote_handle.push(&[push_ref], Some(&mut options))?;

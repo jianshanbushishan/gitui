@@ -226,6 +226,11 @@ impl Component for ChangesComponent {
 				some_selection && self.focused(),
 			));
 			out.push(CommandInfo::new(
+				strings::commands::reset_all(&self.key_config),
+				true,
+				!self.is_empty() && self.focused(),
+			));
+			out.push(CommandInfo::new(
 				strings::commands::ignore_item(&self.key_config),
 				true,
 				some_selection && self.focused(),
@@ -292,6 +297,16 @@ impl Component for ChangesComponent {
 					Ok(self.dispatch_reset_workdir().into())
 				} else if key_match(
 					e,
+					self.key_config.keys.status_reset_all,
+				) && self.is_working_dir
+					&& !self.is_empty()
+				{
+					self.queue.push(InternalEvent::ConfirmAction(
+						Action::ResetAll,
+					));
+					Ok(EventState::Consumed)
+				} else if key_match(
+					e,
 					self.key_config.keys.status_ignore_file,
 				) && self.is_working_dir
 					&& !self.is_empty()
@@ -325,5 +340,65 @@ impl Component for ChangesComponent {
 	fn show(&mut self) -> Result<()> {
 		self.files.show()?;
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crossterm::event::KeyEvent;
+
+	#[test]
+	fn reset_all_requires_focused_nonempty_workdir_and_confirmation()
+	{
+		let env = Environment::test_env();
+		let event = Event::Key(KeyEvent::from(
+			&env.key_config.keys.status_reset_all,
+		));
+		for (working_dir, focused, has_changes) in [
+			(true, true, true),
+			(true, true, false),
+			(true, false, true),
+			(false, true, true),
+		] {
+			let mut changes = ChangesComponent::new(
+				&env,
+				"Changes",
+				focused,
+				working_dir,
+			);
+			if has_changes {
+				changes
+					.set_items(&[StatusItem {
+						path: "nested/selected.txt".into(),
+						status: StatusItemType::Modified,
+					}])
+					.unwrap();
+			}
+			let expected = working_dir && focused && has_changes;
+			let mut commands = Vec::new();
+			changes.commands(&mut commands, false);
+			assert_eq!(
+				commands.iter().any(|command| command
+					.text
+					.name
+					.starts_with("Reset All")
+					&& command.show_in_quickbar()),
+				expected
+			);
+			assert_eq!(
+				changes.event(&event).unwrap().is_consumed(),
+				expected
+			);
+			if expected {
+				assert!(matches!(
+					env.queue.pop(),
+					Some(InternalEvent::ConfirmAction(
+						Action::ResetAll
+					))
+				));
+			}
+			assert!(env.queue.pop().is_none());
+		}
 	}
 }

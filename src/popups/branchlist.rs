@@ -492,6 +492,32 @@ impl BranchListPopup {
 		Ok(())
 	}
 
+	fn branch_details_text(
+		branch: &BranchInfo,
+		width: usize,
+	) -> String {
+		const ELLIPSIS: &str = "...";
+		let details = match &branch.details {
+			BranchDetails::Remote(RemoteBranch {
+				remote_url: Some(url),
+				..
+			}) => format!("{url}  {}", branch.top_commit_message),
+			_ => branch.top_commit_message.clone(),
+		};
+		if details.unicode_truncate(width).0.len() == details.len() {
+			return details;
+		}
+		format!(
+			"{}{}",
+			details
+				.unicode_truncate(
+					width.saturating_sub(ELLIPSIS.len())
+				)
+				.0,
+			ELLIPSIS.unicode_truncate(width).0,
+		)
+	}
+
 	/// Get branches to display
 	fn get_text(
 		&self,
@@ -525,15 +551,10 @@ impl BranchListPopup {
 			.take(height)
 			.enumerate()
 		{
-			let mut commit_message =
-				displaybranch.top_commit_message.clone();
-			if commit_message.len() > commit_message_length {
-				commit_message.unicode_truncate(
-					commit_message_length
-						.saturating_sub(THREE_DOTS_LENGTH),
-				);
-				commit_message += THREE_DOTS;
-			}
+			let commit_message = Self::branch_details_text(
+				displaybranch,
+				commit_message_length,
+			);
 
 			let mut branch_name = displaybranch.name.clone();
 			if branch_name.len()
@@ -825,6 +846,71 @@ mod tests {
 	use super::*;
 	use asyncgit::sync::RepoPath;
 	use crossterm::event::{KeyCode, KeyModifiers};
+
+	#[test]
+	fn branch_rows_show_remote_urls_and_preserve_commit_details() {
+		let (dir, repo) = git2_testing::repo_init();
+		let head = repo.head().unwrap();
+		let commit = head.peel_to_commit().unwrap();
+		let summary = commit.summary().unwrap().unwrap();
+		let url = "https://example.com/仓库.git";
+		repo.remote("origin", url).unwrap();
+		for name in ["origin/feature", "orphan/feature"] {
+			repo.reference(
+				&format!("refs/remotes/{name}"),
+				commit.id(),
+				false,
+				"test remote URL",
+			)
+			.unwrap();
+		}
+		let env = Environment::test_env();
+		*env.repo.borrow_mut() = RepoPath::Path(dir.path().into());
+		let mut popup = BranchListPopup::new(&env);
+		popup.local = false;
+		popup.open().unwrap();
+
+		let text = popup.get_text(&env.theme, 240, 2);
+		let origin = &text.lines[0];
+		assert!(origin.to_string().contains("origin/feature"));
+		assert!(origin
+			.to_string()
+			.contains(&commit.id().to_string()[..7]));
+		assert_eq!(
+			origin.spans.last().unwrap().content,
+			format!("{url}  {summary}"),
+		);
+		assert_eq!(
+			text.lines[1].spans.last().unwrap().content,
+			summary,
+		);
+
+		// The URL has priority over the summary when space is limited.
+		let text = popup.get_text(&env.theme, 60, 2);
+		let detail = &text.lines[0].spans.last().unwrap().content;
+		assert!(detail.starts_with("https://"));
+		assert!(detail.ends_with("..."));
+		// Include widths that truncate inside the multibyte URL, and
+		// widths too small to fit the full ellipsis.
+		for width in 0..=120 {
+			let text = popup.get_text(&env.theme, width, 2);
+			let available = (usize::from(width))
+				.saturating_sub(usize::from(width) * 40 / 100)
+				.saturating_sub(14);
+			assert!(
+				text.lines[0].spans.last().unwrap().width()
+					<= available
+			);
+		}
+
+		popup.local = true;
+		popup.update_branches().unwrap();
+		let text = popup.get_text(&env.theme, 240, 1);
+		assert_eq!(
+			text.lines[0].spans.last().unwrap().content,
+			summary,
+		);
+	}
 
 	#[test]
 	fn view_history_preserves_head_for_local_and_remote_branches() {

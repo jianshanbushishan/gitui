@@ -162,7 +162,7 @@ impl Options {
 		Self {
 			repo: RefCell::new(dir.path().to_path_buf().into()),
 			data: Default::default(),
-			preferences: Default::default(),
+			preferences: GlobalPreferences::default(),
 			config_dir: Some(dir.path().join("config")),
 			_test_dir: Some(dir),
 		}
@@ -183,7 +183,7 @@ impl Options {
 		let mut options = Self {
 			data: Self::read(&repo).unwrap_or_default(),
 			repo,
-			preferences: Default::default(),
+			preferences: GlobalPreferences::default(),
 			config_dir,
 			#[cfg(test)]
 			_test_dir: None,
@@ -191,7 +191,7 @@ impl Options {
 		match options.read_preferences() {
 			Ok(preferences) => options.preferences = preferences,
 			Err(error) => {
-				log::error!("global options read error: {error}")
+				log::error!("global options read error: {error}");
 			}
 		}
 		Rc::new(RefCell::new(options))

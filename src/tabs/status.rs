@@ -874,6 +874,11 @@ impl Status {
 		}
 	}
 
+	/// Discard working-directory changes while preserving the index.
+	pub fn reset_all(&self) -> bool {
+		self.reset(&ResetItem { path: "*".into() })
+	}
+
 	pub fn last_file_moved(&mut self) -> Result<()> {
 		if !self.is_focus_on_diff() && self.is_visible() {
 			self.switch_focus(self.focus.toggled_focus())?;
@@ -959,7 +964,7 @@ impl Status {
 		is_ahead && self.remotes.has_remote_for_push
 	}
 
-	fn can_fetch(&self) -> bool {
+	const fn can_fetch(&self) -> bool {
 		self.remotes.has_remote_for_fetch
 	}
 
@@ -1073,6 +1078,86 @@ mod tests {
 	};
 	use asyncgit::{AsyncGitNotification, StatusItemType};
 	use std::time::{Duration, Instant};
+
+	#[test]
+	fn reset_all_untracked_files_before_first_commit() {
+		use crate::app::Environment;
+		use std::fs;
+
+		let (dir, _repo) = git2_testing::repo_init_empty();
+		fs::create_dir(dir.path().join("untracked")).unwrap();
+		fs::write(dir.path().join("untracked/new.txt"), "new\n")
+			.unwrap();
+		fs::write(dir.path().join(".hidden"), "new\n").unwrap();
+		let mut env = Environment::test_env();
+		*env.repo.get_mut() = dir.path().to_path_buf().into();
+		assert!(Status::new(&env).reset_all());
+		assert!(!dir.path().join("untracked/new.txt").exists());
+		assert!(!dir.path().join(".hidden").exists());
+	}
+
+	#[test]
+	fn reset_all_preserves_staged_and_ignored_files() {
+		use crate::app::Environment;
+		use asyncgit::sync;
+		use std::{fs, path::Path};
+
+		let (dir, repo) = git2_testing::repo_init();
+		let repo_path = dir.path().to_path_buf().into();
+		fs::create_dir(dir.path().join("nested")).unwrap();
+		for (path, contents) in [
+			("tracked.txt", "original\n"),
+			("nested/deleted.txt", "restore me\n"),
+			(".gitignore", "ignored.txt\n"),
+		] {
+			fs::write(dir.path().join(path), contents).unwrap();
+			sync::stage_add_file(&repo_path, Path::new(path))
+				.unwrap();
+		}
+		sync::commit(&repo_path, "tracked files").unwrap();
+		fs::write(dir.path().join("tracked.txt"), "staged\n")
+			.unwrap();
+		sync::stage_add_file(&repo_path, Path::new("tracked.txt"))
+			.unwrap();
+		let index_tree = repo.index().unwrap().write_tree().unwrap();
+		fs::write(dir.path().join("tracked.txt"), "unstaged\n")
+			.unwrap();
+		fs::remove_file(dir.path().join("nested/deleted.txt"))
+			.unwrap();
+		fs::write(dir.path().join("untracked.txt"), "remove me")
+			.unwrap();
+		fs::write(
+			dir.path().join("nested/untracked.txt"),
+			"remove me",
+		)
+		.unwrap();
+		fs::write(dir.path().join("ignored.txt"), "keep me").unwrap();
+
+		let mut env = Environment::test_env();
+		*env.repo.get_mut() = repo_path;
+		assert!(super::Status::new(&env).reset_all());
+		assert_eq!(
+			fs::read_to_string(dir.path().join("tracked.txt"))
+				.unwrap(),
+			"staged\n"
+		);
+		assert_eq!(
+			fs::read_to_string(dir.path().join("nested/deleted.txt"))
+				.unwrap(),
+			"restore me\n"
+		);
+		assert!(!dir.path().join("untracked.txt").exists());
+		assert!(!dir.path().join("nested/untracked.txt").exists());
+		assert_eq!(
+			fs::read_to_string(dir.path().join("ignored.txt"))
+				.unwrap(),
+			"keep me"
+		);
+		assert_eq!(
+			repo.index().unwrap().write_tree().unwrap(),
+			index_tree
+		);
+	}
 
 	fn wait_for_status_scan(
 		receiver: &crossbeam_channel::Receiver<AsyncGitNotification>,

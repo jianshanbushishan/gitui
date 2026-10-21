@@ -50,7 +50,7 @@ impl FilesTab {
 					self.files.set_no_commits();
 				}
 				Err(error) => {
-					self.files.set_head_error(&error.to_string())
+					self.files.set_head_error(&error.to_string());
 				}
 			}
 		}
@@ -64,15 +64,10 @@ impl FilesTab {
 	}
 
 	///
-	pub fn update_async(
-		&mut self,
-		ev: AsyncNotification,
-	) -> Result<()> {
+	pub fn update_async(&mut self, ev: AsyncNotification) {
 		if self.is_visible() {
-			self.files.update(ev)?;
+			self.files.update(ev);
 		}
-
-		Ok(())
 	}
 
 	pub fn file_finder_update(&mut self, file: &Path) {

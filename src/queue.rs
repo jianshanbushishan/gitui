@@ -43,6 +43,7 @@ pub struct ResetItem {
 ///
 pub enum Action {
 	Reset(ResetItem),
+	ResetAll,
 	ResetHunk(String, u64),
 	ResetLines(String, Vec<DiffLinePosition>),
 	StashDrop(Vec<CommitId>),

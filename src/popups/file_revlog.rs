@@ -26,7 +26,7 @@ use asyncgit::{
 };
 use chrono::{DateTime, Local};
 use crossbeam_channel::Sender;
-use crossterm::event::Event;
+use crossterm::event::{Event, KeyEvent};
 use ratatui::{
 	layout::{Alignment, Constraint, Direction, Layout, Rect},
 	text::{Line, Span, Text},
@@ -141,11 +141,11 @@ impl FileRevlogPopup {
 	///
 	pub fn open(&mut self, open_request: FileRevOpen) -> Result<()> {
 		self.open_request = Some(open_request.clone());
-		self.search_options = open_request.search.clone();
+		self.search_options.clone_from(&open_request.search);
 		self.reset_log(
 			open_request.search,
 			open_request.selection.unwrap_or(0),
-		)?;
+		);
 
 		self.show()?;
 
@@ -162,7 +162,7 @@ impl FileRevlogPopup {
 		options: LogFilterSearchOptions,
 	) -> Result<()> {
 		if self.open_request.is_some() && self.visible {
-			self.reset_log(Some(options.clone()), 0)?;
+			self.reset_log(Some(options.clone()), 0);
 			self.search_options = Some(options);
 			self.update()?;
 		}
@@ -173,9 +173,9 @@ impl FileRevlogPopup {
 		&mut self,
 		search: Option<LogFilterSearchOptions>,
 		selection: usize,
-	) -> Result<()> {
+	) {
 		let Some(open_request) = &self.open_request else {
-			return Ok(());
+			return;
 		};
 		let filter =
 			history_filter(open_request.file_path.clone(), search);
@@ -190,7 +190,6 @@ impl FileRevlogPopup {
 		self.count_total = 0;
 		self.set_selection(selection);
 		self.diff.clear(false);
-		Ok(())
 	}
 
 	///
@@ -616,6 +615,84 @@ impl FileRevlogPopup {
 		self.current_height.set(area.height.into());
 	}
 
+	fn event_key(&mut self, key: &KeyEvent) -> Result<()> {
+		if key_match(key, self.key_config.keys.exit_popup) {
+			if self.diff.focused() {
+				self.diff.focus(false);
+			} else if self.search_options.is_some() {
+				self.reset_log(None, 0);
+				self.search_options = None;
+				self.update()?;
+			} else {
+				self.hide_stacked(false);
+			}
+		} else if !self.diff.focused()
+			&& key_match(key, self.key_config.keys.log_find)
+		{
+			self.queue
+				.push(InternalEvent::OpenFileHistorySearchPopup);
+		} else if key_match(key, self.key_config.keys.move_right)
+			&& self.can_focus_diff()
+		{
+			self.diff.focus(true);
+		} else if !self.diff.focused()
+			&& key_match(key, self.key_config.keys.external_diff)
+		{
+			self.open_external_diff();
+		} else if key_match(key, self.key_config.keys.enter) {
+			if let Some(commit_id) = self.selected_commit() {
+				self.hide_stacked(true);
+				self.queue.push(InternalEvent::OpenPopup(
+					StackablePopupOpen::InspectCommit(
+						InspectCommitOpen::new(commit_id),
+					),
+				));
+			}
+		} else if key_match(key, self.key_config.keys.blame)
+			&& self
+				.open_request
+				.as_ref()
+				.is_some_and(|request| !request.is_directory)
+		{
+			if let Some(open_request) = self.open_request.clone() {
+				self.hide_stacked(true);
+				self.queue.push(InternalEvent::OpenPopup(
+					StackablePopupOpen::BlameFile(BlameFileOpen {
+						file_path: open_request.file_path,
+						commit_id: self.selected_commit(),
+						selection: None,
+					}),
+				));
+			}
+		} else if key_match(key, self.key_config.keys.move_up)
+			|| key_match(key, self.key_config.keys.popup_up)
+		{
+			self.move_selection(ScrollType::Up)?;
+		} else if key_match(key, self.key_config.keys.move_down)
+			|| key_match(key, self.key_config.keys.popup_down)
+		{
+			self.move_selection(ScrollType::Down)?;
+		} else if key_match(key, self.key_config.keys.shift_up)
+			|| key_match(key, self.key_config.keys.home)
+		{
+			self.move_selection(ScrollType::Home)?;
+		} else if key_match(key, self.key_config.keys.shift_down)
+			|| key_match(key, self.key_config.keys.end)
+		{
+			self.move_selection(ScrollType::End)?;
+		} else if key_match(key, self.key_config.keys.page_up) {
+			self.move_selection(ScrollType::PageUp)?;
+		} else if key_match(key, self.key_config.keys.page_down) {
+			self.move_selection(ScrollType::PageDown)?;
+		} else if key_match(
+			key,
+			self.key_config.keys.diff_mode_toggle,
+		) {
+			self.diff.toggle_diff_mode();
+		}
+		Ok(())
+	}
+
 	fn hide_stacked(&mut self, stack: bool) {
 		self.hide();
 
@@ -702,105 +779,7 @@ impl Component for FileRevlogPopup {
 			}
 
 			if let Event::Key(key) = event {
-				if key_match(key, self.key_config.keys.exit_popup) {
-					if self.diff.focused() {
-						self.diff.focus(false);
-					} else if self.search_options.is_some() {
-						self.reset_log(None, 0)?;
-						self.search_options = None;
-						self.update()?;
-					} else {
-						self.hide_stacked(false);
-					}
-				} else if !self.diff.focused()
-					&& key_match(key, self.key_config.keys.log_find)
-				{
-					self.queue.push(
-						InternalEvent::OpenFileHistorySearchPopup,
-					);
-				} else if key_match(
-					key,
-					self.key_config.keys.move_right,
-				) && self.can_focus_diff()
-				{
-					self.diff.focus(true);
-				} else if !self.diff.focused()
-					&& key_match(
-						key,
-						self.key_config.keys.external_diff,
-					) {
-					self.open_external_diff();
-				} else if key_match(key, self.key_config.keys.enter) {
-					if let Some(commit_id) = self.selected_commit() {
-						self.hide_stacked(true);
-						self.queue.push(InternalEvent::OpenPopup(
-							StackablePopupOpen::InspectCommit(
-								InspectCommitOpen::new(commit_id),
-							),
-						));
-					}
-				} else if key_match(key, self.key_config.keys.blame)
-					&& self
-						.open_request
-						.as_ref()
-						.is_some_and(|request| !request.is_directory)
-				{
-					if let Some(open_request) =
-						self.open_request.clone()
-					{
-						self.hide_stacked(true);
-						self.queue.push(InternalEvent::OpenPopup(
-							StackablePopupOpen::BlameFile(
-								BlameFileOpen {
-									file_path: open_request.file_path,
-									commit_id: self.selected_commit(),
-									selection: None,
-								},
-							),
-						));
-					}
-				} else if key_match(key, self.key_config.keys.move_up)
-					|| key_match(key, self.key_config.keys.popup_up)
-				{
-					self.move_selection(ScrollType::Up)?;
-				} else if key_match(
-					key,
-					self.key_config.keys.move_down,
-				) || key_match(
-					key,
-					self.key_config.keys.popup_down,
-				) {
-					self.move_selection(ScrollType::Down)?;
-				} else if key_match(
-					key,
-					self.key_config.keys.shift_up,
-				) || key_match(
-					key,
-					self.key_config.keys.home,
-				) {
-					self.move_selection(ScrollType::Home)?;
-				} else if key_match(
-					key,
-					self.key_config.keys.shift_down,
-				) || key_match(
-					key,
-					self.key_config.keys.end,
-				) {
-					self.move_selection(ScrollType::End)?;
-				} else if key_match(key, self.key_config.keys.page_up)
-				{
-					self.move_selection(ScrollType::PageUp)?;
-				} else if key_match(
-					key,
-					self.key_config.keys.page_down,
-				) {
-					self.move_selection(ScrollType::PageDown)?;
-				} else if key_match(
-					key,
-					self.key_config.keys.diff_mode_toggle,
-				) {
-					self.diff.toggle_diff_mode();
-				}
+				self.event_key(key)?;
 			}
 
 			return Ok(EventState::Consumed);

@@ -143,6 +143,9 @@ pub fn stash_popup_msg(_key_config: &SharedKeyConfig) -> String {
 pub fn confirm_title_reset() -> String {
 	"Reset".to_string()
 }
+pub fn confirm_title_reset_all() -> String {
+	"Reset All".to_string()
+}
 pub fn confirm_title_undo_commit() -> String {
 	"Undo commit".to_string()
 }
@@ -203,6 +206,9 @@ pub fn confirm_msg_abortrebase() -> String {
 }
 pub fn confirm_msg_reset() -> String {
 	"confirm file reset?".to_string()
+}
+pub fn confirm_msg_reset_all() -> String {
+	"Discard all unstaged changes and untracked files? Staged changes stay.".to_string()
 }
 pub fn confirm_msg_reset_lines(lines: usize) -> String {
 	format!(
@@ -1412,6 +1418,16 @@ pub mod commands {
 					.get_hint(key_config.keys.status_reset_item),
 			),
 			"revert changes in selected file or entire path",
+			CMD_GROUP_CHANGES,
+		)
+	}
+	pub fn reset_all(key_config: &SharedKeyConfig) -> CommandText {
+		CommandText::new(
+			format!(
+				"Reset All [{}]",
+				key_config.get_hint(key_config.keys.status_reset_all),
+			),
+			"revert all unstaged changes and delete untracked files",
 			CMD_GROUP_CHANGES,
 		)
 	}

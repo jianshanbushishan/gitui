@@ -150,6 +150,10 @@ impl ConfirmPopup {
 					strings::confirm_title_reset(),
 					strings::confirm_msg_reset(),
 				),
+				Action::ResetAll => (
+					strings::confirm_title_reset_all(),
+					strings::confirm_msg_reset_all(),
+				),
 				Action::StashDrop(ids) => (
 					strings::confirm_title_stashdrop(
 						&self.key_config,
@@ -286,6 +290,54 @@ mod tests {
 		buffer::Buffer,
 		widgets::{Clear, Widget},
 	};
+
+	#[test]
+	fn reset_all_can_be_cancelled_or_confirmed() {
+		let env = Environment::test_env();
+		let mut popup = ConfirmPopup::new(&env);
+		popup.open(Action::ResetAll).unwrap();
+		let (title, message) = popup.get_text();
+		assert_eq!(title, "Reset All");
+		assert!(message.contains("untracked files"));
+		assert!(message.contains("Staged changes stay"));
+		let mut terminal = ratatui::Terminal::new(
+			ratatui::backend::TestBackend::new(80, 24),
+		)
+		.unwrap();
+		terminal
+			.draw(|frame| popup.draw(frame, frame.area()).unwrap())
+			.unwrap();
+		let rendered: String = terminal
+			.backend()
+			.buffer()
+			.content
+			.iter()
+			.flat_map(|cell| cell.symbol().chars())
+			.filter(|ch| ch.is_ascii() && !ch.is_whitespace())
+			.collect();
+		let message: String = message
+			.chars()
+			.filter(|ch| !ch.is_whitespace())
+			.collect();
+		assert!(rendered.contains(&message), "{rendered}");
+		popup
+			.event(&Event::Key(
+				(&env.key_config.keys.exit_popup).into(),
+			))
+			.unwrap();
+		assert!(!popup.is_visible());
+		assert!(env.queue.pop().is_none());
+
+		popup.open(Action::ResetAll).unwrap();
+		popup
+			.event(&Event::Key((&env.key_config.keys.enter).into()))
+			.unwrap();
+		assert!(!popup.is_visible());
+		assert!(matches!(
+			env.queue.pop(),
+			Some(InternalEvent::ConfirmedAction(Action::ResetAll))
+		));
+	}
 
 	/// Simulate the real failure mode: a wide (CJK) grapheme sits just
 	/// outside the popup area (in the diff background). Without clearing a

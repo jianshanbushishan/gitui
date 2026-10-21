@@ -69,6 +69,8 @@ pub struct UpstreamBranch {
 pub struct RemoteBranch {
 	///
 	pub has_tracking: bool,
+	/// Fetch URL of the remote whose refspec owns this branch.
+	pub remote_url: Option<String>,
 }
 
 ///
@@ -180,9 +182,18 @@ pub fn get_branches_info(
 					remote,
 				})
 			} else {
+				let remote_url = repo
+					.branch_remote_name(&reference)
+					.ok()
+					.and_then(|name| {
+						let name = name.as_str().ok()?;
+						let remote = repo.find_remote(name).ok()?;
+						remote.url().ok().map(String::from)
+					});
 				BranchDetails::Remote(RemoteBranch {
 					has_tracking: remotes_with_tracking
 						.contains(name_bytes),
+					remote_url,
 				})
 			};
 
@@ -894,6 +905,69 @@ mod test_remote_branches {
 				None
 			}
 		}
+	}
+
+	#[test]
+	fn test_remote_branch_urls_follow_fetch_refspecs() {
+		let (dir, repo) = crate::sync::tests::repo_init().unwrap();
+		let commit = repo.head().unwrap().target().unwrap();
+		let origin_url = "https://example.com/origin.git";
+		let upstream_url = "git@example.com:team/upstream.git";
+		repo.remote("origin", origin_url).unwrap();
+		repo.remote_with_fetch(
+			"team/upstream",
+			upstream_url,
+			"+refs/heads/*:refs/remotes/mirror/*",
+		)
+		.unwrap();
+		for name in
+			["origin/main", "mirror/feature/nested", "orphan/main"]
+		{
+			repo.reference(
+				&format!("refs/remotes/{name}"),
+				commit,
+				false,
+				"test remote URL",
+			)
+			.unwrap();
+		}
+		let repo_path = dir.path().to_str().unwrap().into();
+		let branches = get_branches_info(&repo_path, false).unwrap();
+		assert_eq!(branches.len(), 3);
+		for (name, expected_url) in [
+			("origin/main", Some(origin_url)),
+			("mirror/feature/nested", Some(upstream_url)),
+			("orphan/main", None),
+		] {
+			let branch =
+				branches.iter().find(|b| b.name == name).unwrap();
+			assert_eq!(
+				branch
+					.remote_details()
+					.unwrap()
+					.remote_url
+					.as_deref(),
+				expected_url,
+			);
+		}
+
+		repo.remote_set_url(
+			"origin",
+			"https://example.com/updated.git",
+		)
+		.unwrap();
+		let branches = get_branches_info(&repo_path, false).unwrap();
+		assert_eq!(
+			branches
+				.iter()
+				.find(|b| b.name == "origin/main")
+				.unwrap()
+				.remote_details()
+				.unwrap()
+				.remote_url
+				.as_deref(),
+			Some("https://example.com/updated.git"),
+		);
 	}
 
 	#[test]

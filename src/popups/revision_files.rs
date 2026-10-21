@@ -56,8 +56,8 @@ impl RevisionFilesPopup {
 	}
 
 	///
-	pub fn update(&mut self, ev: AsyncNotification) -> Result<()> {
-		self.files.update(ev)
+	pub fn update(&mut self, ev: AsyncNotification) {
+		self.files.update(ev);
 	}
 
 	///
