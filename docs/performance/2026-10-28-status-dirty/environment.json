@@ -1,0 +1,138 @@
+{
+  "before": {
+    "head": "4cac515555a95f20173e9f6d2d92f67f75466d9b",
+    "index_sha256": "fddb1929007120239917d72204bd329894c685a08be7aaa8eb2a382e98883f4c",
+    "index_mtime_ns": 1793155181331162100,
+    "config_sha256": "0e4200c804c94340a8586b6abbc089f17ec2969a835f15a720e126e4acad2be9",
+    "status_hex": "",
+    "tracked_metadata_sha256": "2bac4f2c15d409781c855f4dc498e0d85f389c44f17e76ee704191cdb524a71c",
+    "selected_file_sha256": {
+      "file-00": "fc05f876300783afa4eea0b3db7248eead9f42ee3f5cfe3333b5f8b8ee657bcc",
+      "file-01": "28d0bf61e9c1934f084468349ffbbe483431c7548ddb1655d50951626e91cc34",
+      "file-02": "5d10d6b9290e1c8b822c5b5d271240c438417ce8ffd0c038a54c1bbf29ab11a0",
+      "file-03": "82f3076aeab69f7597ceccf7cb03b78b02429a734b074c7e307970f15301b45b",
+      "file-04": "b04dfd4d286686b1b226c2fa3c34eac31ab8df01ad9c3fb63bc2bbe82ad065eb",
+      "file-05": "e288ee40f5ad5c2790f88f7b89086eef71015137304c92de25643fe6bca22e7a",
+      "file-06": "c79b8bcf89d93d95feb1347ad5358fe4948eb25614d9354a0fbeecad693865bf",
+      "file-07": "81cdaf389b4d797a362a6e37783598591e05c6a69a3e67a3c3c2f2f5d15d6bf8",
+      "file-08": "64a52822ea0a29bd465ec04698445913ad68c5b93dc153e84ae4cb05607de1e5",
+      "file-09": "923498e40f50b5454b9137e1e8573051f4669f8e534833584538cd3b5860e82a",
+      "file-10": "0f16b9dcba98bea8c7c6da464a7b71f2635d58d1907bcfe00f1d1248315c5a6b",
+      "file-11": "30be893460bcece100cd8010018ad93a449405ebc695a3f43a4eb3974e9fc556",
+      "file-12": "e6a657671813a92ba4ae9859f6a7cf1c1c9b2a13c3f446b25d580ebd64c65df6",
+      "file-13": "9600a1671fc644ef0a0a9277b9aa8da6cd59cb9152552350b22f9fd46d7616b4",
+      "file-14": "9ec0ef26cb5d321829c0287c0f98f4e581768ff00c844c64e469fbc3eac53357",
+      "file-15": "3e2c4c1bde2713db99bb63d4c1855b466a4fe224963c8f801d66e90b88e51443",
+      "file-16": "87c35ac1059b004761a823470ab1d1a9a82027279caaa55d159e0baa74664d42",
+      "file-17": "0d2daad920e20a8ee1c8dcacbecee49300bbef7952e366f7292944d9f2b244a2",
+      "file-18": "f3c7db646cda41942532dd2a97165c44da419523981d3fbe1783ecd19de54d11",
+      "file-19": "15292446f44b3e4abf229e9bcf55c6ee8bcde03192df5e8ae8133fa7e59712f3"
+    }
+  },
+  "after": {
+    "head": "4cac515555a95f20173e9f6d2d92f67f75466d9b",
+    "index_sha256": "fddb1929007120239917d72204bd329894c685a08be7aaa8eb2a382e98883f4c",
+    "index_mtime_ns": 1793155181331162100,
+    "config_sha256": "0e4200c804c94340a8586b6abbc089f17ec2969a835f15a720e126e4acad2be9",
+    "status_hex": "",
+    "tracked_metadata_sha256": "2bac4f2c15d409781c855f4dc498e0d85f389c44f17e76ee704191cdb524a71c",
+    "selected_file_sha256": {
+      "file-00": "fc05f876300783afa4eea0b3db7248eead9f42ee3f5cfe3333b5f8b8ee657bcc",
+      "file-01": "28d0bf61e9c1934f084468349ffbbe483431c7548ddb1655d50951626e91cc34",
+      "file-02": "5d10d6b9290e1c8b822c5b5d271240c438417ce8ffd0c038a54c1bbf29ab11a0",
+      "file-03": "82f3076aeab69f7597ceccf7cb03b78b02429a734b074c7e307970f15301b45b",
+      "file-04": "b04dfd4d286686b1b226c2fa3c34eac31ab8df01ad9c3fb63bc2bbe82ad065eb",
+      "file-05": "e288ee40f5ad5c2790f88f7b89086eef71015137304c92de25643fe6bca22e7a",
+      "file-06": "c79b8bcf89d93d95feb1347ad5358fe4948eb25614d9354a0fbeecad693865bf",
+      "file-07": "81cdaf389b4d797a362a6e37783598591e05c6a69a3e67a3c3c2f2f5d15d6bf8",
+      "file-08": "64a52822ea0a29bd465ec04698445913ad68c5b93dc153e84ae4cb05607de1e5",
+      "file-09": "923498e40f50b5454b9137e1e8573051f4669f8e534833584538cd3b5860e82a",
+      "file-10": "0f16b9dcba98bea8c7c6da464a7b71f2635d58d1907bcfe00f1d1248315c5a6b",
+      "file-11": "30be893460bcece100cd8010018ad93a449405ebc695a3f43a4eb3974e9fc556",
+      "file-12": "e6a657671813a92ba4ae9859f6a7cf1c1c9b2a13c3f446b25d580ebd64c65df6",
+      "file-13": "9600a1671fc644ef0a0a9277b9aa8da6cd59cb9152552350b22f9fd46d7616b4",
+      "file-14": "9ec0ef26cb5d321829c0287c0f98f4e581768ff00c844c64e469fbc3eac53357",
+      "file-15": "3e2c4c1bde2713db99bb63d4c1855b466a4fe224963c8f801d66e90b88e51443",
+      "file-16": "87c35ac1059b004761a823470ab1d1a9a82027279caaa55d159e0baa74664d42",
+      "file-17": "0d2daad920e20a8ee1c8dcacbecee49300bbef7952e366f7292944d9f2b244a2",
+      "file-18": "f3c7db646cda41942532dd2a97165c44da419523981d3fbe1783ecd19de54d11",
+      "file-19": "15292446f44b3e4abf229e9bcf55c6ee8bcde03192df5e8ae8133fa7e59712f3"
+    }
+  },
+  "source_unchanged": true,
+  "tracked_count": 30568,
+  "tracked_bytes": 37990105881,
+  "fixture_method": "Independent copy2 of every tracked regular file; ignored generated files omitted; separate gitdir with read-only object alternate",
+  "scenarios": {
+    "unstaged": {
+      "expected": {
+        "STAGE_COUNT": 0,
+        "WORKDIR_COUNT": 20,
+        "STAGE_ADDED": 0,
+        "STAGE_DELETED": 0,
+        "WORKDIR_ADDED": 60,
+        "WORKDIR_DELETED": 0
+      },
+      "status_sha256": "7b7a13890f66231c4aac3595d773f6a7874873659a9a4b56a12927c8de6a666d",
+      "numstat_totals": [
+        60,
+        0
+      ]
+    },
+    "staged": {
+      "expected": {
+        "STAGE_COUNT": 20,
+        "WORKDIR_COUNT": 0,
+        "STAGE_ADDED": 60,
+        "STAGE_DELETED": 0,
+        "WORKDIR_ADDED": 0,
+        "WORKDIR_DELETED": 0
+      },
+      "status_sha256": "e139978957d84e755b4abcdb045a923c2f4724f1ec974d182672edb50839392a",
+      "numstat_totals": [
+        60,
+        0
+      ]
+    },
+    "untracked": {
+      "expected": {
+        "STAGE_COUNT": 0,
+        "WORKDIR_COUNT": 20,
+        "STAGE_ADDED": 0,
+        "STAGE_DELETED": 0,
+        "WORKDIR_ADDED": 0,
+        "WORKDIR_DELETED": 0
+      },
+      "status_sha256": "512284ba170cffdf459b0cd13c0b6a426f70deb5c8eec8690ed6cca5cb4b5c76",
+      "numstat_totals": [
+        0,
+        0
+      ]
+    }
+  },
+  "binaries": {
+    "baseline": {
+      "path": "D:\\private\\code2read\\gitui\\target\\status-dirty\\baseline-dirty.exe",
+      "sha256": "620ca626b8afd36b02f82d83533e5773fa3d0657c0e4cf0c0d69eae70c412179"
+    },
+    "candidate": {
+      "path": "D:\\private\\code2read\\gitui\\target\\status-dirty\\candidate-dirty.exe",
+      "sha256": "4cf4f049b85de0d801ed1b17e2c2754cbf461e0103811d6d9e75f9c478551e54"
+    }
+  },
+  "sampling": {
+    "blocks": 3,
+    "rounds_per_process": 23,
+    "warmup_rounds_per_process": 2,
+    "retained_per_variant_per_scenario": 63,
+    "order": "baseline,candidate / candidate,baseline / baseline,candidate"
+  },
+  "selected_text_files": 20,
+  "selected_newline": "originally LF only; UTF8, under 100KB each; append 3 LF lines per file",
+  "failed_setup_diagnostics": "Discarded before any valid samples: CRLF/mixed-ending text caused existing libgit2 whole-file line-count differences versus Git CLI. Final fixture uses original LF-only files; all expected counts verified each round.",
+  "runtime": "Windows 11, Ryzen 7 9700X 8C/16T, ZHITAI TiPlus7100 2TB NVMe; Release LTO; Rust 1.99.1",
+  "harness_sha256": {
+    "scripts/perf_status_dirty.py": "2a41b9474ae31df4d80062e30afb152c04c5f5c91a46f1a48071a70e6b1c9eb5",
+    "src/tabs/status_perf.rs": "869f34ad4721825fb50718e27dae27c99a81bd34bacf40b23f4acfddc78b47fe"
+  }
+}

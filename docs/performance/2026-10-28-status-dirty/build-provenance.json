@@ -1,0 +1,84 @@
+{
+  "baseline": {
+    "production_commit": "2d8a26fed3988231a78b5e46cd4ea3d400eef8e3",
+    "files": {
+      "src/tabs/status.rs": "fceec19f291c59748818bbe5658eb4ede15e364e0d3e3e92e82533b2db9b5906",
+      "src/tabs/status_perf.rs": "869f34ad4721825fb50718e27dae27c99a81bd34bacf40b23f4acfddc78b47fe",
+      "asyncgit/src/status.rs": "0a87f4430f169c1056e3fc424d35714f05e0750d3ba38967a14534c95fc06a3b",
+      "asyncgit/src/sync/status.rs": "59f1243d855d596453e2851195a5ac6dfb0c881a525cfdc0ea5bafbed35c84a4",
+      "asyncgit/src/linestats.rs": "2ccff1d259084ce9896968ec14accbde430cdb454f97fc50f27d70c3b40fe938",
+      "Cargo.lock": "82563dd63ebe3a790131fb33a4c584f17c154c62ed0c572e7130597ae0cc2fae"
+    },
+    "asyncgit_build_artifacts": [
+      {
+        "manifest_path": "D:\\private\\code2read\\gitui\\target\\status-dirty\\baseline-src\\asyncgit\\Cargo.toml",
+        "fresh": false,
+        "features": [
+          "openssl-sys",
+          "trace-libgit",
+          "vendor-openssl"
+        ],
+        "profile": {
+          "opt_level": "3",
+          "debuginfo": 0,
+          "debug_assertions": false,
+          "overflow_checks": false,
+          "test": false
+        },
+        "filenames": [
+          "D:/private/code2read/gitui/target\\release\\deps\\libasyncgit-08f1df491156fbc6.rlib",
+          "D:/private/code2read/gitui/target\\release\\deps\\libasyncgit-08f1df491156fbc6.rmeta"
+        ]
+      }
+    ],
+    "exe_sha256": "620ca626b8afd36b02f82d83533e5773fa3d0657c0e4cf0c0d69eae70c412179",
+    "production_files_match_commit_normalized": {
+      "src/tabs/status.rs": true,
+      "asyncgit/src/status.rs": true,
+      "asyncgit/src/sync/status.rs": true,
+      "asyncgit/src/linestats.rs": true,
+      "Cargo.lock": true
+    }
+  },
+  "candidate": {
+    "production_commit": "a535e39cebd88969daf75483498d4a551b86268f",
+    "files": {
+      "src/tabs/status.rs": "38384d1e372dbfd9e72428b5df9d0fe5e9182b21fc6635e8ec5f02b4e65dccbe",
+      "src/tabs/status_perf.rs": "869f34ad4721825fb50718e27dae27c99a81bd34bacf40b23f4acfddc78b47fe",
+      "asyncgit/src/status.rs": "0755357894d905b13f20fd722d182e316101089e70456354332d580fed20b7e0",
+      "asyncgit/src/sync/status.rs": "f4d4a6bfbed3e73dc460957013124ae37de78a3be7c17cec0a49270cdd8fdc60",
+      "asyncgit/src/linestats.rs": "e29e1cabdf473300b6a39672b6ac12f9819cbc22424f1c0138a87564c7f152d1",
+      "Cargo.lock": "82563dd63ebe3a790131fb33a4c584f17c154c62ed0c572e7130597ae0cc2fae"
+    },
+    "production_files_match_commit_normalized": {
+      "src/tabs/status.rs": true,
+      "asyncgit/src/status.rs": true,
+      "asyncgit/src/sync/status.rs": true,
+      "asyncgit/src/linestats.rs": true,
+      "Cargo.lock": true
+    },
+    "exe_sha256": "4cf4f049b85de0d801ed1b17e2c2754cbf461e0103811d6d9e75f9c478551e54",
+    "asyncgit_build_artifacts": [
+      {
+        "manifest_path": "D:\\private\\code2read\\gitui\\asyncgit\\Cargo.toml",
+        "fresh": false,
+        "features": [
+          "openssl-sys",
+          "trace-libgit",
+          "vendor-openssl"
+        ],
+        "profile": {
+          "opt_level": "3",
+          "debuginfo": 0,
+          "debug_assertions": false,
+          "overflow_checks": false,
+          "test": false
+        },
+        "filenames": [
+          "D:\\private\\code2read\\gitui\\target\\release\\deps\\libasyncgit-08f1df491156fbc6.rlib",
+          "D:\\private\\code2read\\gitui\\target\\release\\deps\\libasyncgit-08f1df491156fbc6.rmeta"
+        ]
+      }
+    ]
+  }
+}

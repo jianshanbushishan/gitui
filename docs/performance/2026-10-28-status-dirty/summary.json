@@ -1,0 +1,146 @@
+[
+  {
+    "scenario": "unstaged",
+    "variant": "baseline",
+    "metric": "status_drawn_ns",
+    "n": 63,
+    "median_ms": 578.5502,
+    "p95_ms": 699.3112
+  },
+  {
+    "scenario": "unstaged",
+    "variant": "baseline",
+    "metric": "all_jobs_ns",
+    "n": 63,
+    "median_ms": 1200.3438,
+    "p95_ms": 1435.2919
+  },
+  {
+    "scenario": "unstaged",
+    "variant": "baseline",
+    "metric": "draw_ns",
+    "n": 63,
+    "median_ms": 0.5931,
+    "p95_ms": 0.7681
+  },
+  {
+    "scenario": "unstaged",
+    "variant": "candidate",
+    "metric": "status_drawn_ns",
+    "n": 63,
+    "median_ms": 510.3796,
+    "p95_ms": 876.164
+  },
+  {
+    "scenario": "unstaged",
+    "variant": "candidate",
+    "metric": "all_jobs_ns",
+    "n": 63,
+    "median_ms": 1056.3465,
+    "p95_ms": 1744.7218
+  },
+  {
+    "scenario": "unstaged",
+    "variant": "candidate",
+    "metric": "draw_ns",
+    "n": 63,
+    "median_ms": 0.6584,
+    "p95_ms": 0.8822
+  },
+  {
+    "scenario": "staged",
+    "variant": "baseline",
+    "metric": "status_drawn_ns",
+    "n": 63,
+    "median_ms": 572.1715,
+    "p95_ms": 630.0611
+  },
+  {
+    "scenario": "staged",
+    "variant": "baseline",
+    "metric": "all_jobs_ns",
+    "n": 63,
+    "median_ms": 1178.463,
+    "p95_ms": 1317.963
+  },
+  {
+    "scenario": "staged",
+    "variant": "baseline",
+    "metric": "draw_ns",
+    "n": 63,
+    "median_ms": 0.5874,
+    "p95_ms": 0.7548
+  },
+  {
+    "scenario": "staged",
+    "variant": "candidate",
+    "metric": "status_drawn_ns",
+    "n": 63,
+    "median_ms": 511.2508,
+    "p95_ms": 567.3974
+  },
+  {
+    "scenario": "staged",
+    "variant": "candidate",
+    "metric": "all_jobs_ns",
+    "n": 63,
+    "median_ms": 575.2571,
+    "p95_ms": 643.0908
+  },
+  {
+    "scenario": "staged",
+    "variant": "candidate",
+    "metric": "draw_ns",
+    "n": 63,
+    "median_ms": 0.6073,
+    "p95_ms": 0.8203
+  },
+  {
+    "scenario": "untracked",
+    "variant": "baseline",
+    "metric": "status_drawn_ns",
+    "n": 63,
+    "median_ms": 576.1312,
+    "p95_ms": 690.7584
+  },
+  {
+    "scenario": "untracked",
+    "variant": "baseline",
+    "metric": "all_jobs_ns",
+    "n": 63,
+    "median_ms": 1185.219,
+    "p95_ms": 1322.7867
+  },
+  {
+    "scenario": "untracked",
+    "variant": "baseline",
+    "metric": "draw_ns",
+    "n": 63,
+    "median_ms": 0.575,
+    "p95_ms": 0.7706
+  },
+  {
+    "scenario": "untracked",
+    "variant": "candidate",
+    "metric": "status_drawn_ns",
+    "n": 63,
+    "median_ms": 512.8191,
+    "p95_ms": 660.2247
+  },
+  {
+    "scenario": "untracked",
+    "variant": "candidate",
+    "metric": "all_jobs_ns",
+    "n": 63,
+    "median_ms": 512.8204,
+    "p95_ms": 660.2261
+  },
+  {
+    "scenario": "untracked",
+    "variant": "candidate",
+    "metric": "draw_ns",
+    "n": 63,
+    "median_ms": 0.2292,
+    "p95_ms": 0.3024
+  }
+]
