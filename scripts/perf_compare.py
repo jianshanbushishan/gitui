@@ -141,10 +141,10 @@ def run(args, output):
                 "roots": {}, "command": sys.argv}
     for label, root in roots.items():
         lock = (root / "Cargo.lock").read_bytes()
-        patch = command(["git", "diff", "HEAD", "--binary"], root)
+        patch = command(["git", "-c", "core.autocrlf=true", "diff", "HEAD", "--binary"], root)
         (output / f"{label}.patch").write_bytes(patch)
         metadata["roots"][label] = {"path": str(root), "sha": command(["git", "rev-parse", "HEAD"], root).decode().strip(),
-            "git_status": command(["git", "status", "--short"], root).decode(),
+            "git_status": command(["git", "-c", "core.autocrlf=true", "status", "--short"], root).decode(),
             "lock_sha256": hashlib.sha256(lock).hexdigest(),
             "working_tree_patch_sha256": hashlib.sha256(patch).hexdigest(),
             "versions": {name: re.findall(r'name = "' + re.escape(name) + r'"\r?\nversion = "([^"]+)"', lock.decode())
