@@ -219,6 +219,7 @@ pub struct AsyncStatusPair {
 	request_generation: Arc<AtomicU64>,
 	latest_config: Arc<Mutex<Option<ShowUntrackedFilesConfig>>>,
 	repo: RepoPath,
+	scanner: Arc<Mutex<sync::status::StatusScanner>>,
 }
 
 #[derive(Default)]
@@ -303,6 +304,9 @@ impl AsyncStatusPair {
 			request_generation: Arc::new(AtomicU64::new(0)),
 			latest_config: Arc::new(Mutex::new(None)),
 			repo,
+			scanner: Arc::new(Mutex::new(
+				sync::status::StatusScanner::default(),
+			)),
 		}
 	}
 
@@ -336,8 +340,9 @@ impl AsyncStatusPair {
 		config: Option<ShowUntrackedFilesConfig>,
 	) -> Result<()> {
 		let repo = self.repo.clone();
+		let scanner = Arc::clone(&self.scanner);
 		self.fetch_with(config, move |config| {
-			sync::status::get_status_split(&repo, config).map(
+			scanner.lock()?.scan(&repo, config).map(
 				|(staged, workdir)| StatusPair {
 					staged: staged.into(),
 					workdir: workdir.into(),

@@ -285,6 +285,81 @@ pub fn get_status(
 	Ok(res)
 }
 
+/// Reuses index/object caches between scans, while reopening when repository
+/// identity, HEAD, configuration or environment changes. A fresh lightweight
+/// handle resolves configuration includes and worktree redirects each time.
+#[derive(Default)]
+pub(crate) struct StatusScanner {
+	repository: Option<git2::Repository>,
+	identity: Option<u64>,
+}
+
+impl StatusScanner {
+	pub(crate) fn scan(
+		&mut self,
+		path: &RepoPath,
+		config: Option<ShowUntrackedFilesConfig>,
+	) -> Result<(Vec<StatusItem>, Vec<StatusItem>)> {
+		let result = self.scan_inner(path, config);
+		if result.is_err() {
+			self.repository = None;
+			self.identity = None;
+		}
+		result
+	}
+
+	fn scan_inner(
+		&mut self,
+		path: &RepoPath,
+		config: Option<ShowUntrackedFilesConfig>,
+	) -> Result<(Vec<StatusItem>, Vec<StatusItem>)> {
+		use std::hash::{Hash, Hasher};
+		let fresh = repo(path)?;
+		let mut identity =
+			std::collections::hash_map::DefaultHasher::new();
+		fresh.path().hash(&mut identity);
+		fresh.workdir().hash(&mut identity);
+		fresh
+			.head()
+			.ok()
+			.map(|head| (head.name_bytes().to_vec(), head.target()))
+			.hash(&mut identity);
+		let cfg = fresh.config()?;
+		let mut entries = cfg.entries(None)?;
+		while let Some(entry) = entries.next() {
+			let entry = entry?;
+			entry.name_bytes().hash(&mut identity);
+			entry.value_bytes().hash(&mut identity);
+		}
+		let mut environment: Vec<_> = std::env::vars_os()
+			.filter(|(name, _)| {
+				name.to_string_lossy()
+					.to_ascii_uppercase()
+					.starts_with("GIT_")
+			})
+			.collect();
+		environment.sort();
+		for entry in &environment {
+			entry.hash(&mut identity);
+		}
+		let identity = identity.finish();
+		if self.identity != Some(identity)
+			|| self.repository.is_none()
+		{
+			self.repository = Some(fresh);
+			self.identity = Some(identity);
+		}
+		// Soft index refresh remains enabled in get_status_split_repo, so external
+		// staging/reset and atomic index replacements are visible on the next scan.
+		let cached = self.repository.as_ref().ok_or_else(|| {
+			Error::Generic(
+				"status repository cache unavailable".into(),
+			)
+		})?;
+		get_status_split_repo(cached, config)
+	}
+}
+
 /// Fetch staged and worktree changes in one repository status walk.
 ///
 /// The first result contains index/tree changes and the second contains
@@ -297,7 +372,13 @@ pub fn get_status_split(
 	scope_time!("get_status_split");
 
 	let repo = repo(repo_path)?;
+	get_status_split_repo(&repo, show_untracked)
+}
 
+fn get_status_split_repo(
+	repo: &git2::Repository,
+	show_untracked: Option<ShowUntrackedFilesConfig>,
+) -> Result<(Vec<StatusItem>, Vec<StatusItem>)> {
 	if repo.is_bare() && !repo.is_worktree() {
 		return Ok((Vec::new(), Vec::new()));
 	}
@@ -305,7 +386,7 @@ pub fn get_status_split(
 	let show_untracked = if let Some(config) = show_untracked {
 		config
 	} else {
-		untracked_files_config_repo(&repo)?
+		untracked_files_config_repo(repo)?
 	};
 
 	let mut options = StatusOptions::default();
@@ -449,6 +530,96 @@ mod tests {
 	};
 	use std::{fs, fs::File, io::Write, path::Path};
 	use tempfile::TempDir;
+
+	#[test]
+	fn reused_status_observes_external_index_head_and_config_changes()
+	{
+		let (_td, external) = repo_init().unwrap();
+		let root = external.path().parent().unwrap();
+		let path: RepoPath = root.to_path_buf().into();
+		fs::write(root.join("tracked.txt"), "initial\n").unwrap();
+		stage_add_file(&path, Path::new("tracked.txt")).unwrap();
+		commit(&path, "initial").unwrap();
+		let initial_head = external.head().unwrap().target().unwrap();
+		let branch_name =
+			external.head().unwrap().name().unwrap().to_owned();
+		let mut scanner = StatusScanner::default();
+		assert_eq!(
+			scanner.scan(&path, None).unwrap(),
+			get_status_split(&path, None).unwrap()
+		);
+		let initial_identity = scanner.identity;
+		fs::write(root.join("tracked.txt"), "changed content\n")
+			.unwrap();
+		stage_add_file(&path, Path::new("tracked.txt")).unwrap();
+		assert_eq!(
+			scanner.scan(&path, None).unwrap(),
+			get_status_split(&path, None).unwrap()
+		);
+		assert_eq!(scanner.identity, initial_identity);
+		assert_eq!(scanner.scan(&path, None).unwrap().0.len(), 1);
+		commit(&path, "external commit").unwrap();
+		assert!(scanner.scan(&path, None).unwrap().0.is_empty());
+		assert_ne!(scanner.identity, initial_identity);
+		external.set_head_detached(initial_head).unwrap();
+		assert_eq!(
+			scanner.scan(&path, None).unwrap(),
+			get_status_split(&path, None).unwrap()
+		);
+		assert_eq!(scanner.scan(&path, None).unwrap().0.len(), 1);
+		external.set_head(&branch_name).unwrap();
+		assert!(scanner.scan(&path, None).unwrap().0.is_empty());
+		fs::write(root.join("untracked.txt"), "new").unwrap();
+		assert_eq!(scanner.scan(&path, None).unwrap().1.len(), 1);
+		external
+			.config()
+			.unwrap()
+			.set_str("status.showUntrackedFiles", "no")
+			.unwrap();
+		assert!(scanner.scan(&path, None).unwrap().1.is_empty());
+		external
+			.config()
+			.unwrap()
+			.set_str("status.showUntrackedFiles", "all")
+			.unwrap();
+		assert_eq!(scanner.scan(&path, None).unwrap().1.len(), 1);
+		let missing: RepoPath =
+			root.join("missing-repository").into();
+		assert!(scanner.scan(&missing, None).is_err());
+		assert!(scanner.repository.is_none());
+		assert_eq!(
+			scanner.scan(&path, None).unwrap(),
+			get_status_split(&path, None).unwrap()
+		);
+	}
+
+	#[test]
+	fn reused_status_observes_ignore_changes_and_separate_workdir() {
+		let (gitdir, _) = repo_init_bare().unwrap();
+		let workdir = TempDir::new().unwrap();
+		let path = RepoPath::Workdir {
+			gitdir: gitdir.path().into(),
+			workdir: workdir.path().into(),
+		};
+		let mut scanner = StatusScanner::default();
+		fs::write(workdir.path().join("new.txt"), "new").unwrap();
+		assert_eq!(scanner.scan(&path, None).unwrap().1.len(), 1);
+		fs::write(workdir.path().join(".gitignore"), "new.txt\n")
+			.unwrap();
+		assert_eq!(
+			scanner.scan(&path, None).unwrap(),
+			get_status_split(&path, None).unwrap()
+		);
+		assert_eq!(
+			scanner.scan(&path, None).unwrap().1[0].path,
+			".gitignore"
+		);
+		fs::remove_file(workdir.path().join(".gitignore")).unwrap();
+		assert_eq!(
+			scanner.scan(&path, None).unwrap().1[0].path,
+			"new.txt"
+		);
+	}
 
 	#[test]
 	fn test_get_status_split_maps_conflicts_only_to_workdir() {

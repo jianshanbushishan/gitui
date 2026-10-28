@@ -1,0 +1,45 @@
+{
+  "before": {
+    "head": "4cac515555a95f20173e9f6d2d92f67f75466d9b",
+    "index_sha256": "fddb1929007120239917d72204bd329894c685a08be7aaa8eb2a382e98883f4c",
+    "index_mtime_ns": 1793155181331162100,
+    "config_sha256": "0e4200c804c94340a8586b6abbc089f17ec2969a835f15a720e126e4acad2be9",
+    "status_hex": ""
+  },
+  "binaries": {
+    "baseline": {
+      "path": "D:\\private\\code2read\\gitui\\target\\status-opt\\baseline.exe",
+      "sha256": "e7feca09a2e771c4800c6edfc6f2c7946e996d7b80e8ca3861284da4bb0c086d"
+    },
+    "candidate": {
+      "path": "D:\\private\\code2read\\gitui\\target\\status-opt\\candidate.exe",
+      "sha256": "38d69fadf5f773e689bdd9c69bd69ed8dd09c582d99e626a11d67d000c842f2e"
+    }
+  },
+  "tracked_files": 30568,
+  "blocks": 3,
+  "rounds_per_process": 23,
+  "warmups_per_process": 2,
+  "backend": "Ratatui TestBackend 160x50; excludes terminal host and polling wait",
+  "after": {
+    "head": "4cac515555a95f20173e9f6d2d92f67f75466d9b",
+    "index_sha256": "fddb1929007120239917d72204bd329894c685a08be7aaa8eb2a382e98883f4c",
+    "index_mtime_ns": 1793155181331162100,
+    "config_sha256": "0e4200c804c94340a8586b6abbc089f17ec2969a835f15a720e126e4acad2be9",
+    "status_hex": ""
+  },
+  "unchanged": true,
+  "source_base_commit": "2d8a26fed3988231a78b5e46cd4ea3d400eef8e3",
+  "source_sha256": {
+    "asyncgit\\src\\sync\\status.rs": "f4d4a6bfbed3e73dc460957013124ae37de78a3be7c17cec0a49270cdd8fdc60",
+    "asyncgit\\src\\status.rs": "0755357894d905b13f20fd722d182e316101089e70456354332d580fed20b7e0",
+    "asyncgit\\src\\linestats.rs": "e29e1cabdf473300b6a39672b6ac12f9819cbc22424f1c0138a87564c7f152d1",
+    "src\\tabs\\status.rs": "38384d1e372dbfd9e72428b5df9d0fe5e9182b21fc6635e8ec5f02b4e65dccbe",
+    "src\\tabs\\status_perf.rs": "1a1a1c2d66af353df3694e5a532cfab617e334ad6e22e593c9bb544880689e5c",
+    "scripts\\perf_status_optimization.py": "a5da28c241b96e6c8121824b26ae087915cd5f966fafa2736696820abf2e9a9b"
+  },
+  "baseline_provenance": "SHA256 equals previous real-repository report UI baseline binary; pre-optimization production code",
+  "profile": "release opt-level=3 LTO=true codegen-units=1 default features",
+  "hardware": "AMD Ryzen 7 9700X 8C/16T; ZHITAI TiPlus7100 2TB NVMe",
+  "comparison_limits": "warm cache, clean repository, actual Status component/TestBackend, no terminal host or polling delay; no compilation concurrent with measurement"
+}

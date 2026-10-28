@@ -74,7 +74,6 @@ fn real_repository_refresh() {
 		}
 		let update_ns = start.elapsed().as_nanos();
 		let mut status_drawn = None;
-		let mut stats_received = false;
 		let mut handler_ns = 0;
 		let mut draw_ns = 0;
 		let mut draw_count = 0;
@@ -88,8 +87,6 @@ fn real_repository_refresh() {
 				AsyncGitNotification::StatusPairChanged
 					| AsyncGitNotification::StatusPairUnchanged
 			);
-			stats_received |=
-				event == AsyncGitNotification::LineStats;
 			let handler_start = Instant::now();
 			status
 				.update_git(event)
@@ -109,7 +106,6 @@ fn real_repository_refresh() {
 				status_drawn = Some(start.elapsed().as_nanos());
 			}
 			if status_drawn.is_some()
-				&& stats_received
 				&& !status.anything_pending()
 				&& receiver.is_empty()
 			{

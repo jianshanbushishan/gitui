@@ -1,0 +1,92 @@
+[
+  {
+    "variant": "baseline",
+    "metric": "status_drawn_ns",
+    "n": 63,
+    "median_ms": 551.4988,
+    "p95_ms": 649.5751,
+    "min_ms": 541.5995,
+    "max_ms": 734.1849
+  },
+  {
+    "variant": "baseline",
+    "metric": "all_jobs_ns",
+    "n": 63,
+    "median_ms": 1126.1976,
+    "p95_ms": 1265.0519,
+    "min_ms": 1110.265,
+    "max_ms": 1433.1209
+  },
+  {
+    "variant": "baseline",
+    "metric": "update_call_ns",
+    "n": 63,
+    "median_ms": 1.1096,
+    "p95_ms": 1.4258,
+    "min_ms": 0.8374,
+    "max_ms": 1.8365
+  },
+  {
+    "variant": "baseline",
+    "metric": "notification_handler_ns",
+    "n": 63,
+    "median_ms": 0.0046,
+    "p95_ms": 0.0186,
+    "min_ms": 0.0041,
+    "max_ms": 0.044
+  },
+  {
+    "variant": "baseline",
+    "metric": "draw_ns",
+    "n": 63,
+    "median_ms": 0.5697,
+    "p95_ms": 0.6959,
+    "min_ms": 0.4544,
+    "max_ms": 0.7745
+  },
+  {
+    "variant": "candidate",
+    "metric": "status_drawn_ns",
+    "n": 63,
+    "median_ms": 495.3596,
+    "p95_ms": 554.5691,
+    "min_ms": 481.398,
+    "max_ms": 630.5423
+  },
+  {
+    "variant": "candidate",
+    "metric": "all_jobs_ns",
+    "n": 63,
+    "median_ms": 495.3606,
+    "p95_ms": 554.5701,
+    "min_ms": 481.3991,
+    "max_ms": 630.5436
+  },
+  {
+    "variant": "candidate",
+    "metric": "update_call_ns",
+    "n": 63,
+    "median_ms": 1.0768,
+    "p95_ms": 1.4482,
+    "min_ms": 0.8524,
+    "max_ms": 1.491
+  },
+  {
+    "variant": "candidate",
+    "metric": "notification_handler_ns",
+    "n": 63,
+    "median_ms": 0.002,
+    "p95_ms": 0.0025,
+    "min_ms": 0.0017,
+    "max_ms": 0.0027
+  },
+  {
+    "variant": "candidate",
+    "metric": "draw_ns",
+    "n": 63,
+    "median_ms": 0.1971,
+    "p95_ms": 0.3205,
+    "min_ms": 0.1837,
+    "max_ms": 0.3435
+  }
+]

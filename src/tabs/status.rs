@@ -928,11 +928,31 @@ impl Status {
 	}
 
 	fn request_line_stats(&mut self) -> Result<()> {
-		if self.git_line_stats.is_pending() {
-			self.line_stats_dirty = true;
-		} else {
-			let _ =
-				self.git_line_stats.fetch(self.line_stats_options)?;
+		let Some(snapshot) = self.changes_fetcher.last_completed()?
+		else {
+			return Ok(());
+		};
+		let staged = !snapshot.staged.is_empty();
+		let unstaged = snapshot
+			.workdir
+			.iter()
+			.any(|item| item.status != StatusItemType::New);
+		let was_pending = self.git_line_stats.is_pending();
+		let result = self.git_line_stats.fetch_scoped(
+			self.line_stats_options,
+			staged,
+			unstaged,
+		)?;
+		self.line_stats_dirty = (staged || unstaged) && was_pending;
+		if !staged {
+			self.staged_line_stats = (0, 0);
+		}
+		if !unstaged {
+			self.unstaged_line_stats = (0, 0);
+		}
+		if let Some(stats) = result {
+			self.staged_line_stats = stats.staged;
+			self.unstaged_line_stats = stats.unstaged;
 		}
 		Ok(())
 	}
@@ -1081,6 +1101,36 @@ mod tests {
 	};
 	use asyncgit::{AsyncGitNotification, StatusItemType};
 	use std::time::{Duration, Instant};
+
+	#[test]
+	fn clean_and_untracked_only_snapshots_skip_line_stats() {
+		use crate::{app::Environment, components::Component};
+		for untracked in [false, true] {
+			let (dir, _repo) = git2_testing::repo_init();
+			if untracked {
+				std::fs::write(dir.path().join("new.txt"), "new\n")
+					.unwrap();
+			}
+			let mut env = Environment::test_env();
+			*env.repo.get_mut() = dir.path().to_path_buf().into();
+			let (sender, receiver) = crossbeam_channel::unbounded();
+			env.sender_git = sender;
+			let (sender, _app_receiver) =
+				crossbeam_channel::unbounded();
+			env.sender_app = sender;
+			let mut status = Status::new(&env);
+			status.staged_line_stats = (10, 20);
+			status.unstaged_line_stats = (30, 40);
+			status.show().unwrap();
+			let event = wait_for_status_scan(&receiver);
+			status.update_git(event).unwrap();
+			assert!(!status.git_line_stats.is_pending());
+			assert!(!status.line_stats_dirty);
+			assert_eq!(status.staged_line_stats, (0, 0));
+			assert_eq!(status.unstaged_line_stats, (0, 0));
+			wait_for_status_jobs(&status);
+		}
+	}
 
 	#[test]
 	fn reset_all_untracked_files_before_first_commit() {
