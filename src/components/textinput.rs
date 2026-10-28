@@ -19,7 +19,9 @@ use ratatui::{
 	widgets::{Clear, Paragraph},
 	Frame,
 };
-use ratatui_textarea::{CursorMove, Input, Key, Scrolling, TextArea};
+use ratatui_textarea::{
+	CursorMove, DataCursor, Input, Key, Scrolling, TextArea,
+};
 use std::cell::Cell;
 use std::cell::OnceCell;
 
@@ -215,7 +217,7 @@ impl TextInputComponent {
 	#[allow(clippy::option_if_let_else)]
 	pub fn cursor(&self) -> Option<(u16, u16)> {
 		let live = self.textarea.as_ref().map(|ta| {
-			let (row, col) = ta.cursor();
+			let DataCursor(row, col) = ta.cursor();
 			(
 				u16::try_from(row).unwrap_or(u16::MAX),
 				u16::try_from(col).unwrap_or(u16::MAX),
@@ -792,7 +794,7 @@ impl Component for TextInputComponent {
 		// can still read it via `cursor()` after hide (used to persist
 		// the commit draft cursor on c-q close).
 		if let Some(ta) = &self.textarea {
-			let (row, col) = ta.cursor();
+			let DataCursor(row, col) = ta.cursor();
 			self.last_cursor.set(Some((
 				u16::try_from(row).unwrap_or(u16::MAX),
 				u16::try_from(col).unwrap_or(u16::MAX),
@@ -905,6 +907,75 @@ mod tests {
 			Some((1, 3)),
 			"cursor should be retained after hide() for draft persistence"
 		);
+	}
+
+	#[test]
+	fn cjk_cursor_survives_edit_and_draft_restore() {
+		let env = Environment::test_env();
+		let mut comp = TextInputComponent::new(&env, "", "", false);
+		comp.set_text("a中🙂b\n中文结束".into());
+		comp.show().unwrap();
+		comp.set_cursor(0, 3);
+		comp.event(&Event::Key(KeyEvent::new(
+			KeyCode::Char('文'),
+			KeyModifiers::empty(),
+		)))
+		.unwrap();
+		assert_eq!(comp.get_text(), "a中🙂文b\n中文结束");
+		assert_eq!(comp.cursor(), Some((0, 4)));
+
+		comp.hide();
+		let (row, col) = comp.cursor().unwrap();
+		comp.show().unwrap();
+		comp.set_cursor(row, col);
+		comp.event(&Event::Key(KeyEvent::new(
+			KeyCode::Backspace,
+			KeyModifiers::empty(),
+		)))
+		.unwrap();
+		assert_eq!(comp.get_text(), "a中🙂b\n中文结束");
+		assert_eq!(comp.cursor(), Some((0, 3)));
+	}
+
+	#[test]
+	fn selection_delete_undo_redo_preserves_multibyte_text() {
+		let env = Environment::test_env();
+		let mut comp = TextInputComponent::new(&env, "", "", false);
+		let text = "中文🙂\n第二行";
+		comp.set_text(text.into());
+		comp.show().unwrap();
+		comp.textarea.as_mut().unwrap().select_all();
+		for (key, modifiers, expected) in [
+			(KeyCode::Backspace, KeyModifiers::empty(), ""),
+			(KeyCode::Char('u'), KeyModifiers::CONTROL, text),
+			(KeyCode::Char('r'), KeyModifiers::CONTROL, ""),
+		] {
+			comp.event(&Event::Key(KeyEvent::new(key, modifiers)))
+				.unwrap();
+			assert_eq!(comp.get_text(), expected);
+		}
+		assert_eq!(comp.cursor(), Some((0, 0)));
+	}
+
+	#[test]
+	fn cjk_cursor_renders_at_the_display_cell() {
+		use ratatui::{backend::TestBackend, Terminal};
+
+		let env = Environment::test_env();
+		let mut comp = TextInputComponent::new(&env, "", "", false);
+		comp.embed();
+		comp.set_text("a中🙂b".into());
+		comp.show().unwrap();
+		comp.set_cursor(0, 2);
+		let mut terminal =
+			Terminal::new(TestBackend::new(20, 3)).unwrap();
+		terminal
+			.draw(|frame| comp.draw(frame, frame.area()).unwrap())
+			.unwrap();
+		let cell = &terminal.backend().buffer()[(3, 0)];
+		assert_eq!(cell.symbol(), "🙂");
+		assert!(cell.modifier.contains(Modifier::REVERSED));
+		assert_eq!(comp.cursor(), Some((0, 2)));
 	}
 
 	#[test]

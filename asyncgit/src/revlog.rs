@@ -485,10 +485,36 @@ mod tests {
 	}
 
 	#[test]
-	#[serial]
 	fn test_env_variables() {
-		let (_td, repo) = repo_init().unwrap();
-		let git_dir = repo.path();
+		const CHILD: &str = "GITUI_TEST_GIT_DIR_CHILD";
+		if std::env::var_os(CHILD).is_none() {
+			let (_td, repo) = repo_init().unwrap();
+			// GIT_DIR is process-wide. Test it in a child so concurrent
+			// status scans cannot be redirected to this temporary repo.
+			let output = std::process::Command::new(
+				std::env::current_exe().unwrap(),
+			)
+			.args([
+				"--exact",
+				"revlog::tests::test_env_variables",
+				"--nocapture",
+			])
+			.env(CHILD, "1")
+			.env("GIT_DIR", repo.path())
+			.output()
+			.unwrap();
+			assert!(
+				output.status.success(),
+				"{}\n{}",
+				String::from_utf8_lossy(&output.stdout),
+				String::from_utf8_lossy(&output.stderr)
+			);
+			return;
+		}
+		let repo = git2::Repository::open(
+			std::env::var_os("GIT_DIR").unwrap(),
+		)
+		.unwrap();
 
 		let (tx_git, _rx_git) = unbounded();
 
@@ -501,8 +527,6 @@ mod tests {
 			duration: Duration::default(),
 		}));
 		let arc_background = Arc::new(AtomicBool::new(false));
-
-		std::env::set_var("GIT_DIR", git_dir);
 
 		let result = AsyncLog::fetch_helper_without_filter(
 			// We pass an empty path, thus testing whether `GIT_DIR`, set above, is taken into account.
@@ -518,8 +542,6 @@ mod tests {
 				.into(),
 			&AtomicBool::new(false),
 		);
-
-		std::env::remove_var("GIT_DIR");
 
 		assert_eq!(result.unwrap(), ());
 	}

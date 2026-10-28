@@ -68,7 +68,7 @@ ratatui = { version = "0.30", default-features = false, features = [
 ratatui-image = { version = "11.0.0", default-features = false, features = [
   "crossterm",
 ] }
-ratatui-textarea = "0.8"
+ratatui-textarea = "0.9.3"
 rayon-core = "1.13"
 resvg = { version = "0.48.1", default-features = false, features = [
   "text",
