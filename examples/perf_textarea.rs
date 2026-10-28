@@ -10,7 +10,9 @@ fn measure(
 	mut operation: impl FnMut(&mut TextArea<'static>) -> usize,
 ) {
 	for _ in 0..3 {
-		black_box(operation(&mut prepare()));
+		let mut area = prepare();
+		black_box(operation(&mut area));
+		black_box(&area);
 	}
 	let mut nanos = 0;
 	let mut checksum = 0;
@@ -19,6 +21,7 @@ fn measure(
 		let mut area = prepare();
 		let start = Instant::now();
 		checksum += black_box(operation(&mut area));
+		black_box(&area);
 		nanos += start.elapsed().as_nanos();
 	}
 	println!("{name},{iterations},{nanos},{checksum}");
