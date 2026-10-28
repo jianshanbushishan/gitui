@@ -237,7 +237,7 @@ pub fn get_status(
 				|change_ref: gix::diff::index::ChangeRef<'_, '_>,
 				 _: &gix::index::State,
 				 _: &gix::index::State|
-				 -> gix::Result<gix::diff::index::Action> {
+				 -> Result<gix::diff::index::Action> {
 					let path = change_ref.fields().0.to_string();
 					let status = change_ref.into();
 
