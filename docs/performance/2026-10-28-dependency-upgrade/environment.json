@@ -1,0 +1,162 @@
+{
+  "created_utc": "2026-10-28T03:44:19Z",
+  "platform": "Windows-11-10.0.26300-SP0",
+  "cpu": "AMD64 Family 26 Model 68 Stepping 0, AuthenticAMD",
+  "python": "3.14.2 (main, Jan 13 2026, 17:36:00) [MSC v.1944 64 bit (AMD64)]",
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)\nbinary: rustc\ncommit-hash: 58cf8f9c35b355199727627d07ae34a4e2846d67\ncommit-date: 2026-10-13\nhost: x86_64-pc-windows-msvc\nrelease: 1.99.1\nLLVM version: 23.1.1\n",
+  "git": "git version 2.56.0.windows.4",
+  "rounds": 21,
+  "warmup_process_triplets": 2,
+  "profile": "release; opt-level=3; lto=true; codegen-units=1; gitui default features; asyncgit default features plus vendor-openssl",
+  "harness_sha256": {
+    "asyncgit/examples/perf_compare.rs": "66328a9795868cce5776f89b8f2b5e6ff41d2a81ba91315866e4ec9f0c141aff",
+    "examples/perf_textarea.rs": "68c282ac7dd7c48f107b5635d727749974184ee531da7e1986421d7915d4fd0a",
+    "scripts/perf_compare.py": "4c74f51811ffb00f652e74c4556841ffb6b6b5a6143e9181c6a31cf988bd6307"
+  },
+  "build_environment": {
+    "CARGO_TARGET_DIR": "D:/private/code2read/gitui/target",
+    "OPENSSL_DIR": "D:/private/code2read/gitui/target/debug/build/openssl-sys-e43dd0a55b1e76ec/out/openssl-build/install",
+    "OPENSSL_NO_VENDOR": "1",
+    "OPENSSL_STATIC": "1",
+    "RUSTFLAGS": null,
+    "CARGO_ENCODED_RUSTFLAGS": null,
+    "RUSTUP_TOOLCHAIN": null
+  },
+  "roots": {
+    "baseline": {
+      "path": "C:\\Users\\jians\\.codex\\worktrees\\dependency-perf-baseline\\gitui",
+      "sha": "061eef1bde8d2363600f5d0b7ab1add43ee8ad88",
+      "git_status": "?? asyncgit/examples/\n?? examples/\n?? scripts/\n",
+      "lock_sha256": "2052947c15c1524afe677efc6b2ee3963ce0452c91c57ffe4cd10d319f9d2f50",
+      "working_tree_patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "versions": {
+        "gix": [
+          "0.86.0"
+        ],
+        "git2": [
+          "0.21.0"
+        ],
+        "ratatui": [
+          "0.30.0"
+        ],
+        "ratatui-textarea": [
+          "0.8.0"
+        ],
+        "image": [
+          "0.25.10"
+        ],
+        "resvg": [
+          "0.48.1"
+        ],
+        "ron": [
+          "0.12.2"
+        ]
+      },
+      "binaries": {
+        "git": {
+          "path": "D:\\private\\code2read\\gitui\\target\\perf-20261028\\binaries\\baseline\\perf_compare.exe",
+          "sha256": "63b04e82d7267a20eaf4457dcbae40c192aeaba62bbbaab9edbfe8f1f0dd8890"
+        },
+        "textarea": {
+          "path": "D:\\private\\code2read\\gitui\\target\\perf-20261028\\binaries\\baseline\\perf_textarea.exe",
+          "sha256": "bec803146db2501e07f5467cfbe5b5f85c4a7ca7783aa3d4d005eec3986b7658"
+        }
+      }
+    },
+    "intermediate": {
+      "path": "C:\\Users\\jians\\.codex\\worktrees\\dependency-perf-intermediate\\gitui",
+      "sha": "1c254d91a5e03eff5e2997bd030ac98694d7857f",
+      "git_status": "?? asyncgit/examples/\n?? examples/\n?? scripts/\n",
+      "lock_sha256": "82563dd63ebe3a790131fb33a4c584f17c154c62ed0c572e7130597ae0cc2fae",
+      "working_tree_patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "versions": {
+        "gix": [
+          "0.86.0"
+        ],
+        "git2": [
+          "0.21.0"
+        ],
+        "ratatui": [
+          "0.30.2"
+        ],
+        "ratatui-textarea": [
+          "0.8.0"
+        ],
+        "image": [
+          "0.25.10"
+        ],
+        "resvg": [
+          "0.48.1"
+        ],
+        "ron": [
+          "0.12.2"
+        ]
+      },
+      "binaries": {
+        "git": {
+          "path": "D:\\private\\code2read\\gitui\\target\\perf-20261028\\binaries\\intermediate\\perf_compare.exe",
+          "sha256": "aacc76a450965cfd40ca817a36ce836042144148288ca95ce85c204e7d163fe6"
+        },
+        "textarea": {
+          "path": "D:\\private\\code2read\\gitui\\target\\perf-20261028\\binaries\\intermediate\\perf_textarea.exe",
+          "sha256": "5a1cc1d344ee91417c60d447763cc07d965e4cd04195aaf6325cda68a830e8b0"
+        }
+      }
+    },
+    "candidate": {
+      "path": "D:\\private\\code2read\\gitui",
+      "sha": "78a8d869bfc18cbc6cf3c6e75d9d42e6026a3383",
+      "git_status": "",
+      "lock_sha256": "bf5e666d9a340a4493243061da69672a55d51d8ea4d24bf87049cf0779c1427d",
+      "working_tree_patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "versions": {
+        "gix": [
+          "0.90.0"
+        ],
+        "git2": [
+          "0.21.0"
+        ],
+        "ratatui": [
+          "0.30.2"
+        ],
+        "ratatui-textarea": [
+          "0.9.3"
+        ],
+        "image": [
+          "0.25.10"
+        ],
+        "resvg": [
+          "0.48.1"
+        ],
+        "ron": [
+          "0.12.2"
+        ]
+      },
+      "binaries": {
+        "git": {
+          "path": "D:\\private\\code2read\\gitui\\target\\perf-20261028\\binaries\\candidate\\perf_compare.exe",
+          "sha256": "22e7e19d24b4deaf3ca961d806b15d57394305e0a9959f018a4e3688c99a6d81"
+        },
+        "textarea": {
+          "path": "D:\\private\\code2read\\gitui\\target\\perf-20261028\\binaries\\candidate\\perf_textarea.exe",
+          "sha256": "242e1f5db72174e98f7d85bfad89a1fe82970637d8743c66ae439e966f870041"
+        }
+      }
+    }
+  },
+  "command": [
+    "scripts/perf_compare.py",
+    "run",
+    "--output",
+    "target/perf-20261028",
+    "--baseline-root",
+    "C:/Users/jians/.codex/worktrees/dependency-perf-baseline/gitui",
+    "--intermediate-root",
+    "C:/Users/jians/.codex/worktrees/dependency-perf-intermediate/gitui",
+    "--candidate-root",
+    "D:/private/code2read/gitui",
+    "--rounds",
+    "21"
+  ],
+  "source_metadata_normalization": "Git source status/diff use explicit -c core.autocrlf=true matching checkout/index EOL policy. Fixture Git config remains isolated core.autocrlf=false. Initial EOL diagnostic metadata and patches preserved separately. No tracked source content delta in any group at measurement time; baseline/intermediate contain only identical new harness files."
+}

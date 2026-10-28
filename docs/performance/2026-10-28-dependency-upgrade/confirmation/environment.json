@@ -1,0 +1,15 @@
+{
+  "completed_utc": "2026-10-28T03:49:45Z",
+  "rounds": 6,
+  "idle_before_seconds": 10,
+  "method": "One of each three-group ordering; same immutable binaries, same iterations and per-operation warmup as primary; no extra discarded process triplets. Backend binary has no filter, so full stdout retained; only history analyzed. Textarea cases all retained. p95 over six round means is the maximum and unstable.",
+  "source_environment": "../environment.json",
+  "binary_hashes": {
+    "binaries\\baseline\\perf_compare.exe": "63b04e82d7267a20eaf4457dcbae40c192aeaba62bbbaab9edbfe8f1f0dd8890",
+    "binaries\\baseline\\perf_textarea.exe": "bec803146db2501e07f5467cfbe5b5f85c4a7ca7783aa3d4d005eec3986b7658",
+    "binaries\\candidate\\perf_compare.exe": "22e7e19d24b4deaf3ca961d806b15d57394305e0a9959f018a4e3688c99a6d81",
+    "binaries\\candidate\\perf_textarea.exe": "242e1f5db72174e98f7d85bfad89a1fe82970637d8743c66ae439e966f870041",
+    "binaries\\intermediate\\perf_compare.exe": "aacc76a450965cfd40ca817a36ce836042144148288ca95ce85c204e7d163fe6",
+    "binaries\\intermediate\\perf_textarea.exe": "5a1cc1d344ee91417c60d447763cc07d965e4cd04195aaf6325cda68a830e8b0"
+  }
+}

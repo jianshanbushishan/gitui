@@ -1,0 +1,17 @@
+{
+  "default": {
+    "passed": 547,
+    "failed": 0,
+    "ignored": 3
+  },
+  "onig": {
+    "passed": 547,
+    "failed": 0,
+    "ignored": 3
+  },
+  "clippy": "cargo clippy --workspace --locked: passed",
+  "production_migration_commit": "67c9bb25",
+  "measured_candidate_commit": "78a8d869",
+  "installed_version_retained": "gitui 0.30.0-1c254d91",
+  "candidate_version": "gitui 0.30.0-38fdd115"
+}

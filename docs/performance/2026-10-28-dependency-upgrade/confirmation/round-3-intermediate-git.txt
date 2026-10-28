@@ -1,0 +1,16 @@
+status_split/clean,10,30408800,0
+status_gix/clean,10,61706000,0
+status_split/dirty,10,29737900,800
+status_gix/dirty,10,61343700,800
+status_split/untracked,10,36138600,2000
+status_gix/untracked,10,64701000,2000
+status_split/staged,10,30732300,800
+status_gix/staged,10,66530500,800
+status_split/large_clean,10,114841300,0
+status_gix/large_clean,10,146546300,0
+status_split/large_dirty,10,105898400,800
+status_gix/large_dirty,10,143028100,800
+diff/workdir,50,133399200,50
+diff/staged,50,90138400,50
+history/gix_walk_300,20,24866200,6000
+history/metadata_300,20,32417500,6000

@@ -1,0 +1,38 @@
+{
+  "clean": {
+    "head": "83b52064f4aac6587b4b88f35804b69bb36f114c",
+    "status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "status_entries": 0,
+    "tracked_files": 2001
+  },
+  "dirty": {
+    "head": "83b52064f4aac6587b4b88f35804b69bb36f114c",
+    "status_sha256": "cb30929badc74ee276999c1eda14af0dc608377885c5a573cbe799e98910ac51",
+    "status_entries": 80,
+    "tracked_files": 2001
+  },
+  "large_clean": {
+    "head": "77079bd16f7e2836ca35416eadba2326ca078c63",
+    "status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "status_entries": 0,
+    "tracked_files": 10001
+  },
+  "large_dirty": {
+    "head": "77079bd16f7e2836ca35416eadba2326ca078c63",
+    "status_sha256": "cb30929badc74ee276999c1eda14af0dc608377885c5a573cbe799e98910ac51",
+    "status_entries": 80,
+    "tracked_files": 10001
+  },
+  "staged": {
+    "head": "83b52064f4aac6587b4b88f35804b69bb36f114c",
+    "status_sha256": "c245fdedd76a06e58bda3f09f362b4786fb28aaedb62da93e3b81f4030ef6b72",
+    "status_entries": 80,
+    "tracked_files": 2001
+  },
+  "untracked": {
+    "head": "83b52064f4aac6587b4b88f35804b69bb36f114c",
+    "status_sha256": "c82234852a1d18acdca69776601681bf04ecf372a34a6865df1e6068194e5540",
+    "status_entries": 200,
+    "tracked_files": 2001
+  }
+}

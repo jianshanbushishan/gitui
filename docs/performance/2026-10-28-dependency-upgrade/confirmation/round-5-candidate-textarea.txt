@@ -1,0 +1,6 @@
+textarea/small/middle_cjk_insert_16,50,882700,3800
+textarea/small/cursor_100,50,1153500,3000
+textarea/small/render_120x40,50,7039400,1600
+textarea/large/middle_cjk_insert_16,50,83503300,6800
+textarea/large/cursor_100,50,2343700,6000
+textarea/large/render_120x40,50,75728500,51200
