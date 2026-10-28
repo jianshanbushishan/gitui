@@ -34,6 +34,9 @@ use ratatui::{
 };
 
 mod file_preview;
+#[cfg(test)]
+#[path = "status_perf.rs"]
+mod perf;
 use file_preview::{PreviewResult, StatusFilePreviewJob};
 
 /// what part of the screen is focused

@@ -1,0 +1,19 @@
+{
+  "before": {
+    "head": "4cac515555a95f20173e9f6d2d92f67f75466d9b",
+    "index_sha256": "fddb1929007120239917d72204bd329894c685a08be7aaa8eb2a382e98883f4c",
+    "index_mtime_ns": 1793155181331162100,
+    "config_sha256": "0e4200c804c94340a8586b6abbc089f17ec2969a835f15a720e126e4acad2be9",
+    "status_hex": ""
+  },
+  "binary_sha256": "5c84341aeb5baa9b08ac57d73ca7eebedf3af483af27ff5675e92d439151b0b5",
+  "ui_binary_sha256": "e7feca09a2e771c4800c6edfc6f2c7946e996d7b80e8ca3861284da4bb0c086d",
+  "after": {
+    "head": "4cac515555a95f20173e9f6d2d92f67f75466d9b",
+    "index_sha256": "fddb1929007120239917d72204bd329894c685a08be7aaa8eb2a382e98883f4c",
+    "index_mtime_ns": 1793155181331162100,
+    "config_sha256": "0e4200c804c94340a8586b6abbc089f17ec2969a835f15a720e126e4acad2be9",
+    "status_hex": ""
+  },
+  "unchanged": true
+}

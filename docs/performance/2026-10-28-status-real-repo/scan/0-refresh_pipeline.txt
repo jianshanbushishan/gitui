@@ -1,0 +1,11 @@
+index_entries=30568,libgit2=(1, 9, 7)
+mode,round,total_ns,open_ns,scan_ns,collect_ns,count
+refresh_pipeline,0,1171149200,0,0,0,0
+refresh_pipeline,1,1134680400,0,0,0,0
+refresh_pipeline,2,1129468200,0,0,0,0
+refresh_pipeline,3,1167818800,0,0,0,0
+refresh_pipeline,4,1148071100,0,0,0,0
+refresh_pipeline,5,1178991800,0,0,0,0
+refresh_pipeline,6,1151737200,0,0,0,0
+refresh_pipeline,7,1315051800,0,0,0,0
+refresh_pipeline,8,1268145100,0,0,0,0

@@ -1,0 +1,29 @@
+{
+  "repo": "D:\\work\\ue_prj\\GT_DemoB",
+  "before": {
+    "head": "4cac515555a95f20173e9f6d2d92f67f75466d9b",
+    "index_sha256": "fddb1929007120239917d72204bd329894c685a08be7aaa8eb2a382e98883f4c",
+    "index_mtime_ns": 1793155181331162100,
+    "config_sha256": "0e4200c804c94340a8586b6abbc089f17ec2969a835f15a720e126e4acad2be9",
+    "status_hex": ""
+  },
+  "tracked_files": 30568,
+  "index_bytes": 4422301,
+  "pack_bytes": 36502410293,
+  "git": "git version 2.56.0.windows.4",
+  "platform": "Windows-11-10.0.26300-SP0",
+  "binary_sha256": "94afb1e9b7f25290070c989fbeba3a96a5fc70e5ddb4d336780380ea01de288c",
+  "blocks": 3,
+  "rounds": 9,
+  "warmups_per_process": 2,
+  "started_utc": "2026-10-28T04:53:13Z",
+  "after": {
+    "head": "4cac515555a95f20173e9f6d2d92f67f75466d9b",
+    "index_sha256": "fddb1929007120239917d72204bd329894c685a08be7aaa8eb2a382e98883f4c",
+    "index_mtime_ns": 1793155181331162100,
+    "config_sha256": "0e4200c804c94340a8586b6abbc089f17ec2969a835f15a720e126e4acad2be9",
+    "status_hex": ""
+  },
+  "unchanged": true,
+  "finished_utc": "2026-10-28T04:56:52Z"
+}

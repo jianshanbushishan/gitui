@@ -1,0 +1,74 @@
+[
+  {
+    "mode": "raw",
+    "n": 21,
+    "median_ms": 557.3845,
+    "p95_ms": 679.8661,
+    "min_ms": 549.9836,
+    "max_ms": 699.7926
+  },
+  {
+    "mode": "reuse",
+    "n": 21,
+    "median_ms": 508.409,
+    "p95_ms": 627.9725,
+    "min_ms": 495.6871,
+    "max_ms": 659.4607
+  },
+  {
+    "mode": "ui_status_drawn",
+    "n": 21,
+    "median_ms": 561.133,
+    "p95_ms": 655.0782,
+    "min_ms": 546.6003,
+    "max_ms": 728.1339
+  },
+  {
+    "mode": "ui_all_jobs",
+    "n": 21,
+    "median_ms": 1156.1322,
+    "p95_ms": 1276.712,
+    "min_ms": 1133.3091,
+    "max_ms": 1490.4725
+  },
+  {
+    "mode": "ui_update_call",
+    "n": 21,
+    "median_ms": 1.11,
+    "p95_ms": 1.347,
+    "min_ms": 0.8583,
+    "max_ms": 1.4194
+  },
+  {
+    "mode": "ui_notification_handler",
+    "n": 21,
+    "median_ms": 0.0046,
+    "p95_ms": 0.0082,
+    "min_ms": 0.0041,
+    "max_ms": 0.0093
+  },
+  {
+    "mode": "ui_draw",
+    "n": 21,
+    "median_ms": 0.5562,
+    "p95_ms": 0.6425,
+    "min_ms": 0.4482,
+    "max_ms": 0.6545
+  },
+  {
+    "mode": "git_preload",
+    "n": 21,
+    "median_ms": 320.36,
+    "p95_ms": 329.2858,
+    "min_ms": 313.2194,
+    "max_ms": 332.4571
+  },
+  {
+    "mode": "git_no_preload",
+    "n": 21,
+    "median_ms": 390.6823,
+    "p95_ms": 397.6757,
+    "min_ms": 380.601,
+    "max_ms": 401.3142
+  }
+]

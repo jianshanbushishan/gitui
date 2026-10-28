@@ -1,0 +1,29 @@
+{
+  "source_commit": "56fdad6e8c2884bcaba25d1c2d3d5c44fda38bd9",
+  "cpu": "AMD Ryzen 7 9700X, 8 cores / 16 threads",
+  "disk": "ZHITAI TiPlus7100 2TB NVMe (D:)",
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "profile": "release; opt-level=3; LTO=true; codegen-units=1",
+  "status_show_untracked_files": "unset (GitUI defaults to All)",
+  "git2": "0.21.0",
+  "libgit2": "1.9.7",
+  "gix": "0.86.0 (not used for Status scan)",
+  "production_changes": false,
+  "ui_backend": "ratatui TestBackend 160x50; real Status component and background jobs; excludes terminal host and polling delay",
+  "target_editor_and_gitui_processes": "none found at initial inventory",
+  "validation": {
+    "release_probe_build": "passed",
+    "clippy_example": "passed (-D warnings)",
+    "status_tests": "14 passed; 1 ignored real-repository probe",
+    "real_repository_probe": "passed; 23 UI refresh rounds, first 2 discarded",
+    "clippy_workspace": "passed",
+    "clippy_tests": "blocked by 580 pre-existing lint diagnostics in existing test code; no diagnostics in new status_perf.rs after cleanup"
+  },
+  "harness_sha256": {
+    "asyncgit/examples/perf_status_real.rs": "14fafb932201f38297ff05a279810fd1605727884c53381ffa1764f71f56d125",
+    "src/tabs/status_perf.rs": "58e625dc64bf55442dd64f6e241df40fb792021f9948b9b39e21b6ff2abe0bb8",
+    "scripts/perf_status_real.py": "7092a4671235ab90cc963add41803e950df91956da216b8d9180dc47cd4acd1b",
+    "scripts/perf_status_confirm.py": "0810b7a198545d259cde85df0f6fec5f32319f47d3ef06fad1dd10926f7a5838"
+  },
+  "measurement_source_note": "Initial scan batch used the same logic before rustfmt/unused-import cleanup and before addition of the paired mode. Confirmation used the final Rust probe; later Python-only guard and documentation edits do not affect measured binaries. UI probe later received documentation, assertion-message and pre-timing setup-helper cleanup; measured operations and boundaries are unchanged."
+}

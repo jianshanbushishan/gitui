@@ -1,0 +1,11 @@
+index_entries=30568,libgit2=(1, 9, 7)
+mode,round,total_ns,open_ns,scan_ns,collect_ns,count
+unstaged_stats,0,578506300,0,0,0,0
+unstaged_stats,1,556943200,0,0,0,0
+unstaged_stats,2,523873100,0,0,0,0
+unstaged_stats,3,523216100,0,0,0,0
+unstaged_stats,4,551141600,0,0,0,0
+unstaged_stats,5,805938900,0,0,0,0
+unstaged_stats,6,823380100,0,0,0,0
+unstaged_stats,7,984973100,0,0,0,0
+unstaged_stats,8,980935400,0,0,0,0
