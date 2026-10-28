@@ -115,7 +115,7 @@ impl PullPopup {
 				self.pending = false;
 				self.hide();
 				self.queue.push(InternalEvent::ShowErrorMsg(
-					format!("fetch failed:\n{error}"),
+					format!("pull failed:\n{error}"),
 				));
 			}
 		}
@@ -152,9 +152,12 @@ impl PullPopup {
 				&self.repo.borrow(),
 				&self.branch,
 			);
-			if let Err(e) = ff_res {
-				log::trace!("ff failed: {e}");
-				self.confirm_merge(branch_compare.behind);
+			match ff_res {
+				Ok(()) => (),
+				Err(asyncgit::Error::FastForwardNotPossible(_)) => {
+					self.confirm_merge(branch_compare.behind);
+				}
+				Err(error) => return Err(error.into()),
 			}
 		}
 
@@ -300,6 +303,194 @@ impl Component for PullPopup {
 mod tests {
 	use super::*;
 	use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+	use git2::{Repository, Signature};
+	use tempfile::TempDir;
+
+	const PULL_FILE: &str = "pull-file.txt";
+
+	fn commit_file(
+		repo: &Repository,
+		reference: &str,
+		content: &[u8],
+	) {
+		let parent = repo.head().unwrap().peel_to_commit().unwrap();
+		let parent_tree = parent.tree().unwrap();
+		let mut builder =
+			repo.treebuilder(Some(&parent_tree)).unwrap();
+		builder
+			.insert(PULL_FILE, repo.blob(content).unwrap(), 0o100_644)
+			.unwrap();
+		let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+		let signature =
+			Signature::now("test", "test@example.com").unwrap();
+		repo.commit(
+			Some(reference),
+			&signature,
+			&signature,
+			"update pull file",
+			&tree,
+			&[&parent],
+		)
+		.unwrap();
+	}
+
+	fn prepare_pull() -> (TempDir, Repository, PullPopup) {
+		let (dir, repo) = git2_testing::repo_init();
+		commit_file(&repo, "HEAD", b"base\n");
+		repo.checkout_head(None).unwrap();
+		let branch =
+			repo.head().unwrap().shorthand().unwrap().to_owned();
+		repo.remote("origin", dir.path().to_str().unwrap()).unwrap();
+		commit_file(
+			&repo,
+			&format!("refs/remotes/origin/{branch}"),
+			b"remote\n",
+		);
+		repo.find_branch(&branch, git2::BranchType::Local)
+			.unwrap()
+			.set_upstream(Some(&format!("origin/{branch}")))
+			.unwrap();
+
+		let env = Environment::test_env();
+		*env.repo.borrow_mut() = dir.path().to_path_buf().into();
+		let mut popup = PullPopup::new(&env);
+		popup.branch = branch;
+		popup.show().unwrap();
+		(dir, repo, popup)
+	}
+
+	#[test]
+	fn pull_fastforwards_without_confirmation() {
+		let (dir, repo, mut popup) = prepare_pull();
+		let upstream = repo
+			.revparse_single(&format!("origin/{}", popup.branch))
+			.unwrap()
+			.id();
+
+		popup.try_ff_merge().unwrap();
+
+		assert_eq!(repo.head().unwrap().target(), Some(upstream));
+		assert_eq!(
+			std::fs::read(dir.path().join(PULL_FILE)).unwrap(),
+			b"remote\n"
+		);
+		assert!(popup.queue.pop().is_none());
+		assert!(!popup.is_visible());
+	}
+
+	#[test]
+	fn pull_confirms_merge_for_diverged_branches() {
+		let (_dir, repo, mut popup) = prepare_pull();
+		commit_file(&repo, "HEAD", b"local\n");
+
+		popup.try_ff_merge().unwrap();
+
+		assert!(matches!(
+			popup.queue.pop(),
+			Some(InternalEvent::ConfirmAction(Action::PullMerge {
+				incoming: 1,
+				..
+			}))
+		));
+		assert!(popup.queue.pop().is_none());
+	}
+
+	#[test]
+	fn pull_respects_no_fastforward_preference() {
+		let (_dir, repo, mut popup) = prepare_pull();
+		repo.config().unwrap().set_bool("merge.ff", false).unwrap();
+
+		popup.try_ff_merge().unwrap();
+
+		assert!(matches!(
+			popup.queue.pop(),
+			Some(InternalEvent::ConfirmAction(
+				Action::PullMerge { .. }
+			))
+		));
+		assert!(popup.queue.pop().is_none());
+	}
+
+	#[test]
+	fn pull_propagates_checkout_failure_without_merge_confirmation() {
+		let (dir, repo, mut popup) = prepare_pull();
+		let head = repo.head().unwrap().target();
+		std::fs::write(
+			dir.path().join(PULL_FILE),
+			b"unsaved changes\n",
+		)
+		.unwrap();
+
+		let error = popup.try_ff_merge().unwrap_err();
+
+		assert!(matches!(
+			error.downcast_ref::<asyncgit::Error>(),
+			Some(asyncgit::Error::Git(_))
+		));
+		assert_eq!(repo.head().unwrap().target(), head);
+		assert_eq!(
+			std::fs::read(dir.path().join(PULL_FILE)).unwrap(),
+			b"unsaved changes\n"
+		);
+		assert!(popup.queue.pop().is_none());
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn pull_reports_file_in_use_without_merge_confirmation() {
+		use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
+
+		let (dir, repo, mut popup) = prepare_pull();
+		let head = repo.head().unwrap().target();
+		let remote_dir = TempDir::new().unwrap();
+		let remote = Repository::clone(
+			dir.path().to_str().unwrap(),
+			remote_dir.path(),
+		)
+		.unwrap();
+		commit_file(&remote, "HEAD", b"remote\n");
+		repo.remote_set_url(
+			"origin",
+			remote_dir.path().to_str().unwrap(),
+		)
+		.unwrap();
+		let (sender, receiver) = crossbeam_channel::unbounded();
+		popup.git_fetch =
+			AsyncPull::new(popup.repo.borrow().clone(), &sender);
+		// Allow status reads, but deny checkout writes and deletion.
+		let locked = OpenOptions::new()
+			.read(true)
+			.share_mode(1)
+			.open(dir.path().join(PULL_FILE))
+			.unwrap();
+
+		popup.fetch(popup.branch.clone()).unwrap();
+		while popup.is_visible() {
+			let event = receiver
+				.recv_timeout(std::time::Duration::from_secs(10))
+				.unwrap();
+			popup.update_git(event);
+		}
+
+		let Some(InternalEvent::ShowErrorMsg(message)) =
+			popup.queue.pop()
+		else {
+			panic!(
+				"expected a pull error instead of merge confirmation"
+			);
+		};
+		assert!(message.starts_with("pull failed:\n"), "{message}");
+		let os_reason = std::io::Error::from_raw_os_error(32);
+		// The Windows message is localized; compare with the system's text.
+		let reason = os_reason.to_string();
+		let reason = reason.split(" (os error").next().unwrap();
+		assert!(message.contains(PULL_FILE), "{message}");
+		assert!(message.contains(reason.trim()), "{message}");
+		assert_eq!(repo.head().unwrap().target(), head);
+		assert!(!popup.any_work_pending());
+		assert!(popup.queue.pop().is_none());
+		drop(locked);
+	}
 
 	#[test]
 	fn escape_from_credentials_cancels_pull() {

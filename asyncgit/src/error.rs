@@ -85,6 +85,10 @@ pub enum Error {
 	#[error("`{0}`")]
 	Generic(String),
 
+	/// A fast-forward is unavailable or disabled; a merge is required.
+	#[error("git: {0}")]
+	FastForwardNotPossible(&'static str),
+
 	///
 	#[error("git: no head found")]
 	NoHead,
