@@ -907,6 +907,31 @@ mod tests {
 	}
 
 	#[test]
+	fn finder_keeps_repeated_nested_selections_visible() {
+		let env = Environment::test_env();
+		let mut component = RevisionFilesComponent::new(&env, None);
+		let paths = [
+			Path::new("./docs/nested/guide.md"),
+			Path::new("./docs/index.md"),
+			Path::new("./src/main.rs"),
+		];
+		component.tree =
+			FileTree::new(&paths, &BTreeSet::new()).unwrap();
+
+		for path in ["./docs/nested/guide.md", "./docs/nested/"] {
+			for _ in 0..2 {
+				component.find_file(Path::new(path));
+				assert!(component
+					.tree
+					.iterate(0, usize::MAX)
+					.any(|(item, selected)| selected
+						&& item.info().full_path()
+							== Path::new(path)));
+			}
+		}
+	}
+
+	#[test]
 	fn directory_history_opens_for_selected_directory() {
 		let env = Environment::test_env();
 		let mut files = RevisionFilesComponent::new(&env, None);

@@ -199,16 +199,17 @@ impl FileTree {
 			.iter()
 			.position(|item| item.info().full_path() == path);
 
-		if new_selection == self.selection {
-			return false;
-		}
+		let changed = new_selection != self.selection;
 
 		self.selection = new_selection;
 		if let Some(selection) = self.selection {
-			self.items.show_element(selection);
+			// Collapsing the tree can hide an unchanged selection.
+			if changed || !self.is_visible_index(selection) {
+				self.items.show_element(selection);
+			}
 		}
 		self.visual_selection = self.calc_visual_selection();
-		true
+		changed
 	}
 
 	fn visual_index_to_absolute(
@@ -344,6 +345,54 @@ mod test {
 	use crate::{FileTree, MoveSelection};
 	use pretty_assertions::assert_eq;
 	use std::{collections::BTreeSet, path::Path};
+
+	#[test]
+	fn test_reselect_visible_root_refreshes_visual_selection() {
+		let items =
+			vec![Path::new("./a/b.txt"), Path::new("./c.txt")];
+		let mut tree =
+			FileTree::new(&items, &BTreeSet::new()).unwrap();
+		tree.collapse_but_root();
+
+		assert!(!tree.select_file(Path::new(".")));
+		assert_eq!(tree.visual_selection().unwrap().index, 0);
+		assert_eq!(tree.visual_selection().unwrap().count, 3);
+	}
+
+	#[test]
+	fn test_reselect_reveals_collapsed_file_and_directory() {
+		let items = vec![
+			Path::new("./a/b/target.txt"),
+			Path::new("./a/other.txt"),
+			Path::new("./root.txt"),
+		];
+
+		for path in
+			[Path::new("./a/b/target.txt"), Path::new("./a/b")]
+		{
+			let mut tree =
+				FileTree::new(&items, &BTreeSet::new()).unwrap();
+			assert!(tree.select_file(path));
+			tree.collapse_but_root();
+			assert!(!tree.selected_item().unwrap().is_visible());
+
+			// The selection stays the same, but its ancestors must reopen.
+			assert!(!tree.select_file(path));
+			assert!(tree.selected_item().unwrap().is_visible());
+			let visible: Vec<_> =
+				tree.iterate(0, usize::MAX).collect();
+			let selected =
+				visible.iter().position(|(_, selected)| *selected);
+			assert_eq!(
+				selected,
+				Some(tree.visual_selection().unwrap().index)
+			);
+			assert_eq!(
+				tree.visual_selection().unwrap().count,
+				visible.len()
+			);
+		}
+	}
 
 	#[test]
 	fn test_selection() {
