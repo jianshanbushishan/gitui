@@ -84,8 +84,8 @@ impl<'a> LogWalker<'a> {
 		let mut count = 0_usize;
 
 		while let Some(c) = self.commits.pop() {
-			for p in c.0.parents() {
-				self.visit(p);
+			for index in 0..c.0.parent_count() {
+				self.visit(c.0.parent(index)?);
 			}
 
 			let id: CommitId = c.0.id().into();
@@ -178,7 +178,8 @@ impl<'a> LogWalkerWithoutFilter<'a> {
 	pub fn read(&mut self, out: &mut Vec<CommitId>) -> Result<usize> {
 		let mut count = 0_usize;
 
-		while let Some(Ok(info)) = self.walk.next() {
+		for info in self.walk.by_ref() {
+			let info = info?;
 			out.push(info.id.into());
 
 			count += 1;
@@ -211,6 +212,29 @@ mod tests {
 	};
 	use pretty_assertions::assert_eq;
 	use std::{fs::File, io::Write, path::Path};
+
+	#[test]
+	fn missing_parent_is_an_error_for_both_walkers() -> Result<()> {
+		let (_td, repo) = repo_init_empty()?;
+		let tree = repo.treebuilder(None)?.write()?;
+		let raw = format!(
+			"tree {tree}\nparent 1111111111111111111111111111111111111111\nauthor Test <test@example.com> 1 +0000\ncommitter Test <test@example.com> 1 +0000\n\nmissing parent\n"
+		);
+		let start = repo
+			.odb()?
+			.write(git2::ObjectType::Commit, raw.as_bytes())?
+			.into();
+		let mut gix_repo = gix::open(repo.path()).unwrap();
+		let mut walker = LogWalkerWithoutFilter::from_commit(
+			&mut gix_repo,
+			100,
+			start,
+		)?;
+		assert!(walker.read(&mut Vec::new()).is_err());
+		let mut walker = LogWalker::from_commit(&repo, 100, start)?;
+		assert!(walker.read(&mut Vec::new()).is_err());
+		Ok(())
+	}
 
 	#[test]
 	fn test_limit() -> Result<()> {

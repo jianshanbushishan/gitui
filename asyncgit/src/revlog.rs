@@ -9,6 +9,7 @@ use crate::{
 use crossbeam_channel::Sender;
 use scopetime::scope_time;
 use std::{
+	collections::HashSet,
 	sync::{
 		atomic::{AtomicBool, Ordering},
 		Arc, Mutex,
@@ -306,28 +307,92 @@ impl AsyncLog {
 		start: CommitId,
 		cancelled: &AtomicBool,
 	) -> Result<()> {
-		let mut repo: gix::Repository = gix_repo(repo_path)?;
-		let mut walker = LogWalkerWithoutFilter::from_commit(
-			&mut repo,
-			LIMIT_COUNT,
-			start,
-		)?;
+		Self::fetch_with_fallback(
+			|published| {
+				let mut repo = gix_repo(repo_path)?;
+				let mut walker = LogWalkerWithoutFilter::from_commit(
+					&mut repo,
+					LIMIT_COUNT,
+					start,
+				)?;
 
+				Self::fetch_batches(
+					|entries| {
+						if cancelled.load(Ordering::Relaxed) {
+							return Ok(0);
+						}
+						let count = walker.read(entries)?;
+						published.extend(entries.iter().copied());
+						Ok(count)
+					},
+					arc_current,
+					arc_background,
+					sender,
+					thread::sleep,
+				)?;
+
+				log::trace!("revlog visited: {}", walker.visited());
+				Ok(())
+			},
+			|published| {
+				Self::fetch_helper_fallback(
+					repo_path,
+					arc_current,
+					arc_background,
+					sender,
+					start,
+					cancelled,
+					&published,
+				)
+			},
+			cancelled,
+		)
+	}
+
+	fn fetch_helper_fallback(
+		repo_path: &RepoPath,
+		current: &Mutex<AsyncLogResult>,
+		background: &AtomicBool,
+		sender: &Sender<AsyncGitNotification>,
+		start: CommitId,
+		cancelled: &AtomicBool,
+		published: &HashSet<CommitId>,
+	) -> Result<()> {
+		let repo = repo(repo_path)?;
+		let mut walker =
+			LogWalker::from_commit(&repo, LIMIT_COUNT, start)?;
 		Self::fetch_batches(
 			|entries| {
 				if cancelled.load(Ordering::Relaxed) {
-					Ok(0)
-				} else {
-					walker.read(entries)
+					return Ok(0);
 				}
+				let count = walker.read(entries)?;
+				// UI consumers may already have extracted earlier batches.
+				// Keep those IDs separately to avoid publishing them twice.
+				entries.retain(|id| !published.contains(id));
+				Ok(count)
 			},
-			arc_current,
-			arc_background,
+			current,
+			background,
 			sender,
 			thread::sleep,
-		)?;
+		)
+	}
 
-		log::trace!("revlog visited: {}", walker.visited());
+	fn fetch_with_fallback(
+		primary: impl FnOnce(&mut HashSet<CommitId>) -> Result<()>,
+		fallback: impl FnOnce(HashSet<CommitId>) -> Result<()>,
+		cancelled: &AtomicBool,
+	) -> Result<()> {
+		let mut published = HashSet::new();
+		if let Err(error) = primary(&mut published) {
+			log::error!(
+				"gix log traversal failed; falling back to libgit2: {error:?}"
+			);
+			if !cancelled.load(Ordering::Relaxed) {
+				return fallback(published);
+			}
+		}
 
 		Ok(())
 	}
@@ -402,6 +467,142 @@ mod tests {
 	use crate::AsyncLog;
 
 	use super::AsyncLogResult;
+
+	#[test]
+	fn fallback_resumes_after_published_or_extracted_batches() {
+		for extract in [false, true] {
+			let (_td, repo) = repo_init().unwrap();
+			let path: RepoPath =
+				repo.workdir().unwrap().to_path_buf().into();
+			let head = repo.head().unwrap().target().unwrap().into();
+			let tip = append_to_reference(
+				&repo,
+				"refs/heads/feature",
+				head,
+				"feature",
+			);
+			let (sender, receiver) = unbounded();
+			let log = AsyncLog::new(path.clone(), &sender, None);
+			let extracted = std::cell::RefCell::new(Vec::new());
+			AsyncLog::fetch_with_fallback(
+				|published| {
+					let mut first_batch = true;
+					AsyncLog::fetch_batches(
+						|entries| {
+							if std::mem::take(&mut first_batch) {
+								entries.push(tip);
+								published.insert(tip);
+								Ok(1)
+							} else {
+								// A partially read failing batch is not published.
+								entries.push(head);
+								Err(crate::Error::Generic(
+									"injected gix read failure"
+										.into(),
+								))
+							}
+						},
+						&log.current,
+						&log.background,
+						&sender,
+						|_| {
+							if extract {
+								extracted.borrow_mut().extend(
+									log.extract_items().unwrap(),
+								);
+							}
+						},
+					)
+				},
+				|published| {
+					assert_eq!(
+						published,
+						[tip].into_iter().collect()
+					);
+					AsyncLog::fetch_helper_fallback(
+						&path,
+						&log.current,
+						&log.background,
+						&sender,
+						tip,
+						&log.cancelled,
+						&published,
+					)
+				},
+				&log.cancelled,
+			)
+			.unwrap();
+			let mut commits = extracted.into_inner();
+			commits.extend(log.extract_items().unwrap());
+			assert_eq!(commits, vec![tip, head]);
+			assert!(!receiver.is_empty());
+			assert_eq!(
+				repo.head().unwrap().target(),
+				Some(head.into())
+			);
+		}
+	}
+
+	#[test]
+	fn fallback_handles_initialization_failure() {
+		let (_td, repo) = repo_init().unwrap();
+		let path: RepoPath =
+			repo.workdir().unwrap().to_path_buf().into();
+		let head = repo.head().unwrap().target().unwrap().into();
+		let (sender, _receiver) = unbounded();
+		let log = AsyncLog::new(path.clone(), &sender, None);
+		AsyncLog::fetch_with_fallback(
+			|_| Err(crate::Error::Generic("gix init failed".into())),
+			|published| {
+				assert!(published.is_empty());
+				AsyncLog::fetch_helper_fallback(
+					&path,
+					&log.current,
+					&log.background,
+					&sender,
+					head,
+					&log.cancelled,
+					&published,
+				)
+			},
+			&log.cancelled,
+		)
+		.unwrap();
+		assert_eq!(log.get_items().unwrap(), vec![head]);
+	}
+
+	#[test]
+	fn fallback_is_skipped_after_success_or_cancellation() {
+		for cancelled in [false, true] {
+			AsyncLog::fetch_with_fallback(
+				|_| {
+					if cancelled {
+						Err(crate::Error::Generic(
+							"gix failed".into(),
+						))
+					} else {
+						Ok(())
+					}
+				},
+				|_| panic!("fallback should not run"),
+				&AtomicBool::new(cancelled),
+			)
+			.unwrap();
+		}
+	}
+
+	#[test]
+	fn fallback_failure_is_propagated() {
+		let result = AsyncLog::fetch_with_fallback(
+			|_| Err(crate::Error::Generic("gix failed".into())),
+			|_| Err(crate::Error::Generic("libgit2 failed".into())),
+			&AtomicBool::new(false),
+		);
+		assert!(matches!(
+			result,
+			Err(crate::Error::Generic(message)) if message == "libgit2 failed"
+		));
+	}
 
 	#[test]
 	fn published_batches_are_unlocked_during_pause() {

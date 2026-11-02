@@ -52,6 +52,10 @@ pub enum GixError {
 	RevisionWalk(#[from] gix::revision::walk::Error),
 
 	///
+	#[error("gix::revision::walk::iter error: {0}")]
+	RevisionWalkIter(#[from] gix::revision::walk::iter::Error),
+
+	///
 	#[error("gix::status::Error error: {0}")]
 	Status(#[from] Box<gix::status::Error>),
 
@@ -273,6 +277,12 @@ impl From<gix::reference::iter::init::Error> for Error {
 
 impl From<gix::revision::walk::Error> for Error {
 	fn from(error: gix::revision::walk::Error) -> Self {
+		Self::Gix(GixError::from(error))
+	}
+}
+
+impl From<gix::revision::walk::iter::Error> for Error {
+	fn from(error: gix::revision::walk::iter::Error) -> Self {
 		Self::Gix(GixError::from(error))
 	}
 }
