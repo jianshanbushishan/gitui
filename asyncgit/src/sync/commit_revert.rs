@@ -17,6 +17,11 @@ pub fn revert_commit(
 	let repo = repo(repo_path)?;
 
 	let commit = repo.find_commit(commit.into())?;
+	super::lfs::guard(
+		&repo,
+		"Revert",
+		Some(&commit.id().to_string()),
+	)?;
 
 	repo.revert(&commit, None)?;
 

@@ -39,6 +39,11 @@ pub fn conflict_free_rebase(
 	repo: &git2::Repository,
 	commit: &git2::AnnotatedCommit,
 ) -> Result<CommitId> {
+	super::lfs::guard(
+		repo,
+		"Rebase",
+		Some(&commit.id().to_string()),
+	)?;
 	let mut rebase = repo.rebase(None, Some(commit), None, None)?;
 	let signature =
 		crate::sync::commit::signature_allow_undefined_name(repo)?;
@@ -82,6 +87,11 @@ pub fn rebase(
 	repo: &git2::Repository,
 	commit: &git2::AnnotatedCommit,
 ) -> Result<RebaseState> {
+	super::lfs::guard(
+		repo,
+		"Rebase",
+		Some(&commit.id().to_string()),
+	)?;
 	let mut rebase = repo.rebase(None, Some(commit), None, None)?;
 	let signature =
 		crate::sync::commit::signature_allow_undefined_name(repo)?;
@@ -110,6 +120,7 @@ pub fn rebase(
 pub fn continue_rebase(
 	repo: &git2::Repository,
 ) -> Result<RebaseState> {
+	super::lfs::guard(repo, "Rebase", None)?;
 	let mut rebase = repo.open_rebase(None)?;
 	let signature =
 		crate::sync::commit::signature_allow_undefined_name(repo)?;
@@ -176,6 +187,7 @@ pub fn get_rebase_progress(
 
 ///
 pub fn abort_rebase(repo: &git2::Repository) -> Result<()> {
+	super::lfs::guard(repo, "Rebase", None)?;
 	let mut rebase = repo.open_rebase(None)?;
 
 	rebase.abort()?;

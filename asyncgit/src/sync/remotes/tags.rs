@@ -2,7 +2,7 @@
 
 use super::push::AsyncProgress;
 use crate::{
-	error::Result,
+	error::{Error, Result},
 	progress::ProgressPercent,
 	sync::{
 		cred::BasicAuthCredential,
@@ -59,7 +59,7 @@ fn remote_tag_refs(
 	let mut remote = repo.find_remote(remote)?;
 	let callbacks = Callbacks::new(None, basic_credential);
 	let conn = remote.connect_auth(
-		Direction::Fetch,
+		Direction::Push,
 		Some(callbacks.callbacks()),
 		Some(proxy_auto()),
 	)?;
@@ -104,54 +104,88 @@ pub fn tags_missing_remote(
 }
 
 ///
+#[cfg(test)]
 pub fn push_tags(
 	repo_path: &RepoPath,
 	remote: &str,
 	basic_credential: Option<BasicAuthCredential>,
 	progress_sender: Option<Sender<PushTagsProgress>>,
 ) -> Result<()> {
+	push_tags_with_hook(
+		repo_path,
+		remote,
+		basic_credential,
+		progress_sender,
+		None,
+	)
+}
+
+pub fn push_tags_with_hook(
+	repo_path: &RepoPath,
+	remote: &str,
+	basic_credential: Option<BasicAuthCredential>,
+	progress_sender: Option<Sender<PushTagsProgress>>,
+	hook_progress: Option<git2_hooks::HookProgress<'_>>,
+) -> Result<()> {
 	scope_time!("push_tags");
-
-	progress_sender
-		.as_ref()
-		.map(|sender| sender.send(PushTagsProgress::CheckRemote));
-
+	if let Some(sender) = &progress_sender {
+		let _ = sender.send(PushTagsProgress::CheckRemote);
+	}
 	let tags_missing = tags_missing_remote(
 		repo_path,
 		remote,
 		basic_credential.clone(),
 	)?;
-
 	let repo = repo(repo_path)?;
-	let mut remote = repo.find_remote(remote)?;
-
+	let configured_remote = repo.find_remote(remote)?;
+	let url = configured_remote
+		.pushurl()?
+		.unwrap_or(configured_remote.url()?)
+		.to_owned();
+	// The local libgit2 transport uses remote.url even when pushurl is set.
+	// Bind both advertisement and transfer to the effective push destination.
+	let mut remote_handle = if url == configured_remote.url()? {
+		configured_remote
+	} else {
+		repo.remote_anonymous(&url)?
+	};
 	let total = tags_missing.len();
-
-	progress_sender.as_ref().map(|sender| {
-		sender.send(PushTagsProgress::Push { pushed: 0, total })
-	});
-
-	for (idx, tag) in tags_missing.into_iter().enumerate() {
+	if let Some(sender) = &progress_sender {
+		let _ =
+			sender.send(PushTagsProgress::Push { pushed: 0, total });
+	}
+	if total != 0 {
 		let mut options = PushOptions::new();
-		let callbacks =
-			Callbacks::new(None, basic_credential.clone());
-		options.remote_callbacks(callbacks.callbacks());
-		options.packbuilder_parallelism(0);
-		options.proxy_options(proxy_auto());
-		remote.push(&[tag.as_str()], Some(&mut options))?;
-
-		progress_sender.as_ref().map(|sender| {
-			sender.send(PushTagsProgress::Push {
-				pushed: idx + 1,
-				total,
+		let callbacks = Callbacks::new(None, basic_credential);
+		let mut remote_callbacks = callbacks.callbacks();
+		remote_callbacks.push_negotiation(|updates| {
+			crate::sync::hooks::negotiated_pre_push(
+				&repo,
+				remote,
+				&url,
+				updates,
+				hook_progress,
+			)
+			.map_err(|error| {
+				git2::Error::from_str(&error.to_string())
 			})
 		});
+		options.remote_callbacks(remote_callbacks);
+		options.packbuilder_parallelism(0);
+		options.proxy_options(proxy_auto());
+		// One negotiation and hook invocation for the exact set of tags sent.
+		remote_handle.push(&tags_missing, Some(&mut options))?;
+		if let Some((reference, message)) =
+			callbacks.get_stats()?.push_rejected_msg
+		{
+			return Err(Error::Generic(format!(
+				"push to '{reference}' rejected: {message}"
+			)));
+		}
 	}
-
-	drop(basic_credential);
-
-	progress_sender.map(|sender| sender.send(PushTagsProgress::Done));
-
+	if let Some(sender) = progress_sender {
+		let _ = sender.send(PushTagsProgress::Done);
+	}
 	Ok(())
 }
 
@@ -171,6 +205,46 @@ mod tests {
 	};
 	use pretty_assertions::assert_eq;
 	use sync::tests::write_commit_file;
+
+	#[test]
+	fn tags_use_push_destination_when_fetch_url_differs() {
+		let (local_dir, local) =
+			crate::sync::tests::repo_init().unwrap();
+		let (fetch_dir, fetch_remote) = repo_init_bare().unwrap();
+		let (push_dir, push_remote) = repo_init_bare().unwrap();
+		let commit = local.head().unwrap().peel_to_commit().unwrap();
+		local
+			.tag_lightweight("release", commit.as_object(), false)
+			.unwrap();
+		local
+			.remote("origin", fetch_dir.path().to_str().unwrap())
+			.unwrap();
+		local
+			.find_remote("origin")
+			.unwrap()
+			.push(&["refs/tags/release"], None)
+			.unwrap();
+		assert!(fetch_remote
+			.find_reference("refs/tags/release")
+			.is_ok());
+		local
+			.remote_set_pushurl(
+				"origin",
+				Some(push_dir.path().to_str().unwrap()),
+			)
+			.unwrap();
+		push_tags(
+			&RepoPath::Path(local_dir.path().to_owned()),
+			"origin",
+			None,
+			None,
+		)
+		.unwrap();
+		assert_eq!(
+			push_remote.refname_to_id("refs/tags/release").unwrap(),
+			commit.id()
+		);
+	}
 
 	#[test]
 	fn test_push_pull_tags() {

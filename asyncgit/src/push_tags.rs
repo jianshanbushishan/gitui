@@ -2,7 +2,7 @@ use crate::{
 	error::{Error, Result},
 	sync::{
 		cred::BasicAuthCredential,
-		remotes::tags::{push_tags, PushTagsProgress},
+		remotes::tags::{push_tags_with_hook, PushTagsProgress},
 		RepoPath,
 	},
 	AsyncGitNotification, RemoteProgress,
@@ -30,6 +30,7 @@ struct PushState {}
 pub struct AsyncPushTags {
 	state: Arc<Mutex<Option<PushState>>>,
 	last_result: Arc<Mutex<Option<String>>>,
+	hook_progress: Arc<Mutex<Option<String>>>,
 	progress: Arc<Mutex<Option<PushTagsProgress>>>,
 	sender: Sender<AsyncGitNotification>,
 	repo: RepoPath,
@@ -45,6 +46,7 @@ impl AsyncPushTags {
 			repo,
 			state: Arc::new(Mutex::new(None)),
 			last_result: Arc::new(Mutex::new(None)),
+			hook_progress: Arc::new(Mutex::new(None)),
 			progress: Arc::new(Mutex::new(None)),
 			sender: sender.clone(),
 		}
@@ -68,6 +70,11 @@ impl AsyncPushTags {
 		Ok(*res)
 	}
 
+	/// Current pre-push phase or latest hook output; absent during Git transfer.
+	pub fn hook_progress(&self) -> Result<Option<String>> {
+		Ok(self.hook_progress.lock()?.clone())
+	}
+
 	///
 	pub fn request(&self, params: PushTagsRequest) -> Result<()> {
 		log::trace!("request");
@@ -77,8 +84,12 @@ impl AsyncPushTags {
 		}
 
 		self.set_request(&params)?;
+		*self.last_result.lock()? = None;
+		*self.hook_progress.lock()? =
+			Some("Running pre-push hook".into());
 		RemoteProgress::set_progress(&self.progress, None)?;
 
+		let hook_progress = Arc::clone(&self.hook_progress);
 		let arc_state = Arc::clone(&self.state);
 		let arc_res = Arc::clone(&self.last_result);
 		let arc_progress = Arc::clone(&self.progress);
@@ -95,15 +106,67 @@ impl AsyncPushTags {
 				arc_progress,
 			);
 
-			let res = push_tags(
+			let last_hook_notification =
+				Mutex::new(None::<std::time::Instant>);
+			let notify_hook = |output: &[u8]| {
+				if output.is_empty() {
+					if let Ok(mut state) = hook_progress.lock() {
+						*state = None;
+					}
+					let _ = sender
+						.try_send(AsyncGitNotification::PushTags);
+					return;
+				}
+				let text = String::from_utf8_lossy(output);
+				let latest = text
+					.split(['\r', '\n'])
+					.rev()
+					.find(|line| !line.trim().is_empty())
+					.unwrap_or("");
+				// Avoid terminal control characters and bound the UI label.
+				let latest: String = latest
+					.chars()
+					.filter(|c| !c.is_control())
+					.take(240)
+					.collect();
+				if !latest.is_empty() {
+					if let Ok(mut state) = hook_progress.lock() {
+						*state = Some(latest);
+					}
+					if let Ok(mut last) =
+						last_hook_notification.lock()
+					{
+						let now = std::time::Instant::now();
+						if last.is_none_or(|previous| {
+							now.duration_since(previous)
+								>= std::time::Duration::from_millis(
+									33,
+								)
+						}) {
+							let _ = sender.try_send(
+								AsyncGitNotification::PushTags,
+							);
+							*last = Some(now);
+						}
+					}
+				}
+			};
+			let _ = sender.try_send(AsyncGitNotification::PushTags);
+			let res = push_tags_with_hook(
 				&repo,
 				params.remote.as_str(),
 				params.basic_credential.clone(),
-				Some(progress_sender),
+				Some(progress_sender.clone()),
+				Some(&notify_hook),
 			);
+			// Ensure the receiver finishes when the hook or transfer fails.
+			let _ = progress_sender.send(PushTagsProgress::Done);
 
 			handle.join().expect("joining thread failed");
 
+			if let Ok(mut state) = hook_progress.lock() {
+				*state = None;
+			}
 			Self::set_result(&arc_res, res).expect("result error");
 
 			Self::clear_request(&arc_state).expect("clear error");

@@ -24,6 +24,7 @@ pub fn stage_lines(
 	}
 
 	let repo = repo(repo_path)?;
+	super::ensure_partial_edit_allowed(&repo, file_path)?;
 	// log::debug!("stage_lines: {:?}", lines);
 
 	let mut index = repo.index()?;

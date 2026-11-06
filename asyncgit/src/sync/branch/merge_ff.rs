@@ -21,6 +21,11 @@ pub fn branch_merge_upstream_fastforward(
 
 	let upstream_commit =
 		upstream.into_reference().peel_to_commit()?;
+	super::super::lfs::guard(
+		&repo,
+		"Pull",
+		Some(&upstream_commit.id().to_string()),
+	)?;
 
 	let annotated =
 		repo.find_annotated_commit(upstream_commit.id())?;

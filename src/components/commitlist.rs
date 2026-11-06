@@ -8,14 +8,12 @@ use crate::{
 	keys::{key_match, SharedKeyConfig},
 	queue::{InternalEvent, Queue},
 	strings::{self, symbol},
-	try_or_popup,
 	ui::style::{SharedTheme, Theme},
 	ui::{calc_scroll_top, draw_scrollbar, Orientation},
 };
 use anyhow::Result;
 use asyncgit::sync::{
-	self, checkout_commit, BranchDetails, BranchInfo, CommitId,
-	RepoPathRef, Tags,
+	self, BranchDetails, BranchInfo, CommitId, RepoPathRef, Tags,
 };
 use chrono::{DateTime, Local};
 use crossterm::event::Event;
@@ -195,11 +193,11 @@ impl CommitList {
 		if let Some(commit_hash) =
 			self.selected_entry().map(|entry| entry.id)
 		{
-			try_or_popup!(
-				self,
-				"failed to checkout commit:",
-				checkout_commit(&self.repo.borrow(), commit_hash)
-			);
+			self.queue.push(InternalEvent::RepoOperation(
+				crate::repo_operation::RepoOperation::CheckoutCommit(
+					commit_hash,
+				),
+			));
 		}
 	}
 

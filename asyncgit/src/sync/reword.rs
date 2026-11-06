@@ -16,6 +16,11 @@ pub fn reword(
 	message: &str,
 ) -> Result<CommitId> {
 	let repo = repo(repo_path)?;
+	super::lfs::guard(
+		&repo,
+		"Reword",
+		Some(&commit.get_oid().to_string()),
+	)?;
 	let config = repo.config()?;
 
 	let sign = config.get_bool("commit.gpgsign").unwrap_or(false);

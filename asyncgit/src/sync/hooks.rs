@@ -7,7 +7,7 @@ use crate::{
 			push_default_strategy_config_repo,
 			PushDefaultStrategyConfig,
 		},
-		remotes::{proxy_auto, tags::tags_missing_remote, Callbacks},
+		remotes::{proxy_auto, Callbacks},
 	},
 };
 use git2::{BranchType, Direction, Oid};
@@ -32,16 +32,25 @@ impl From<git2_hooks::HookResult> for HookResult {
 				if response.is_successful() {
 					Self::Ok
 				} else {
-					Self::NotOk(if response.stderr.is_empty() {
-						response.stdout
-					} else if response.stdout.is_empty() {
-						response.stderr
-					} else {
-						format!(
-							"{}\n{}",
-							response.stdout, response.stderr
-						)
-					})
+					Self::NotOk(
+						if response.stderr.is_empty()
+							&& response.stdout.is_empty()
+						{
+							format!(
+								"hook exited with status {}",
+								response.code
+							)
+						} else if response.stderr.is_empty() {
+							response.stdout
+						} else if response.stdout.is_empty() {
+							response.stderr
+						} else {
+							format!(
+								"{}\n{}",
+								response.stdout, response.stderr
+							)
+						},
+					)
 				}
 			}
 		}
@@ -165,6 +174,23 @@ pub fn hooks_pre_push(
 	push: &PrePushTarget<'_>,
 	basic_credential: Option<crate::sync::cred::BasicAuthCredential>,
 ) -> Result<HookResult> {
+	hooks_pre_push_with_progress(
+		repo_path,
+		remote,
+		push,
+		basic_credential,
+		None,
+	)
+}
+
+/// Run a pre-push hook, forwarding live output without losing failure details.
+pub fn hooks_pre_push_with_progress(
+	repo_path: &RepoPath,
+	remote: &str,
+	push: &PrePushTarget<'_>,
+	basic_credential: Option<crate::sync::cred::BasicAuthCredential>,
+	progress: Option<git2_hooks::HookProgress<'_>>,
+) -> Result<HookResult> {
 	scope_time!("hooks_pre_push");
 
 	let repo = repo(repo_path)?;
@@ -173,6 +199,31 @@ pub fn hooks_pre_push(
 		None,
 		git2_hooks::HOOK_PRE_PUSH,
 	)? {
+		let sources = match push {
+			PrePushTarget::Branch { branch, delete } => {
+				if *delete {
+					Vec::new()
+				} else {
+					vec![format!("refs/heads/{branch}")]
+				}
+			}
+			PrePushTarget::Tag { tag, delete } => {
+				if *delete {
+					Vec::new()
+				} else {
+					vec![format!("refs/tags/{tag}")]
+				}
+			}
+			PrePushTarget::Tags => repo
+				.references_glob("refs/tags/*")?
+				.map(|reference| {
+					reference.and_then(|reference| {
+						reference.name().map(str::to_owned)
+					})
+				})
+				.collect::<std::result::Result<Vec<_>, _>>()?,
+		};
+		super::lfs::ensure_push_hook(&repo, sources, &[])?;
 		return Ok(HookResult::Ok);
 	}
 
@@ -207,19 +258,105 @@ pub fn hooks_pre_push(
 				&advertised,
 			)?]
 		}
+		PrePushTarget::Tag { tag, delete } => {
+			let reference = format!("refs/tags/{tag}");
+			let oid = if *delete {
+				None
+			} else {
+				Some(repo.refname_to_id(&reference)?)
+			};
+			vec![PrePushRef::new(
+				reference.clone(),
+				oid,
+				reference.clone(),
+				advertised.get(&reference).copied(),
+			)]
+		}
 		PrePushTarget::Tags => {
-			pre_push_tag_updates(repo_path, remote, &advertised)?
+			pre_push_tag_updates(repo_path, &advertised)?
 		}
 	};
 
-	Ok(git2_hooks::hooks_pre_push(
+	Ok(git2_hooks::hooks_pre_push_with_progress(
 		&repo,
 		None,
 		Some(remote),
 		&url,
 		&updates,
+		progress,
 	)?
 	.into())
+}
+
+/// Run against the immutable updates selected by libgit2 on this push connection.
+pub fn negotiated_pre_push(
+	repo: &git2::Repository,
+	remote: &str,
+	url: &str,
+	updates: &[git2::PushUpdate<'_>],
+	progress: Option<git2_hooks::HookProgress<'_>>,
+) -> Result<()> {
+	let updates = updates
+		.iter()
+		.filter(|update| update.src() != update.dst())
+		.map(|update| {
+			let local = update.dst();
+			let old = update.src();
+			Ok(PrePushRef::new(
+				if local.is_zero() {
+					"(delete)"
+				} else {
+					update.src_refname()?
+				},
+				(!local.is_zero()).then_some(local),
+				update.dst_refname()?,
+				(!old.is_zero()).then_some(old),
+			))
+		})
+		.collect::<Result<Vec<_>>>()?;
+	if !git2_hooks::hook_available(
+		repo,
+		None,
+		git2_hooks::HOOK_PRE_PUSH,
+	)? {
+		super::lfs::ensure_push_hook(
+			repo,
+			updates.iter().filter_map(|update| {
+				update.local_oid.map(|oid| oid.to_string())
+			}),
+			&updates
+				.iter()
+				.filter_map(|update| update.remote_oid)
+				.collect::<Vec<_>>(),
+		)?;
+		if let Some(progress) = progress {
+			progress(&[]);
+		}
+		return Ok(());
+	}
+	let result: HookResult =
+		git2_hooks::hooks_pre_push_with_progress(
+			repo,
+			None,
+			Some(remote),
+			url,
+			&updates,
+			progress,
+		)?
+		.into();
+	match result {
+		HookResult::Ok => {
+			if let Some(progress) = progress {
+				progress(&[]);
+			}
+			Ok(())
+		}
+		HookResult::NotOk(error) => {
+			Err(crate::error::Error::Generic(format!(
+				"pre-push hook failed:\n{error}"
+			)))
+		}
+	}
 }
 
 /// Build a single pre-push update line for a branch.
@@ -232,14 +369,16 @@ fn pre_push_branch_update(
 ) -> Result<PrePushRef> {
 	let repo = repo(repo_path)?;
 	let local_ref = format!("refs/heads/{branch_name}");
-	let local_oid = (!delete)
-		.then(|| {
-			repo.find_branch(branch_name, BranchType::Local)
-				.ok()
-				.and_then(|branch| branch.get().peel_to_commit().ok())
-				.map(|commit| commit.id())
-		})
-		.flatten();
+	let local_oid = if delete {
+		None
+	} else {
+		Some(
+			repo.find_branch(branch_name, BranchType::Local)?
+				.get()
+				.peel_to_commit()?
+				.id(),
+		)
+	};
 
 	let remote_oid = advertised.get(remote_ref).copied();
 
@@ -251,27 +390,27 @@ fn pre_push_branch_update(
 /// Build pre-push updates for tags that are missing on the remote.
 fn pre_push_tag_updates(
 	repo_path: &RepoPath,
-	remote: &str,
 	advertised: &HashMap<String, Oid>,
 ) -> Result<Vec<PrePushRef>> {
 	let repo = repo(repo_path)?;
-	let tags = tags_missing_remote(repo_path, remote, None)?;
-	let mut updates = Vec::with_capacity(tags.len());
-
-	for tag_ref in tags {
-		if let Ok(reference) = repo.find_reference(&tag_ref) {
-			let tag_oid = reference.target().or_else(|| {
-				reference.peel_to_commit().ok().map(|c| c.id())
-			});
-			let remote_ref = tag_ref.clone();
-			let advertised_oid = advertised.get(&remote_ref).copied();
-			updates.push(PrePushRef::new(
-				tag_ref.clone(),
-				tag_oid,
-				remote_ref,
-				advertised_oid,
-			));
+	let mut updates = Vec::new();
+	for reference in repo.references_glob("refs/tags/*")? {
+		let reference = reference?;
+		let name = reference.name()?.to_owned();
+		if advertised.contains_key(&name) {
+			continue;
 		}
+		let oid = reference.resolve()?.target().ok_or_else(|| {
+			crate::error::Error::Generic(format!(
+				"tag '{name}' has no target"
+			))
+		})?;
+		updates.push(PrePushRef::new(
+			name.clone(),
+			Some(oid),
+			name,
+			None,
+		));
 	}
 
 	Ok(updates)
@@ -284,6 +423,13 @@ pub enum PrePushTarget<'a> {
 		/// Local branch name being pushed.
 		branch: &'a str,
 		/// Whether this is a delete push.
+		delete: bool,
+	},
+	/// Push or delete one tag.
+	Tag {
+		/// Tag name without refs/tags/.
+		tag: &'a str,
+		/// Whether this is a deletion.
 		delete: bool,
 	},
 	/// Push tags.

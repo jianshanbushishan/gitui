@@ -23,6 +23,11 @@ pub fn merge_upstream_commit(
 	let upstream = branch.upstream()?;
 
 	let upstream_commit = upstream.get().peel_to_commit()?;
+	super::super::lfs::guard(
+		&repo,
+		"Pull",
+		Some(&upstream_commit.id().to_string()),
+	)?;
 
 	let annotated_upstream = repo
 		.reference_to_annotated_commit(&upstream.into_reference())?;

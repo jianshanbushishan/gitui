@@ -241,7 +241,20 @@ These are the high level goals before calling out `1.0`:
 
 * visualize branching structure in log tab ([#81](https://github.com/gitui-org/gitui/issues/81))
 * interactive rebase ([#32](https://github.com/gitui-org/gitui/issues/32))
-- no git-lfs support (see [#2812](https://github.com/gitui-org/gitui/issues/2812))
+
+### Git LFS
+
+Install Git and Git LFS and configure the repository with `git lfs install --local`.
+GitUI supports LFS status and pointer metadata, whole-file staging and restore,
+branch checkout, and branch/tag push via the repository's pre-push hook.
+Checkout uses locally cached objects. Press `Ctrl+L` to open Git LFS and
+download objects for the current commit or restore existing pointers from cache.
+A custom pre-push hook must invoke Git LFS for uploads to run.
+LFS transfers use Git's credential configuration. Extension-filtered LFS files
+require an existing commit for local restoration.
+
+Use Git on the command line for LFS stash, merge, rebase, revert, reword, hard
+reset and other unsupported worktree operations. LFS files are staged as a whole.
 
 ## 5. <a name="limitations"></a> Known Limitations <small><sup>[Top ▲](#table-of-contents)</sup></small>
 

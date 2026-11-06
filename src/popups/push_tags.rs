@@ -16,8 +16,8 @@ use asyncgit::{
 			extract_username_password, need_username_password,
 			BasicAuthCredential,
 		},
-		get_default_remote, hooks_pre_push, AsyncProgress,
-		HookResult, PushTagsProgress, RepoPathRef,
+		get_default_remote, AsyncProgress, PushTagsProgress,
+		RepoPathRef,
 	},
 	AsyncGitNotification, AsyncPushTags, PushTagsRequest,
 };
@@ -85,22 +85,6 @@ impl PushTagsPopup {
 		cred: Option<BasicAuthCredential>,
 	) -> Result<()> {
 		let remote = get_default_remote(&self.repo.borrow())?;
-
-		let repo = self.repo.borrow();
-		if let HookResult::NotOk(e) = hooks_pre_push(
-			&repo,
-			&remote,
-			&asyncgit::sync::PrePushTarget::Tags,
-			cred.clone(),
-		)? {
-			log::error!("pre-push hook failed: {e}");
-			self.queue.push(InternalEvent::ShowErrorMsg(format!(
-				"pre-push hook failed:\n{e}"
-			)));
-			self.pending = false;
-			self.visible = false;
-			return Ok(());
-		}
 
 		self.pending = true;
 		self.progress = None;
@@ -178,9 +162,12 @@ impl DrawableComponent for PushTagsPopup {
 	fn draw(&self, f: &mut Frame, rect: Rect) -> Result<()> {
 		if self.visible {
 			let (state, progress) =
-				Self::get_progress(self.progress.as_ref());
+				self.git_push.hook_progress()?.map_or_else(
+					|| Self::get_progress(self.progress.as_ref()),
+					|message| (format!("Pre-push: {message}"), 0),
+				);
 
-			let area = ui::centered_rect_absolute(30, 3, f.area());
+			let area = ui::centered_rect_absolute(70, 3, f.area());
 
 			f.render_widget(Clear, area);
 			f.render_widget(

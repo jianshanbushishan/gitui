@@ -226,6 +226,9 @@ pub fn get_staged_line_stats(
 	scope_time!("get_staged_line_stats");
 
 	let repo = repo(repo_path)?;
+	if super::lfs::is_repo(&repo)? {
+		return lfs_line_stats(&repo, true, options);
+	}
 	let diff = staged_diff_raw(&repo, options)?;
 	diff_line_stats(&diff)
 }
@@ -302,8 +305,50 @@ pub fn get_unstaged_line_stats(
 	scope_time!("get_unstaged_line_stats");
 
 	let repo = repo(repo_path)?;
+	if super::lfs::is_repo(&repo)? {
+		return lfs_line_stats(&repo, false, options);
+	}
 	let diff = unstaged_diff_raw(&repo, options)?;
 	diff_line_stats(&diff)
+}
+
+fn lfs_line_stats(
+	repo: &Repository,
+	staged: bool,
+	options: Option<DiffOptions>,
+) -> Result<(usize, usize)> {
+	let mut args = vec![
+		"diff",
+		"--numstat",
+		"-z",
+		"--no-renames",
+		"--no-ext-diff",
+		"--no-textconv",
+	];
+	if staged {
+		args.push("--cached");
+	}
+	if options.is_some_and(|options| options.ignore_whitespace) {
+		args.push("--ignore-all-space");
+	}
+	// LFS files are whole-file changes. Exclude their data and pointer lines.
+	args.extend(["--", ":(exclude,glob,attr:filter=lfs)**"]);
+	let output = super::lfs::git(repo, args, false)?;
+	let mut added = 0_usize;
+	let mut deleted = 0_usize;
+	for record in output.split(|byte| *byte == 0) {
+		let mut fields = record.splitn(3, |byte| *byte == b'\t');
+		let parse = |field: Option<&[u8]>| {
+			std::str::from_utf8(field?).ok()?.parse::<usize>().ok()
+		};
+		if let (Some(a), Some(d)) =
+			(parse(fields.next()), parse(fields.next()))
+		{
+			added = added.saturating_add(a);
+			deleted = deleted.saturating_add(d);
+		}
+	}
+	Ok((added, deleted))
 }
 
 /// Build a single tree→index diff over the whole repo (no pathspec),

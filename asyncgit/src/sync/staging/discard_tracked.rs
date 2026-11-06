@@ -22,6 +22,7 @@ pub fn discard_lines(
 	}
 
 	let repo = repo(repo_path)?;
+	super::ensure_partial_edit_allowed(&repo, file_path)?;
 	repo.index()?.read(true)?;
 
 	//TODO: check that file is not new (status modified)

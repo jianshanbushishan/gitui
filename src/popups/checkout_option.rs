@@ -2,9 +2,7 @@ use crate::components::{
 	visibility_blocking, CommandBlocking, CommandInfo, Component,
 	DrawableComponent, EventState,
 };
-use crate::queue::{InternalEvent, NeedsUpdate};
 use crate::strings::CheckoutOptions;
-use crate::try_or_popup;
 use crate::{
 	app::Environment,
 	keys::{key_match, SharedKeyConfig},
@@ -12,10 +10,9 @@ use crate::{
 	strings,
 	ui::{self, style::SharedTheme},
 };
+use crate::{queue::InternalEvent, repo_operation::RepoOperation};
 use anyhow::{Ok, Result};
-use asyncgit::sync::branch::checkout_remote_branch;
-use asyncgit::sync::status::discard_status;
-use asyncgit::sync::{checkout_branch, BranchInfo, RepoPath};
+use asyncgit::sync::BranchInfo;
 use crossterm::event::Event;
 use ratatui::{
 	layout::Rect,
@@ -26,7 +23,6 @@ use ratatui::{
 
 pub struct CheckoutOptionPopup {
 	queue: Queue,
-	repo: RepoPath,
 	branch: Option<BranchInfo>,
 	option: CheckoutOptions,
 	visible: bool,
@@ -39,7 +35,6 @@ impl CheckoutOptionPopup {
 	pub fn new(env: &Environment) -> Self {
 		Self {
 			queue: env.queue.clone(),
-			repo: env.repo.borrow().clone(),
 			branch: None,
 			option: CheckoutOptions::KeepLocalChanges,
 			visible: false,
@@ -85,34 +80,20 @@ impl CheckoutOptionPopup {
 		Ok(())
 	}
 
-	fn checkout(&self) -> Result<()> {
-		if let Some(branch) = &self.branch {
-			if branch.is_local() {
-				checkout_branch(&self.repo, &branch.name)?;
-			} else {
-				checkout_remote_branch(&self.repo, branch)?;
-			}
+	fn handle_event(&mut self) {
+		if let Some(branch) = self.branch.take() {
+			self.queue.push(InternalEvent::RepoOperation(
+				RepoOperation::CheckoutBranch {
+					branch,
+					check_changes: false,
+					discard: matches!(
+						self.option,
+						CheckoutOptions::DiscardAllLocalChagnes
+					),
+				},
+			));
 		}
-
-		Ok(())
-	}
-
-	fn handle_event(&mut self) -> Result<()> {
-		match self.option {
-			CheckoutOptions::KeepLocalChanges => {
-				self.checkout()?;
-			}
-			CheckoutOptions::DiscardAllLocalChagnes => {
-				discard_status(&self.repo)?;
-				self.checkout()?;
-			}
-		}
-
-		self.queue.push(InternalEvent::Update(NeedsUpdate::ALL));
-		self.queue.push(InternalEvent::SelectBranch);
 		self.hide();
-
-		Ok(())
 	}
 
 	const fn change_kind(&mut self, incr: bool) {
@@ -212,11 +193,7 @@ impl Component for CheckoutOptionPopup {
 				{
 					self.change_kind(false);
 				} else if key_match(key, self.key_config.keys.enter) {
-					try_or_popup!(
-						self,
-						"checkout error:",
-						self.handle_event()
-					);
+					self.handle_event();
 				}
 			}
 

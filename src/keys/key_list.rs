@@ -52,6 +52,7 @@ pub struct KeysList {
 	pub open_commit_editor: GituiKeyEvent,
 	pub open_help: GituiKeyEvent,
 	pub open_options: GituiKeyEvent,
+	pub open_lfs: GituiKeyEvent,
 	pub move_left: GituiKeyEvent,
 	pub move_right: GituiKeyEvent,
 	pub move_up: GituiKeyEvent,
@@ -160,6 +161,7 @@ impl Default for KeysList {
 			open_commit_editor: GituiKeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
 			open_help: GituiKeyEvent::new(KeyCode::Char('h'),  KeyModifiers::empty()),
 			open_options: GituiKeyEvent::new(KeyCode::Char('o'),  KeyModifiers::empty()),
+			open_lfs: GituiKeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
 			move_left: GituiKeyEvent::new(KeyCode::Left,  KeyModifiers::empty()),
 			move_right: GituiKeyEvent::new(KeyCode::Right,  KeyModifiers::empty()),
 			tree_collapse_recursive: GituiKeyEvent::new(KeyCode::Left,  KeyModifiers::SHIFT),
@@ -251,6 +253,80 @@ impl Default for KeysList {
 }
 
 impl KeysList {
+	/// Navigation is permitted during a repository operation only when the
+	/// same key cannot also dispatch a write in another component. Bindings
+	/// are configurable, and component handlers run before tab navigation.
+	pub fn can_browse_while_busy(&self, key: &KeyEvent) -> bool {
+		let writes = [
+			self.enter,
+			self.stage_unstage_item,
+			self.status_stage_all,
+			self.status_reset_item,
+			self.status_reset_all,
+			self.status_ignore_file,
+			self.diff_stage_lines,
+			self.diff_reset_lines,
+			self.stashing_save,
+			self.stash_apply,
+			self.stash_drop,
+			self.stash_pop,
+			self.log_checkout_commit,
+			self.log_reset_commit,
+			self.log_reword_commit,
+			self.log_tag_commit,
+			self.commit_amend,
+			self.commit,
+			self.create_branch,
+			self.rename_branch,
+			self.delete_branch,
+			self.merge_branch,
+			self.rebase_branch,
+			self.reset_branch,
+			self.delete_tag,
+			self.select_tag,
+			self.tag_annotate,
+			self.push,
+			self.force_push,
+			self.fetch,
+			self.pull,
+			self.abort_merge,
+			self.undo_commit,
+			self.update_remote_name,
+			self.update_remote_url,
+			self.add_remote,
+			self.delete_remote,
+			self.update_submodule,
+			self.view_submodule_parent,
+			self.edit_file,
+			self.external_diff,
+			self.open_commit_editor,
+		];
+		if writes.into_iter().any(|binding| key_match(key, binding)) {
+			return false;
+		}
+		[
+			self.tab_toggle,
+			self.tab_toggle_reverse,
+			self.tab_status,
+			self.tab_log,
+			self.tab_files,
+			self.tab_stashing,
+			self.tab_stashes,
+			self.toggle_workarea,
+			self.move_left,
+			self.move_right,
+			self.move_up,
+			self.move_down,
+			self.page_up,
+			self.page_down,
+			self.home,
+			self.end,
+			self.exit_popup,
+		]
+		.into_iter()
+		.any(|binding| key_match(key, binding))
+	}
+
 	pub fn init(file: PathBuf) -> Self {
 		let mut keys_list = Self::default();
 		if let Ok(f) = File::open(file) {
@@ -280,6 +356,23 @@ mod tests {
 		let patch = ron::de::from_reader(f)
 			.expect("vim style config format incorrect");
 		keys_list.apply(patch);
+	}
+
+	#[test]
+	fn busy_navigation_rejects_overlapping_write_bindings() {
+		let mut keys = KeysList::default();
+		let right = KeyEvent::from(&keys.move_right);
+		let tab = KeyEvent::from(&keys.tab_toggle);
+		assert!(keys.can_browse_while_busy(&right));
+		assert!(keys.can_browse_while_busy(&tab));
+		assert!(!keys.can_browse_while_busy(&KeyEvent::from(
+			&keys.diff_stage_lines,
+		)));
+		keys.diff_stage_lines = keys.move_right;
+		assert!(!keys.can_browse_while_busy(&right));
+		assert!(keys.can_browse_while_busy(&tab));
+		keys.enter = keys.tab_toggle;
+		assert!(!keys.can_browse_while_busy(&tab));
 	}
 
 	#[test]

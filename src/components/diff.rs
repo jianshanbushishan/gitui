@@ -15,6 +15,7 @@ use crate::{
 	keys::{key_match, GituiKeyEvent, SharedKeyConfig},
 	options::SharedOptions,
 	queue::{Action, InternalEvent, NeedsUpdate, Queue, ResetItem},
+	repo_operation::RepoOperation,
 	string_utils::tabs_to_spaces,
 	string_utils::trim_offset,
 	strings, try_or_popup,
@@ -41,7 +42,6 @@ use std::{
 	borrow::Cow,
 	cell::{Cell, RefCell},
 	cmp,
-	path::Path,
 	sync::Arc,
 };
 
@@ -721,10 +721,14 @@ impl DiffComponent {
 		if let Some(diff) = &self.diff {
 			if let Some(hunk) = self.selected_hunk {
 				if diff.untracked {
-					sync::stage_add_file(
-						&self.repo.borrow(),
-						Path::new(&self.current.path),
-					)?;
+					self.queue.push(InternalEvent::RepoOperation(
+						RepoOperation::Stage {
+							path: self.current.path.clone().into(),
+							removed: false,
+							last: false,
+						},
+					));
+					return Ok(());
 				} else if let Some(hunk_data) = diff.hunks.get(hunk) {
 					sync::stage_hunk(
 						&self.repo.borrow(),

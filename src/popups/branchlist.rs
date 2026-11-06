@@ -10,6 +10,7 @@ use crate::{
 	queue::{
 		Action, InternalEvent, NeedsUpdate, Queue, StackablePopupOpen,
 	},
+	repo_operation::RepoOperation,
 	strings, try_or_popup,
 	ui::{self, Size},
 };
@@ -17,13 +18,9 @@ use anyhow::Result;
 use asyncgit::{
 	sync::{
 		self,
-		branch::{
-			checkout_remote_branch, BranchDetails, LocalBranch,
-			RemoteBranch,
-		},
-		checkout_branch, get_branches_info,
-		status::StatusType,
-		BranchInfo, BranchType, CommitId, RepoPathRef, RepoState,
+		branch::{BranchDetails, LocalBranch, RemoteBranch},
+		get_branches_info, BranchInfo, BranchType, CommitId,
+		RepoPathRef, RepoState,
 	},
 	AsyncGitNotification,
 };
@@ -248,6 +245,11 @@ impl Component for BranchListPopup {
 }
 
 impl BranchListPopup {
+	pub fn show_local(&mut self) -> Result<()> {
+		self.local = true;
+		self.open()
+	}
+
 	pub fn new(env: &Environment) -> Self {
 		Self {
 			branches: Vec::new(),
@@ -360,7 +362,7 @@ impl BranchListPopup {
 						branch.reference == selected.reference
 					})
 				})
-				.unwrap_or(usize::from(self.selection));
+				.unwrap_or_else(|| usize::from(self.selection));
 			self.longest_branch_name_width = branches
 				.iter()
 				.map(|branch| branch.name.width())
@@ -554,6 +556,20 @@ impl BranchListPopup {
 		)
 	}
 
+	const fn branch_status_symbol(branch: &BranchInfo) -> char {
+		match branch.details {
+			BranchDetails::Local(LocalBranch {
+				has_upstream,
+				..
+			}) if has_upstream => '↑',
+			BranchDetails::Remote(RemoteBranch {
+				has_tracking,
+				..
+			}) if has_tracking => '↓',
+			_ => ' ',
+		}
+	}
+
 	/// Get branches to display
 	fn get_text(
 		&self,
@@ -561,8 +577,6 @@ impl BranchListPopup {
 		width_available: u16,
 		height: usize,
 	) -> Text<'_> {
-		const UPSTREAM_SYMBOL: char = '\u{2191}';
-		const TRACKING_SYMBOL: char = '\u{2193}';
 		const HEAD_SYMBOL: char = '*';
 		const EMPTY_SYMBOL: char = ' ';
 		const COMMIT_HASH_LENGTH: usize = 8;
@@ -616,17 +630,8 @@ impl BranchListPopup {
 				.is_some_and(|details| details.is_head);
 			let is_head_str =
 				if is_head { HEAD_SYMBOL } else { EMPTY_SYMBOL };
-			let upstream_tracking_str = match displaybranch.details {
-				BranchDetails::Local(LocalBranch {
-					has_upstream,
-					..
-				}) if has_upstream => UPSTREAM_SYMBOL,
-				BranchDetails::Remote(RemoteBranch {
-					has_tracking,
-					..
-				}) if has_tracking => TRACKING_SYMBOL,
-				_ => EMPTY_SYMBOL,
-			};
+			let upstream_tracking_str =
+				Self::branch_status_symbol(displaybranch);
 
 			let span_prefix = Span::styled(
 				format!("{is_head_str}{upstream_tracking_str} "),
@@ -679,35 +684,15 @@ impl BranchListPopup {
 			anyhow::bail!("no valid branch selected");
 		}
 
-		let status = sync::status::get_status(
-			&self.repo.borrow(),
-			StatusType::WorkingDir,
-			None,
-		)
-		.expect("Could not get status");
-
 		let selected_branch = &self.branches[self.selection as usize];
-		if status.is_empty() {
-			if self.local {
-				checkout_branch(
-					&self.repo.borrow(),
-					&selected_branch.name,
-				)?;
-				self.hide();
-			} else {
-				checkout_remote_branch(
-					&self.repo.borrow(),
-					selected_branch,
-				)?;
-				self.local = true;
-				self.update_branches()?;
-			}
-			self.queue.push(InternalEvent::Update(NeedsUpdate::ALL));
-		} else {
-			self.queue.push(InternalEvent::CheckoutOption(
-				selected_branch.clone(),
-			));
-		}
+		self.queue.push(InternalEvent::RepoOperation(
+			RepoOperation::CheckoutBranch {
+				branch: selected_branch.clone(),
+				check_changes: true,
+				discard: false,
+			},
+		));
+		self.hide();
 
 		Ok(())
 	}
@@ -1134,6 +1119,12 @@ mod tests {
 
 	#[test]
 	fn enter_still_checks_out_selected_local_branch() {
+		use crate::repo_operation::{
+			OperationOutcome, PendingOperation,
+		};
+		use crate::AsyncAppNotification;
+		use std::time::Duration;
+
 		let (dir, repo) = git2_testing::repo_init();
 		let commit = repo.head().unwrap().peel_to_commit().unwrap();
 		repo.branch("feature", &commit, false).unwrap();
@@ -1155,15 +1146,35 @@ mod tests {
 			)))
 			.unwrap();
 
+		let Some(InternalEvent::RepoOperation(operation)) =
+			env.queue.pop()
+		else {
+			panic!("checkout was not scheduled");
+		};
+		let (sender, notification) = crossbeam_channel::bounded(1);
+		let pending = PendingOperation::start(
+			env.repo.borrow().clone(),
+			operation,
+			sender,
+		)
+		.unwrap();
+		assert_eq!(
+			notification
+				.recv_timeout(Duration::from_secs(5))
+				.unwrap(),
+			AsyncAppNotification::RepoOperation
+		);
+		assert!(matches!(
+			pending.result().unwrap(),
+			OperationOutcome::CheckoutDone {
+				reopen_branches: false
+			}
+		));
 		assert_eq!(
 			repo.head().unwrap().name().unwrap(),
 			"refs/heads/feature"
 		);
 		assert!(!popup.is_visible());
-		assert!(matches!(
-			env.queue.pop(),
-			Some(InternalEvent::Update(_))
-		));
 		assert!(env.queue.pop().is_none());
 	}
 }

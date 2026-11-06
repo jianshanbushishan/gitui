@@ -11,7 +11,7 @@ use git2::{Delta, Status, StatusOptions, StatusShow};
 use scopetime::scope_time;
 use std::path::Path;
 
-use super::{RepoPath, ShowUntrackedFilesConfig};
+use super::{lfs, RepoPath, ShowUntrackedFilesConfig};
 
 ///
 #[derive(Copy, Clone, Hash, PartialEq, Eq, Debug)]
@@ -141,6 +141,11 @@ pub fn is_workdir_clean(
 	} else {
 		untracked_files_config_repo(&repo)?
 	};
+	if lfs::is_repo(&repo)? {
+		return Ok(get_lfs_status(&repo, show_untracked)?
+			.1
+			.is_empty());
+	}
 
 	let mut options = StatusOptions::default();
 	options
@@ -174,14 +179,24 @@ pub fn get_status(
 	show_untracked: Option<ShowUntrackedFilesConfig>,
 ) -> Result<Vec<StatusItem>> {
 	scope_time!("get_status");
+	let git2_repo = repo(repo_path)?;
+	if lfs::is_repo(&git2_repo)? {
+		let show_untracked = match show_untracked {
+			Some(config) => config,
+			None => untracked_files_config_repo(&git2_repo)?,
+		};
+		return get_lfs_status_by_type(
+			&git2_repo,
+			show_untracked,
+			status_type,
+		);
+	}
 
 	let repo: gix::Repository = gix_repo(repo_path)?;
 
 	let show_untracked = if let Some(config) = show_untracked {
 		config
 	} else {
-		let git2_repo = crate::sync::repository::repo(repo_path)?;
-
 		// Calling `untracked_files_config_repo` ensures compatibility with `gitui` <= 0.27.
 		// `untracked_files_config_repo` defaults to `All` while both `libgit2` and `gix` default to
 		// `Normal`. According to [show-untracked-files], `normal` is the default value that `git`
@@ -285,6 +300,25 @@ pub fn get_status(
 	Ok(res)
 }
 
+fn get_lfs_status_by_type(
+	repo: &git2::Repository,
+	show_untracked: ShowUntrackedFilesConfig,
+	status_type: StatusType,
+) -> Result<Vec<StatusItem>> {
+	let (mut staged, workdir) = get_lfs_status(repo, show_untracked)?;
+	Ok(match status_type {
+		StatusType::Stage => staged,
+		StatusType::WorkingDir => workdir,
+		StatusType::Both => {
+			staged.extend(workdir);
+			staged.sort_by(|a, b| {
+				Path::new(&a.path).cmp(Path::new(&b.path))
+			});
+			staged
+		}
+	})
+}
+
 /// Reuses index/object caches between scans, while reopening when repository
 /// identity, HEAD, configuration or environment changes. A fresh lightweight
 /// handle resolves configuration includes and worktree redirects each time.
@@ -356,7 +390,13 @@ impl StatusScanner {
 				"status repository cache unavailable".into(),
 			)
 		})?;
-		get_status_split_repo(cached, config)
+		// Detection inspects index attributes too. Use the cached index and a
+		// soft refresh so ordinary polling does not reload the full index into
+		// a temporary repository before the actual status scan.
+		if !cached.is_bare() {
+			cached.index()?.read(false)?;
+		}
+		get_status_split_repo(cached, config, lfs::is_repo(cached)?)
 	}
 }
 
@@ -372,12 +412,13 @@ pub fn get_status_split(
 	scope_time!("get_status_split");
 
 	let repo = repo(repo_path)?;
-	get_status_split_repo(&repo, show_untracked)
+	get_status_split_repo(&repo, show_untracked, lfs::is_repo(&repo)?)
 }
 
 fn get_status_split_repo(
 	repo: &git2::Repository,
 	show_untracked: Option<ShowUntrackedFilesConfig>,
+	lfs_repository: bool,
 ) -> Result<(Vec<StatusItem>, Vec<StatusItem>)> {
 	if repo.is_bare() && !repo.is_worktree() {
 		return Ok((Vec::new(), Vec::new()));
@@ -388,6 +429,9 @@ fn get_status_split_repo(
 	} else {
 		untracked_files_config_repo(repo)?
 	};
+	if lfs_repository {
+		return get_lfs_status(repo, show_untracked);
+	}
 
 	let mut options = StatusOptions::default();
 	options
@@ -506,9 +550,112 @@ fn workdir_status_type(status: Status) -> Option<StatusItemType> {
 	}
 }
 
+pub(super) fn get_lfs_status(
+	repo: &git2::Repository,
+	show_untracked: ShowUntrackedFilesConfig,
+) -> Result<(Vec<StatusItem>, Vec<StatusItem>)> {
+	let untracked = match show_untracked {
+		ShowUntrackedFilesConfig::All => "--untracked-files=all",
+		ShowUntrackedFilesConfig::Normal => {
+			"--untracked-files=normal"
+		}
+		ShowUntrackedFilesConfig::No => "--untracked-files=no",
+	};
+	let output = lfs::git(
+		repo,
+		["status", "--porcelain=v2", "-z", "--renames", untracked],
+		false,
+	)?;
+	parse_porcelain_status(&output)
+}
+
+fn parse_porcelain_status(
+	output: &[u8],
+) -> Result<(Vec<StatusItem>, Vec<StatusItem>)> {
+	let mut staged = Vec::new();
+	let mut workdir = Vec::new();
+	let mut records = output.split(|byte| *byte == 0).peekable();
+	let invalid =
+		|| Error::Generic("invalid Git porcelain v2 status".into());
+	while let Some(record) = records.next() {
+		if record.is_empty() && records.peek().is_none() {
+			break;
+		}
+		let kind = record.first().ok_or_else(invalid)?;
+		let field_count = match kind {
+			b'#' | b'!' => continue,
+			b'1' => 9,
+			b'2' => 10,
+			b'u' => 11,
+			b'?' => 2,
+			_ => return Err(invalid()),
+		};
+		let mut fields =
+			record.splitn(field_count, |byte| *byte == b' ');
+		let _ = fields.next();
+		let xy = if *kind == b'?' {
+			b".?".as_slice()
+		} else {
+			fields
+				.next()
+				.filter(|xy| xy.len() == 2)
+				.ok_or_else(invalid)?
+		};
+		let remaining_fields =
+			if *kind == b'?' { 1 } else { field_count - 2 };
+		let path = fields
+			.nth(remaining_fields - 1)
+			.filter(|path| !path.is_empty())
+			.ok_or_else(invalid)?;
+		if *kind == b'2' {
+			// In the NUL format, the destination precedes a separate source path.
+			records.next().ok_or_else(invalid)?;
+		}
+		let path = crate::sync::utils::bytes2string(path)?;
+		if *kind == b'u' {
+			workdir.push(StatusItem {
+				path,
+				status: StatusItemType::Conflicted,
+			});
+			continue;
+		}
+		if let Some(status) = porcelain_status_type(xy[0]) {
+			staged.push(StatusItem {
+				path: path.clone(),
+				status,
+			});
+		}
+		if let Some(status) = porcelain_status_type(xy[1]) {
+			workdir.push(StatusItem { path, status });
+		}
+	}
+	let sort = |items: &mut Vec<StatusItem>| {
+		items.sort_by(|a, b| {
+			Path::new(&a.path).cmp(Path::new(&b.path))
+		});
+	};
+	sort(&mut staged);
+	sort(&mut workdir);
+	Ok((staged, workdir))
+}
+
+const fn porcelain_status_type(status: u8) -> Option<StatusItemType> {
+	match status {
+		b'A' | b'?' | b'C' => Some(StatusItemType::New),
+		b'M' => Some(StatusItemType::Modified),
+		b'D' => Some(StatusItemType::Deleted),
+		b'R' => Some(StatusItemType::Renamed),
+		b'T' => Some(StatusItemType::Typechange),
+		_ => None,
+	}
+}
+
 /// discard all changes in the working directory
 pub fn discard_status(repo_path: &RepoPath) -> Result<bool> {
 	let repo = repo(repo_path)?;
+	if lfs::is_repo(&repo)? {
+		return Err(Error::Generic("Discard before switching branches is unavailable in LFS repositories; discard individual changes first".into()));
+	}
 	let commit = repo.head()?.peel_to_commit()?;
 
 	repo.reset(commit.as_object(), git2::ResetType::Hard, None)?;
@@ -530,6 +677,49 @@ mod tests {
 	};
 	use std::{fs, fs::File, io::Write, path::Path};
 	use tempfile::TempDir;
+
+	#[test]
+	fn porcelain_status_preserves_paths_and_separates_conflicts() {
+		let oid = "0".repeat(40);
+		let output = format!(
+			"1 MM N... 100644 100644 100644 {oid} {oid} both panes.txt\0\
+			2 R. N... 100644 100644 100644 {oid} {oid} R100 renamed\nfile.txt\0old name.txt\0\
+			u UU N... 100644 100644 100644 100644 {oid} {oid} {oid} conflict.txt\0\
+			? untracked directory/\0"
+		);
+		let (staged, workdir) =
+			parse_porcelain_status(output.as_bytes()).unwrap();
+		assert_eq!(
+			staged,
+			vec![
+				StatusItem {
+					path: "both panes.txt".into(),
+					status: StatusItemType::Modified,
+				},
+				StatusItem {
+					path: "renamed\nfile.txt".into(),
+					status: StatusItemType::Renamed,
+				},
+			]
+		);
+		assert_eq!(
+			workdir,
+			vec![
+				StatusItem {
+					path: "both panes.txt".into(),
+					status: StatusItemType::Modified,
+				},
+				StatusItem {
+					path: "conflict.txt".into(),
+					status: StatusItemType::Conflicted,
+				},
+				StatusItem {
+					path: "untracked directory/".into(),
+					status: StatusItemType::New,
+				},
+			]
+		);
+	}
 
 	#[test]
 	fn reused_status_observes_external_index_head_and_config_changes()

@@ -666,6 +666,16 @@ pub mod commands {
 			CMD_GROUP_GENERAL,
 		)
 	}
+	pub fn open_lfs(key_config: &SharedKeyConfig) -> CommandText {
+		CommandText::new(
+			format!(
+				"Git LFS [{}]",
+				key_config.get_hint(key_config.keys.open_lfs)
+			),
+			"show Git LFS information and file download actions",
+			CMD_GROUP_GENERAL,
+		)
+	}
 	pub fn navigate_commit_message(
 		key_config: &SharedKeyConfig,
 	) -> CommandText {

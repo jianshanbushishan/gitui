@@ -7,13 +7,25 @@ pub use stage_tracked::stage_lines;
 pub use stage_untracked::stage_lines_untracked;
 
 use super::{
-	diff::DiffLinePosition, patches::HunkLines, utils::work_dir,
+	diff::DiffLinePosition, lfs, patches::HunkLines, utils::work_dir,
 };
-use crate::error::Result;
+use crate::error::{Error, Result};
 use git2::{DiffLine, DiffLineType, Repository};
-use std::{collections::HashSet, fs::File, io::Read};
+use std::{collections::HashSet, fs::File, io::Read, path::Path};
 
 const NEWLINE: char = '\n';
+
+pub(super) fn ensure_partial_edit_allowed(
+	repo: &Repository,
+	path: &str,
+) -> Result<()> {
+	if lfs::is_path(repo, Path::new(path))? {
+		return Err(Error::Generic(
+			"Git LFS files can only be changed as whole files".into(),
+		));
+	}
+	Ok(())
+}
 
 #[derive(Default)]
 struct NewFromOldContent {

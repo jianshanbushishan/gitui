@@ -115,16 +115,13 @@ impl HookPaths {
 		}
 
 		for p in paths {
-			let p = repo.path().to_path_buf().join(p).join(hook);
+			let p = repo.commondir().join(p).join(hook);
 			if p.exists() {
 				return p;
 			}
 		}
 
-		repo.path()
-			.to_path_buf()
-			.join(DEFAULT_HOOKS_PATH)
-			.join(hook)
+		repo.commondir().join(DEFAULT_HOOKS_PATH).join(hook)
 	}
 
 	/// was a hook file found and is it executable
@@ -159,6 +156,19 @@ impl HookPaths {
 		I: IntoIterator<Item = S> + Copy,
 		S: AsRef<OsStr>,
 	{
+		self.run_hook_with_progress(args, stdin, None)
+	}
+
+	pub fn run_hook_with_progress<I, S>(
+		&self,
+		args: I,
+		stdin: Option<&[u8]>,
+		progress: Option<crate::HookProgress<'_>>,
+	) -> Result<HookResult>
+	where
+		I: IntoIterator<Item = S> + Copy,
+		S: AsRef<OsStr>,
+	{
 		let hook = self.hook.clone();
 		log::trace!(
 			"run hook '{}' in '{}'",
@@ -167,9 +177,15 @@ impl HookPaths {
 		);
 
 		let run_command = |command: &mut Command| {
+			if progress.is_some() {
+				command
+					.env("GIT_TERMINAL_PROMPT", "0")
+					.env("GIT_LFS_FORCE_PROGRESS", "1");
+			}
 			let mut child = command
 				.args(args)
 				.current_dir(&self.pwd)
+				.env("GIT_DIR", &self.git)
 				.with_no_window()
 				.stdin(if stdin.is_some() {
 					std::process::Stdio::piped()
@@ -180,29 +196,7 @@ impl HookPaths {
 				.stderr(std::process::Stdio::piped())
 				.spawn()?;
 
-			if let (Some(mut stdin_handle), Some(input)) =
-				(child.stdin.take(), stdin)
-			{
-				use std::io::{ErrorKind, Write};
-
-				// Write stdin to hook process
-				// Ignore broken pipe - hook may exit early without reading all input
-				let _ =
-					stdin_handle.write_all(input).inspect_err(|e| {
-						match e.kind() {
-							ErrorKind::BrokenPipe => {
-								log::debug!(
-									"Hook closed stdin early"
-								);
-							}
-							_ => log::warn!(
-								"Failed to write stdin to hook: {e}"
-							),
-						}
-					});
-			}
-
-			child.wait_with_output()
+			wait_hook_output(&mut child, stdin, progress)
 		};
 
 		let output = if cfg!(windows) {
@@ -348,10 +342,115 @@ impl CommandExt for Command {
 	}
 }
 
+fn read_hook_output(
+	mut reader: impl std::io::Read,
+	progress: Option<crate::HookProgress<'_>>,
+) -> std::io::Result<Vec<u8>> {
+	const LIMIT: usize = 64 * 1024;
+	let mut output = std::collections::VecDeque::new();
+	let mut buffer = [0; 4096];
+	let mut truncated = false;
+	loop {
+		let count = reader.read(&mut buffer)?;
+		if count == 0 {
+			break;
+		}
+		output.extend(buffer[..count].iter().copied());
+		if let Some(progress) = progress {
+			progress(&buffer[..count]);
+			if output.len() > LIMIT {
+				output.drain(..output.len() - LIMIT);
+				truncated = true;
+			}
+		}
+	}
+	let mut captured = Vec::with_capacity(output.len() + 32);
+	if truncated {
+		captured
+			.extend_from_slice(b"[Earlier hook output omitted]\n");
+	}
+	captured.extend(output);
+	Ok(captured)
+}
+
+fn wait_hook_output(
+	child: &mut std::process::Child,
+	stdin: Option<&[u8]>,
+	progress: Option<crate::HookProgress<'_>>,
+) -> std::io::Result<std::process::Output> {
+	// Drain both pipes concurrently, including while writing stdin. Hooks
+	// can emit transfer progress before consuming all ref updates.
+	std::thread::scope(
+		|scope| -> std::io::Result<std::process::Output> {
+			let stdout = child.stdout.take().expect("piped stdout");
+			let stderr = child.stderr.take().expect("piped stderr");
+			let out = scope
+				.spawn(move || read_hook_output(stdout, progress));
+			let err = scope
+				.spawn(move || read_hook_output(stderr, progress));
+			let mut stdin_error = None;
+			if let (Some(mut stdin_handle), Some(input)) =
+				(child.stdin.take(), stdin)
+			{
+				use std::io::{ErrorKind, Write};
+
+				// Write stdin to hook process
+				// Ignore broken pipe - hook may exit early without reading all input
+				if let Err(error) = stdin_handle.write_all(input) {
+					if error.kind() == ErrorKind::BrokenPipe {
+						log::debug!("Hook closed stdin early");
+					} else {
+						stdin_error = Some(error);
+					}
+				}
+			}
+
+			let status = child.wait()?;
+			let stdout = out.join().expect("stdout reader failed")?;
+			let stderr = err.join().expect("stderr reader failed")?;
+			if let Some(error) = stdin_error {
+				return Err(error);
+			}
+			Ok(std::process::Output {
+				status,
+				stdout,
+				stderr,
+			})
+		},
+	)
+}
+
 #[cfg(test)]
 mod test {
 	use super::HookPaths;
 	use std::path::Path;
+
+	#[test]
+	fn live_output_retains_bounded_tail_and_reports_every_byte() {
+		let mut bytes = vec![b'x'; 200_000];
+		bytes.extend_from_slice(b"final error");
+		let count = std::sync::atomic::AtomicUsize::new(0);
+		let progress = |chunk: &[u8]| {
+			count.fetch_add(
+				chunk.len(),
+				std::sync::atomic::Ordering::Relaxed,
+			);
+		};
+		let output = super::read_hook_output(
+			std::io::Cursor::new(&bytes),
+			Some(&progress),
+		)
+		.unwrap();
+		assert_eq!(
+			count.load(std::sync::atomic::Ordering::Relaxed),
+			bytes.len()
+		);
+		assert!(
+			output.starts_with(b"[Earlier hook output omitted]\n")
+		);
+		assert!(output.ends_with(b"final error"));
+		assert!(output.len() <= 64 * 1024 + 32);
+	}
 
 	#[test]
 	fn test_hookspath_relative() {

@@ -21,6 +21,7 @@ pub fn stage_lines_untracked(
 	}
 
 	let repo = repo(repo_path)?;
+	super::ensure_partial_edit_allowed(&repo, file_path)?;
 	let work_dir = repo.workdir().ok_or_else(|| {
 		crate::error::Error::Generic(String::from("no workdir"))
 	})?;

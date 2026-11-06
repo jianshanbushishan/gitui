@@ -40,6 +40,7 @@ pub fn abort_pending_state(repo_path: &RepoPath) -> Result<()> {
 	scope_time!("abort_pending_state");
 
 	let repo = repo(repo_path)?;
+	super::lfs::guard(&repo, "Aborting the pending operation", None)?;
 
 	reset_stage(repo_path, "*")?;
 	reset_workdir(repo_path, "*")?;
@@ -102,6 +103,11 @@ pub fn merge_branch_repo(
 	branch_type: BranchType,
 ) -> Result<()> {
 	let branch = repo.find_branch(branch, branch_type)?;
+	super::lfs::guard(
+		repo,
+		"Merge",
+		Some(&branch.get().peel_to_commit()?.id().to_string()),
+	)?;
 
 	let annotated =
 		repo.reference_to_annotated_commit(&branch.into_reference())?;

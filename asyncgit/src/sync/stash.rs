@@ -47,6 +47,11 @@ pub fn stash_pop(
 	scope_time!("stash_pop");
 
 	let mut repo = repo(repo_path)?;
+	super::lfs::guard(
+		&repo,
+		"Stash",
+		Some(&stash_id.get_oid().to_string()),
+	)?;
 
 	let index = get_stash_index(&mut repo, stash_id.into())?;
 
@@ -64,6 +69,11 @@ pub fn stash_apply(
 	scope_time!("stash_apply");
 
 	let mut repo = repo(repo_path)?;
+	super::lfs::guard(
+		&repo,
+		"Stash",
+		Some(&stash_id.get_oid().to_string()),
+	)?;
 
 	let index = get_stash_index(&mut repo, stash_id.get_oid())?;
 
@@ -107,6 +117,7 @@ pub fn stash_save(
 	scope_time!("stash_save");
 
 	let mut repo = repo(repo_path)?;
+	super::lfs::guard(&repo, "Stash", None)?;
 
 	let sig = repo.signature()?;
 

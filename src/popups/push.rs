@@ -16,9 +16,9 @@ use asyncgit::{
 			extract_username_password_for_push,
 			need_username_password_for_push, BasicAuthCredential,
 		},
-		get_branch_remote, hooks_pre_push,
+		get_branch_remote,
 		remotes::get_default_remote_for_push,
-		HookResult, RepoPathRef,
+		RepoPathRef,
 	},
 	AsyncGitNotification, AsyncPush, PushRequest, PushType,
 	RemoteProgress, RemoteProgressState,
@@ -148,26 +148,6 @@ impl PushPopup {
 			remote
 		};
 
-		// run pre push hook - can reject push
-		let repo = self.repo.borrow();
-		if let HookResult::NotOk(e) = hooks_pre_push(
-			&repo,
-			&remote,
-			&asyncgit::sync::PrePushTarget::Branch {
-				branch: &self.branch,
-				delete: self.modifier.delete(),
-			},
-			cred.clone(),
-		)? {
-			log::error!("pre-push hook failed: {e}");
-			self.queue.push(InternalEvent::ShowErrorMsg(format!(
-				"pre-push hook failed:\n{e}"
-			)));
-			self.pending = false;
-			self.visible = false;
-			return Ok(());
-		}
-
 		self.pending = true;
 		self.progress = None;
 		self.start_time = Some(Instant::now());
@@ -267,6 +247,9 @@ impl PushPopup {
 	}
 
 	fn gauge_content(&self) -> (String, u16) {
+		if self.git_push.hook_progress().ok().flatten().is_some() {
+			return ("Pre-push / LFS".into(), 0);
+		}
 		self.progress.as_ref().map_or_else(
 			|| (strings::PUSH_POPUP_PROGRESS_NONE.into(), 0),
 			|progress| {
@@ -289,6 +272,9 @@ impl PushPopup {
 	}
 
 	fn detail_line(&self) -> String {
+		if let Ok(Some(message)) = self.git_push.hook_progress() {
+			return format!("{message}{}", self.elapsed_suffix());
+		}
 		self.progress.as_ref().map_or_else(
 			|| {
 				if self.start_time.is_some() {

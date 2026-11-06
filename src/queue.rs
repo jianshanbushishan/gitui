@@ -4,12 +4,12 @@ use crate::{
 		AppOption, BlameFileOpen, FileRevOpen, FileTreeOpen,
 		InspectCommitOpen,
 	},
+	repo_operation::RepoOperation,
 	tabs::StashingOptions,
 };
 use asyncgit::{
 	sync::{
-		diff::DiffLinePosition, BranchInfo, CommitId,
-		LogFilterSearchOptions,
+		diff::DiffLinePosition, CommitId, LogFilterSearchOptions,
 	},
 	PushType,
 };
@@ -88,6 +88,12 @@ pub enum AppTabs {
 ///
 pub enum InternalEvent {
 	///
+	StatusLastFileMoved,
+	///
+	RepoOperation(RepoOperation),
+	///
+	OpenLfs(Option<(String, bool)>),
+	///
 	ConfirmAction(Action),
 	///
 	ConfirmedAction(Action),
@@ -101,8 +107,6 @@ pub enum InternalEvent {
 	ShowInfoLabeledMsg(String, String),
 	///
 	Update(NeedsUpdate),
-	///
-	StatusLastFileMoved,
 	/// open commit msg input
 	OpenCommit,
 	///
@@ -184,8 +188,6 @@ pub enum InternalEvent {
 	OpenGotoLinePopup(usize),
 	///
 	GotoLine(usize),
-	///
-	CheckoutOption(BranchInfo),
 }
 
 /// single threaded simple queue for components to communicate with each other

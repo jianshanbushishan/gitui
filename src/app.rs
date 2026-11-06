@@ -16,7 +16,7 @@ use crate::{
 		ConfirmPopup, ContentSearchPopup, CreateBranchPopup,
 		CreateRemotePopup, ExternalEditorPopup, FetchPopup,
 		FileRevlogPopup, FuzzyFindPopup, GotoLinePopup, HelpPopup,
-		InspectCommitPopup, LogSearchPopupPopup, MsgPopup,
+		InspectCommitPopup, LfsPopup, LogSearchPopupPopup, MsgPopup,
 		OptionsPopup, PullPopup, PushPopup, PushTagsPopup,
 		RemoteListPopup, RenameBranchPopup, RenameRemotePopup,
 		ResetPopup, RevisionFilesPopup, StashMsgPopup,
@@ -26,6 +26,10 @@ use crate::{
 	queue::{
 		Action, AppTabs, InternalEvent, NeedsUpdate, Queue,
 		StackablePopupOpen,
+	},
+	repo_operation::{
+		literal_selection, OperationOutcome, PendingOperation,
+		RepoOperation,
 	},
 	setup_popups,
 	strings::{self, order},
@@ -102,6 +106,9 @@ pub struct App {
 	tags_popup: TagListPopup,
 	reset_popup: ResetPopup,
 	checkout_option_popup: CheckoutOptionPopup,
+	lfs_popup: LfsPopup,
+	repo_operation: Option<PendingOperation>,
+	repo_operation_sender: Sender<AsyncAppNotification>,
 	cmdbar: RefCell<CommandBar>,
 	tab: usize,
 	revlog: Revlog,
@@ -236,6 +243,9 @@ impl App {
 			stashlist_tab: StashList::new(&env),
 			files_tab: FilesTab::new(&env, select_file),
 			checkout_option_popup: CheckoutOptionPopup::new(&env),
+			lfs_popup: LfsPopup::new(&env),
+			repo_operation: None,
+			repo_operation_sender: env.sender_app.clone(),
 			goto_line_popup: GotoLinePopup::new(&env),
 			tab: 0,
 			queue: env.queue,
@@ -304,7 +314,15 @@ impl App {
 		log::trace!("event: {ev:?}");
 
 		if let InputEvent::Input(ev) = ev {
-			if self.check_hard_exit(&ev) || self.check_quit(&ev) {
+			if self.check_hard_exit(&ev)
+				|| (self.repo_operation.is_none()
+					&& self.check_quit(&ev))
+			{
+				return Ok(());
+			}
+			if self.repo_operation.is_some()
+				&& !self.can_browse_while_busy(&ev)
+			{
 				return Ok(());
 			}
 
@@ -357,6 +375,11 @@ impl App {
 				) {
 					self.options_popup.show()?;
 					NeedsUpdate::ALL
+				} else if key_match(k, self.key_config.keys.open_lfs)
+					&& !self.any_popup_visible()
+				{
+					self.open_lfs_menu();
+					NeedsUpdate::COMMANDS
 				} else {
 					NeedsUpdate::empty()
 				};
@@ -366,39 +389,45 @@ impl App {
 
 			self.process_queue(flags)?;
 		} else if let InputEvent::State(polling_state) = ev {
-			self.external_editor_popup.hide();
-			if matches!(polling_state, InputState::Paused) {
-				let result = if let Some((path, diff_type)) =
-					self.diff_to_open.take()
-				{
-					self.open_external_diff(&path, &diff_type)
-				} else if let Some((path, line)) =
-					self.file_to_open.take()
-				{
-					ExternalEditorPopup::open_file_in_editor(
-						&self.repo.borrow(),
-						Path::new(&path),
-						line,
-					)
-				} else {
-					let changes =
-						self.status_tab.get_files_changes()?;
-					self.commit_popup.show_editor(changes)
-				};
-
-				if let Err(e) = result {
-					let msg = format!(
-						"failed to launch external tool:\n{e}"
-					);
-					log::error!("{}", msg.as_str());
-					self.msg_popup.show_error(msg.as_str())?;
-				}
-
-				self.requires_redraw.set(true);
-				self.input.set_polling(true);
-			}
+			self.on_input_state(polling_state)?;
 		}
 
+		Ok(())
+	}
+
+	fn on_input_state(
+		&mut self,
+		polling_state: InputState,
+	) -> Result<()> {
+		self.external_editor_popup.hide();
+		if matches!(polling_state, InputState::Paused) {
+			let result = if let Some((path, diff_type)) =
+				self.diff_to_open.take()
+			{
+				self.open_external_diff(&path, &diff_type)
+			} else if let Some((path, line)) =
+				self.file_to_open.take()
+			{
+				ExternalEditorPopup::open_file_in_editor(
+					&self.repo.borrow(),
+					Path::new(&path),
+					line,
+				)
+			} else {
+				let changes = self.status_tab.get_files_changes()?;
+				self.commit_popup.show_editor(changes)
+			};
+
+			if let Err(e) = result {
+				let msg =
+					format!("failed to launch external tool:\n{e}");
+				log::error!("{}", msg.as_str());
+				self.msg_popup.show_error(msg.as_str())?;
+			}
+
+			self.requires_redraw.set(true);
+			self.input.set_polling(true);
+		}
 		Ok(())
 	}
 
@@ -441,7 +470,14 @@ impl App {
 		ev: AsyncNotification,
 	) -> Result<()> {
 		log::trace!("update_async: {ev:?}");
-		self.status_tab.update_async(ev);
+		self.status_tab.update_async(ev)?;
+		if ev
+			== AsyncNotification::App(
+				AsyncAppNotification::RepoOperation,
+			) {
+			self.finish_repo_operation()?;
+		}
+		self.lfs_popup.update_async(ev);
 		self.commit_popup.update_async(ev);
 		self.inspect_commit_popup.update_async(ev);
 
@@ -488,6 +524,7 @@ impl App {
 	///
 	pub fn any_work_pending(&self) -> bool {
 		self.status_tab.anything_pending()
+			|| self.repo_operation.is_some()
 			|| self.commit_popup.any_work_pending()
 			|| self.revlog.any_work_pending()
 			|| self.stashing_tab.anything_pending()
@@ -554,6 +591,7 @@ impl App {
 			tag_commit_popup,
 			reset_popup,
 			checkout_option_popup,
+			lfs_popup,
 			create_branch_popup,
 			create_remote_popup,
 			rename_remote_popup,
@@ -595,6 +633,7 @@ impl App {
 			tags_popup,
 			reset_popup,
 			checkout_option_popup,
+			lfs_popup,
 			create_branch_popup,
 			rename_branch_popup,
 			revision_files_popup,
@@ -792,6 +831,15 @@ impl App {
 	) -> Result<NeedsUpdate> {
 		let mut flags = NeedsUpdate::empty();
 		match ev {
+			InternalEvent::StatusLastFileMoved => {
+				self.status_tab.last_file_moved()?;
+			}
+			InternalEvent::RepoOperation(operation) => {
+				self.start_repo_operation(operation);
+			}
+			InternalEvent::OpenLfs(file) => {
+				self.lfs_popup.open(file)?;
+			}
 			InternalEvent::ConfirmedAction(action) => {
 				self.process_confirmed_action(action, &mut flags)?;
 			}
@@ -938,9 +986,6 @@ impl App {
 				}
 				flags.insert(NeedsUpdate::ALL);
 			}
-			InternalEvent::StatusLastFileMoved => {
-				self.status_tab.last_file_moved()?;
-			}
 			InternalEvent::OpenFuzzyFinder(contents, target) => {
 				self.fuzzy_find_popup.open(contents, target)?;
 				flags
@@ -1081,9 +1126,6 @@ impl App {
 					self.blame_file_popup.goto_line(line);
 				}
 			}
-			InternalEvent::CheckoutOption(branch) => {
-				self.checkout_option_popup.open(branch)?;
-			}
 		}
 
 		Ok(flags)
@@ -1096,10 +1138,14 @@ impl App {
 	) -> Result<()> {
 		match action {
 			Action::Reset(r) => {
-				self.status_tab.reset(&r);
+				self.start_repo_operation(RepoOperation::Discard(
+					literal_selection(r.path),
+				));
 			}
 			Action::ResetAll => {
-				self.status_tab.reset_all();
+				self.start_repo_operation(RepoOperation::Discard(
+					"*".into(),
+				));
 			}
 			Action::StashDrop(_)
 			| Action::StashPop(_)
@@ -1188,6 +1234,96 @@ impl App {
 
 		flags.insert(NeedsUpdate::ALL);
 
+		Ok(())
+	}
+
+	fn can_browse_while_busy(&self, event: &Event) -> bool {
+		let Event::Key(key) = event else {
+			return false;
+		};
+		self.key_config.keys.can_browse_while_busy(key)
+	}
+
+	fn open_lfs_menu(&self) {
+		let file = if self.status_tab.is_visible() {
+			self.status_tab
+				.selected_status_item()
+				.map(|(item, staged)| (item.path, staged))
+		} else if self.files_tab.is_visible() {
+			self.files_tab
+				.selected_file_path()
+				.map(|path| (path, false))
+		} else {
+			None
+		};
+		self.queue.push(InternalEvent::OpenLfs(file));
+	}
+
+	fn start_repo_operation(&mut self, operation: RepoOperation) {
+		if let Some(pending) = &self.repo_operation {
+			self.queue.push(InternalEvent::ShowErrorMsg(format!(
+				"{} is still in progress.",
+				pending.label
+			)));
+		} else if self.push_popup.any_work_pending()
+			|| self.push_tags_popup.any_work_pending()
+			|| self.pull_popup.any_work_pending()
+		{
+			self.queue.push(InternalEvent::ShowErrorMsg(
+				"Wait for the current remote operation to finish."
+					.into(),
+			));
+		} else {
+			match PendingOperation::start(
+				self.repo.borrow().clone(),
+				operation,
+				self.repo_operation_sender.clone(),
+			) {
+				Ok(pending) => self.repo_operation = Some(pending),
+				Err(error) => self.queue.push(
+					InternalEvent::ShowErrorMsg(error.to_string()),
+				),
+			}
+		}
+		self.requires_redraw.set(true);
+	}
+
+	fn finish_repo_operation(&mut self) -> Result<()> {
+		let Some(operation) = self.repo_operation.take() else {
+			return Ok(());
+		};
+		let label = operation.label;
+		match operation.result() {
+			Ok(OperationOutcome::Done) => {}
+			Ok(OperationOutcome::LastFileMoved) => {
+				self.status_tab.last_file_moved()?;
+			}
+			Ok(OperationOutcome::CheckoutOptions(branch)) => {
+				self.checkout_option_popup.open(branch)?;
+			}
+			Ok(OperationOutcome::CheckoutDone {
+				reopen_branches,
+			}) => {
+				if reopen_branches {
+					self.select_branch_popup.show_local()?;
+				}
+			}
+			Ok(OperationOutcome::LfsDone(message)) => {
+				self.queue
+					.push(InternalEvent::ShowInfoMsg(message.into()));
+			}
+			Err(error) => {
+				self.queue.push(InternalEvent::ShowErrorMsg(
+					format!("{label} failed\n{error}"),
+				));
+			}
+		}
+		self.queue.push(InternalEvent::Update(
+			NeedsUpdate::ALL
+				| NeedsUpdate::DIFF
+				| NeedsUpdate::COMMANDS,
+		));
+		self.requires_redraw.set(true);
 		Ok(())
 	}
 
@@ -1302,6 +1438,16 @@ impl App {
 
 		res.push(
 			CommandInfo::new(
+				strings::commands::open_lfs(&self.key_config),
+				true,
+				!self.any_popup_visible(),
+			)
+			.order(order::NAV)
+			.hidden(),
+		);
+
+		res.push(
+			CommandInfo::new(
 				strings::commands::quit(&self.key_config),
 				true,
 				true,
@@ -1320,8 +1466,18 @@ impl App {
 			horizontal: 1,
 		});
 
+		let status_tab = self.repo_operation.as_ref().map_or_else(
+			|| strings::tab_status(&self.key_config),
+			|operation| {
+				format!(
+					"{} · {}",
+					strings::tab_status(&self.key_config),
+					operation.label
+				)
+			},
+		);
 		let tab_labels = [
-			Span::raw(strings::tab_status(&self.key_config)),
+			Span::raw(status_tab),
 			Span::raw(strings::tab_log(&self.key_config)),
 			Span::raw(strings::tab_files(&self.key_config)),
 			Span::raw(strings::tab_stashing(&self.key_config)),

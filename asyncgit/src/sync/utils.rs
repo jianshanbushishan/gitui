@@ -1,7 +1,8 @@
 //! sync git api (various methods)
 
 use super::{
-	repository::repo, CommitId, RepoPath, ShowUntrackedFilesConfig,
+	lfs, repository::repo, CommitId, RepoPath,
+	ShowUntrackedFilesConfig,
 };
 use crate::{
 	error::{Error, Result},
@@ -10,6 +11,7 @@ use crate::{
 use git2::{IndexAddOption, Repository, RepositoryOpenFlags};
 use scopetime::scope_time;
 use std::{
+	ffi::OsStr,
 	fs::File,
 	io::Write,
 	path::{Path, PathBuf},
@@ -100,6 +102,20 @@ pub fn stage_add_file(
 	scope_time!("stage_add_file");
 
 	let repo = repo(repo_path)?;
+	if lfs::is_path(&repo, path)? || lfs::is_repo(&repo)? {
+		lfs::require_ready(&repo)?;
+		return lfs::git(
+			&repo,
+			[
+				OsStr::new("--literal-pathspecs"),
+				OsStr::new("add"),
+				OsStr::new("--"),
+				path.as_os_str(),
+			],
+			false,
+		)
+		.map(|_| ());
+	}
 
 	let mut index = repo.index()?;
 
@@ -119,14 +135,28 @@ pub fn stage_add_all(
 
 	let repo = repo(repo_path)?;
 
-	let mut index = repo.index()?;
-
 	let stage_untracked = if let Some(config) = stage_untracked {
 		config
 	} else {
 		untracked_files_config_repo(&repo)?
 	};
+	let path = path_or_repo_root(pattern);
+	if lfs::is_repo(&repo)? || lfs::is_any_path(&repo, path)? {
+		lfs::require_ready(&repo)?;
+		let mode = if stage_untracked.include_untracked() {
+			"--all"
+		} else {
+			"--update"
+		};
+		return lfs::git(
+			&repo,
+			["--literal-pathspecs", "add", mode, "--", path],
+			false,
+		)
+		.map(|_| ());
+	}
 
+	let mut index = repo.index()?;
 	if stage_untracked.include_untracked() {
 		index.add_all(
 			vec![pattern],
@@ -140,6 +170,14 @@ pub fn stage_add_all(
 	index.write()?;
 
 	Ok(())
+}
+
+pub(super) fn path_or_repo_root(path: &str) -> &str {
+	if path == "*" {
+		"."
+	} else {
+		path
+	}
 }
 
 /// Undo last commit in repo
@@ -165,6 +203,21 @@ pub fn stage_addremoved(
 	scope_time!("stage_addremoved");
 
 	let repo = repo(repo_path)?;
+	if lfs::is_repo(&repo)? {
+		return lfs::git(
+			&repo,
+			[
+				OsStr::new("--literal-pathspecs"),
+				OsStr::new("rm"),
+				OsStr::new("--cached"),
+				OsStr::new("-f"),
+				OsStr::new("--"),
+				path.as_os_str(),
+			],
+			false,
+		)
+		.map(|_| ());
+	}
 
 	let mut index = repo.index()?;
 

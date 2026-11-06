@@ -215,6 +215,7 @@ pub fn push_branch(
 }
 
 //TODO: cleanup
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn push_raw(
 	repo_path: &RepoPath,
@@ -226,6 +227,31 @@ pub fn push_raw(
 	basic_credential: Option<BasicAuthCredential>,
 	progress_sender: Option<Sender<ProgressNotification>>,
 ) -> Result<()> {
+	push_raw_with_hook(
+		repo_path,
+		remote,
+		branch,
+		ref_type,
+		force,
+		delete,
+		basic_credential,
+		progress_sender,
+		None,
+	)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn push_raw_with_hook(
+	repo_path: &RepoPath,
+	remote: &str,
+	branch: &str,
+	ref_type: PushType,
+	force: bool,
+	delete: bool,
+	basic_credential: Option<BasicAuthCredential>,
+	progress_sender: Option<Sender<ProgressNotification>>,
+	hook_progress: Option<git2_hooks::HookProgress<'_>>,
+) -> Result<()> {
 	scope_time!("push");
 
 	let repo = repo(repo_path)?;
@@ -234,12 +260,33 @@ pub fn push_raw(
 	let push_default_strategy =
 		push_default_strategy_config_repo(&repo)?;
 
+	let url = remote_handle
+		.pushurl()?
+		.unwrap_or(remote_handle.url()?)
+		.to_owned();
+	let separate_push_url = url != remote_handle.url()?;
+	let negotiated_oid = std::cell::Cell::new(None);
 	let mut options = PushOptions::new();
 	options.proxy_options(proxy_auto());
 
 	let callbacks =
 		Callbacks::new(progress_sender, basic_credential.clone());
-	options.remote_callbacks(callbacks.callbacks());
+
+	let mut remote_callbacks = callbacks.callbacks();
+	remote_callbacks.push_negotiation(|updates| {
+		// Keep the selected object ID even if the local ref changes in the hook.
+		negotiated_oid
+			.set(updates.first().map(git2::PushUpdate::dst));
+		crate::sync::hooks::negotiated_pre_push(
+			&repo,
+			remote,
+			&url,
+			updates,
+			hook_progress,
+		)
+		.map_err(|error| git2::Error::from_str(&error.to_string()))
+	});
+	options.remote_callbacks(remote_callbacks);
 	options.packbuilder_parallelism(0);
 
 	let branch_modifier = match (force, delete) {
@@ -269,11 +316,11 @@ pub fn push_raw(
 	}
 
 	log::debug!("push to: {push_ref}");
+	let destination = push_ref.split_once(':').map_or_else(
+		|| format!("refs/{git_ref_type}/{branch}"),
+		|(_, dst)| dst.to_owned(),
+	);
 	if force && !delete && ref_type == PushType::Branch {
-		let destination = push_ref.split_once(':').map_or_else(
-			|| format!("refs/heads/{branch}"),
-			|(_, dst)| dst.to_owned(),
-		);
 		push_with_checked_lease(
 			&repo,
 			&mut remote_handle,
@@ -283,6 +330,11 @@ pub fn push_raw(
 			&mut options,
 			basic_credential,
 		)?;
+	} else if separate_push_url {
+		// libgit2's local transport writes through remote.url, ignoring pushurl.
+		// Bind the transfer to the same URL that the hook uses for LFS.
+		repo.remote_anonymous(&url)?
+			.push(&[push_ref], Some(&mut options))?;
 	} else {
 		remote_handle.push(&[push_ref], Some(&mut options))?;
 	}
@@ -295,10 +347,47 @@ pub fn push_raw(
 		)));
 	}
 
-	if !delete {
+	if separate_push_url {
+		if let Some(oid) = negotiated_oid.get() {
+			update_push_tracking(
+				&repo,
+				&remote_handle,
+				&destination,
+				oid,
+			)?;
+		}
+	}
+	if !delete && ref_type == PushType::Branch {
 		branch_set_upstream_after_push(&repo, branch)?;
 	}
 
+	Ok(())
+}
+
+/// Mirror the named remote's tracking updates after a successful anonymous push.
+fn update_push_tracking(
+	repo: &Repository,
+	remote: &Remote<'_>,
+	destination: &str,
+	oid: git2::Oid,
+) -> Result<()> {
+	for refspec in remote.refspecs().filter(|spec| {
+		spec.direction() == Direction::Fetch
+			&& spec.src_matches(destination)
+	}) {
+		let tracking = refspec.transform(destination)?;
+		let tracking = tracking.as_str()?;
+		if oid.is_zero() {
+			match repo.find_reference(tracking) {
+				Ok(mut reference) => reference.delete()?,
+				Err(error)
+					if error.code() == git2::ErrorCode::NotFound => {}
+				Err(error) => return Err(error.into()),
+			}
+		} else {
+			repo.reference(tracking, oid, true, "update by push")?;
+		}
+	}
 	Ok(())
 }
 
@@ -314,6 +403,112 @@ mod tests {
 	};
 	use git2::Repository;
 	use std::{fs::File, io::Write, path::Path};
+
+	#[test]
+	fn branch_push_and_delete_use_separate_push_url() {
+		let (local_dir, local) = repo_init().unwrap();
+		let (fetch_dir, fetch_remote) = repo_init_bare().unwrap();
+		let (push_dir, push_remote) = repo_init_bare().unwrap();
+		let branch =
+			local.head().unwrap().shorthand().unwrap().to_owned();
+		let reference = format!("refs/heads/{branch}");
+		let tracking = format!("refs/remotes/origin/{branch}");
+		let path = RepoPath::Path(local_dir.path().to_owned());
+		local
+			.remote("origin", fetch_dir.path().to_str().unwrap())
+			.unwrap();
+		local
+			.remote_set_pushurl(
+				"origin",
+				Some(push_dir.path().to_str().unwrap()),
+			)
+			.unwrap();
+		let original = local.refname_to_id(&reference).unwrap();
+		push_branch(
+			&path, "origin", &branch, false, false, None, None,
+		)
+		.unwrap();
+		assert!(fetch_remote.find_reference(&reference).is_err());
+		assert_eq!(
+			push_remote.refname_to_id(&reference).unwrap(),
+			original
+		);
+		assert_eq!(local.refname_to_id(&tracking).unwrap(), original);
+		let local_branch = local
+			.find_branch(&branch, git2::BranchType::Local)
+			.unwrap();
+		let upstream = local_branch.upstream().unwrap();
+		assert_eq!(upstream.get().name().unwrap(), tracking);
+		assert_eq!(upstream.get().target(), Some(original));
+
+		let newer = write_commit_file(
+			&local,
+			"new.txt",
+			"new",
+			"next commit",
+		);
+		let hook = local.path().join("hooks/pre-push");
+		std::fs::write(&hook, format!("#!/bin/sh\ncat > hook-refs\ngit update-ref {reference} {original}\n")).unwrap();
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+			std::fs::set_permissions(
+				&hook,
+				std::fs::Permissions::from_mode(0o755),
+			)
+			.unwrap();
+		}
+		push_branch(
+			&path, "origin", &branch, false, false, None, None,
+		)
+		.unwrap();
+		assert!(fetch_remote.find_reference(&reference).is_err());
+		assert_eq!(
+			push_remote.refname_to_id(&reference).unwrap(),
+			newer.into()
+		);
+		assert_eq!(
+			local.refname_to_id(&tracking).unwrap(),
+			newer.into()
+		);
+		assert_eq!(
+			local.refname_to_id(&reference).unwrap(),
+			original
+		);
+
+		let error = push_branch(
+			&path, "origin", &branch, true, false, None, None,
+		)
+		.unwrap_err();
+		assert!(error
+			.to_string()
+			.contains("push URL differs from fetch URL"));
+		assert_eq!(
+			push_remote.refname_to_id(&reference).unwrap(),
+			newer.into()
+		);
+
+		assert_eq!(
+			local.refname_to_id(&tracking).unwrap(),
+			newer.into()
+		);
+		// Seed a different fetch destination to catch accidental deletion there.
+		local
+			.remote_anonymous(fetch_dir.path().to_str().unwrap())
+			.unwrap()
+			.push(&[&reference], None)
+			.unwrap();
+		push_branch(
+			&path, "origin", &branch, false, true, None, None,
+		)
+		.unwrap();
+		assert_eq!(
+			fetch_remote.refname_to_id(&reference).unwrap(),
+			original
+		);
+		assert!(push_remote.find_reference(&reference).is_err());
+		assert!(local.find_reference(&tracking).is_err());
+	}
 
 	#[test]
 	fn test_force_push() {

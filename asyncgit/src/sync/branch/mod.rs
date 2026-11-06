@@ -9,8 +9,9 @@ use super::{utils::bytes2string, RepoPath};
 use crate::{
 	error::{Error, Result},
 	sync::{
-		remotes::get_default_remote_for_push_in_repo,
-		repository::repo, utils::get_head_repo, CommitId,
+		lfs, remotes::get_default_remote_for_push_in_repo,
+		repository::repo, status::get_lfs_status,
+		utils::get_head_repo, CommitId, ShowUntrackedFilesConfig,
 	},
 };
 use git2::{Branch, BranchType, Repository};
@@ -358,6 +359,13 @@ pub fn checkout_branch(
 	let branch = repo.find_branch(branch_name, BranchType::Local)?;
 
 	let branch_ref = branch.into_reference();
+	let reference = branch_ref.name()?;
+	if lfs::is_repo(&repo)? || lfs::is_repo_at(&repo, reference)? {
+		return switch_lfs(
+			&repo,
+			["switch", "--no-guess", "--", branch_name],
+		);
+	}
 
 	let target_treeish = branch_ref.peel_to_tree()?;
 	let target_treeish_object = target_treeish.as_object();
@@ -386,6 +394,14 @@ pub fn checkout_commit(
 	scope_time!("checkout_commit");
 
 	let repo = repo(repo_path)?;
+	let target = git2::Oid::from(commit_hash).to_string();
+	if lfs::is_repo(&repo)? || lfs::is_repo_at(&repo, &target)? {
+		ensure_clean_for_lfs_checkout(&repo)?;
+		return switch_lfs(
+			&repo,
+			["switch", "--detach", "--", &target],
+		);
+	}
 	let cur_ref = repo.head()?;
 	let statuses = repo.statuses(Some(
 		git2::StatusOptions::new().include_ignored(false),
@@ -416,6 +432,15 @@ pub fn checkout_remote_branch(
 	scope_time!("checkout_remote_branch");
 
 	let repo = repo(repo_path)?;
+	if lfs::is_repo(&repo)?
+		|| lfs::is_repo_at(&repo, &branch.reference)?
+	{
+		ensure_clean_for_lfs_checkout(&repo)?;
+		return switch_lfs(
+			&repo,
+			["switch", "--track", "--", &branch.reference],
+		);
+	}
 	let cur_ref = repo.head()?;
 
 	if !repo
@@ -449,6 +474,27 @@ pub fn checkout_remote_branch(
 		return Err(Error::Git(e));
 	}
 	Ok(())
+}
+
+fn ensure_clean_for_lfs_checkout(repo: &Repository) -> Result<()> {
+	let (staged, workdir) =
+		get_lfs_status(repo, ShowUntrackedFilesConfig::All)?;
+	if staged.is_empty() && workdir.is_empty() {
+		Ok(())
+	} else {
+		Err(Error::UncommittedChanges)
+	}
+}
+
+fn switch_lfs(
+	repo: &Repository,
+	args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
+) -> Result<()> {
+	lfs::require_ready(repo)?;
+	lfs::git(repo, args, true)?;
+	lfs::checkout_local(repo, None).map_err(|error| {
+		Error::Generic(format!("Git checkout succeeded, but local LFS content could not be restored: {error}"))
+	})
 }
 
 /// The user must not be on the branch for the branch to be deleted

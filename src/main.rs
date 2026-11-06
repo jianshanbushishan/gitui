@@ -77,6 +77,7 @@ mod os_theme;
 mod popup_stack;
 mod popups;
 mod queue;
+mod repo_operation;
 mod spinner;
 mod string_utils;
 mod strings;
@@ -148,6 +149,14 @@ pub enum AsyncAppNotification {
 	ImagePreview,
 	/// The selected new file has been checked for preview changes.
 	StatusFilePreview,
+	/// A repository write or LFS transfer finished.
+	RepoOperation,
+	/// The LFS menu diagnostics are ready.
+	LfsDiagnostics,
+	/// The status view's LFS information is ready.
+	LfsStatus,
+	/// Metadata for the selected status entry is ready.
+	LfsSelection,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

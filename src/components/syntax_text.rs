@@ -479,6 +479,18 @@ impl SyntaxTextComponent {
 			return;
 		}
 
+		if let Some(pointer) = sync::lfs::parse_pointer(bytes) {
+			self.load_error(
+				path,
+				format!(
+					"Git LFS\nSize: {} bytes\nOID: sha256:{}",
+					pointer.size, pointer.oid
+				),
+			);
+			self.content_hash = Some(content_hash);
+			return;
+		}
+
 		if ui::is_image(Path::new(&path), bytes) {
 			self.cancel_highlighting();
 			self.image_preview.get_mut().set(bytes, content_hash);

@@ -9,7 +9,8 @@ use crate::{
 	keys::{key_match, SharedKeyConfig},
 	options::SharedOptions,
 	queue::{Action, InternalEvent, NeedsUpdate, Queue, ResetItem},
-	strings, try_or_popup,
+	repo_operation::{literal_selection, RepoOperation},
+	strings,
 };
 use anyhow::Result;
 use asyncgit::{
@@ -18,7 +19,7 @@ use asyncgit::{
 };
 use crossterm::event::Event;
 use ratatui::{layout::Rect, Frame};
-use std::path::Path;
+use std::{collections::HashSet, rc::Rc};
 
 ///
 pub struct ChangesComponent {
@@ -55,6 +56,10 @@ impl ChangesComponent {
 		Ok(())
 	}
 
+	pub fn set_lfs_paths(&mut self, paths: Rc<HashSet<String>>) {
+		self.files.set_lfs_paths(paths);
+	}
+
 	///
 	pub fn selection(&self) -> Option<FileTreeItem> {
 		self.files.selection()
@@ -86,72 +91,52 @@ impl ChangesComponent {
 		self.files.draw_popup(f)
 	}
 
-	fn index_add_remove(&self) -> Result<bool> {
+	fn index_add_remove(&self) {
 		if let Some(tree_item) = self.selection() {
-			if self.is_working_dir {
+			let operation = if self.is_working_dir {
+				let last = self.files.file_count() == 1;
 				if let FileTreeItemKind::File(i) = tree_item.kind {
-					let path = Path::new(i.path.as_str());
-					match i.status {
-						StatusItemType::Deleted => {
-							sync::stage_addremoved(
-								&self.repo.borrow(),
-								path,
-							)?;
-						}
-						_ => sync::stage_add_file(
-							&self.repo.borrow(),
-							path,
-						)?,
+					RepoOperation::Stage {
+						path: i.path.into(),
+						removed: i.status == StatusItemType::Deleted,
+						last,
 					}
 				} else {
-					let config =
-						self.options.borrow().status_show_untracked();
-
-					//TODO: check if we can handle the one file case with it as well
-					sync::stage_add_all(
-						&self.repo.borrow(),
-						tree_item.info.full_path.as_str(),
-						config,
-					)?;
-				}
-
-				// Check if this is the last file in the tree.
-				// file_count() tracks individual files (not tree nodes), so if a
-				// folder contains 3 files, file_count() returns 3, not 1.
-				// Using file_count() is much faster than is_workdir_clean()
-				// which would scan the entire working directory.
-				if self.files.file_count() == 1 {
-					self.queue
-						.push(InternalEvent::StatusLastFileMoved);
+					RepoOperation::StageAll {
+						path: literal_selection(
+							tree_item.info.full_path,
+						),
+						config: self
+							.options
+							.borrow()
+							.status_show_untracked(),
+						last,
+					}
 				}
 			} else {
-				// this is a staged entry, so lets unstage it
-				let path = tree_item.info.full_path.as_str();
-				sync::reset_stage(&self.repo.borrow(), path)?;
-			}
-
-			return Ok(true);
+				RepoOperation::Unstage {
+					path: literal_selection(tree_item.info.full_path),
+					last: false,
+				}
+			};
+			self.queue.push(InternalEvent::RepoOperation(operation));
 		}
-
-		Ok(false)
 	}
 
-	fn index_add_all(&self) -> Result<()> {
-		let config = self.options.borrow().status_show_untracked();
-
-		sync::stage_add_all(&self.repo.borrow(), "*", config)?;
-
-		self.queue.push(InternalEvent::Update(NeedsUpdate::ALL));
-
-		Ok(())
-	}
-
-	fn stage_remove_all(&self) -> Result<()> {
-		sync::reset_stage(&self.repo.borrow(), "*")?;
-
-		self.queue.push(InternalEvent::Update(NeedsUpdate::ALL));
-
-		Ok(())
+	fn index_change_all(&self) {
+		let operation = if self.is_working_dir {
+			RepoOperation::StageAll {
+				path: "*".into(),
+				config: self.options.borrow().status_show_untracked(),
+				last: true,
+			}
+		} else {
+			RepoOperation::Unstage {
+				path: "*".into(),
+				last: true,
+			}
+		};
+		self.queue.push(InternalEvent::RepoOperation(operation));
 	}
 
 	fn dispatch_reset_workdir(&self) -> bool {
@@ -262,32 +247,14 @@ impl Component for ChangesComponent {
 					e,
 					self.key_config.keys.stage_unstage_item,
 				) {
-					try_or_popup!(
-						self,
-						"staging error:",
-						self.index_add_remove()
-					);
-
-					self.queue.push(InternalEvent::Update(
-						NeedsUpdate::ALL,
-					));
+					self.index_add_remove();
 					Ok(EventState::Consumed)
 				} else if key_match(
 					e,
 					self.key_config.keys.status_stage_all,
 				) && !self.is_empty()
 				{
-					if self.is_working_dir {
-						try_or_popup!(
-							self,
-							"staging all error:",
-							self.index_add_all()
-						);
-					} else {
-						self.stage_remove_all()?;
-					}
-					self.queue
-						.push(InternalEvent::StatusLastFileMoved);
+					self.index_change_all();
 					Ok(EventState::Consumed)
 				} else if key_match(
 					e,

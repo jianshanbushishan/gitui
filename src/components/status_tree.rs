@@ -26,7 +26,9 @@ use std::fmt::Write;
 use std::{
 	borrow::Cow,
 	cell::{Cell, RefCell},
+	collections::HashSet,
 	path::Path,
+	rc::Rc,
 };
 
 //TODO: use new `filetreelist` crate
@@ -46,6 +48,7 @@ pub struct StatusTreeComponent {
 	scroll_top: Cell<usize>,
 	visible: bool,
 	revision: Option<CommitId>,
+	lfs_paths: Rc<HashSet<String>>,
 	repo: RepoPathRef,
 	copy_path_popup: CopyPathPopup,
 	/// Flattened/folded rows, invalidated only when tree layout changes.
@@ -68,6 +71,7 @@ impl StatusTreeComponent {
 			pending: true,
 			visible: false,
 			revision: None,
+			lfs_paths: Rc::default(),
 			repo: env.repo.clone(),
 			copy_path_popup: CopyPathPopup::new(
 				env.queue.clone(),
@@ -80,6 +84,10 @@ impl StatusTreeComponent {
 
 	pub const fn set_commit(&mut self, revision: Option<CommitId>) {
 		self.revision = revision;
+	}
+
+	pub fn set_lfs_paths(&mut self, paths: Rc<HashSet<String>>) {
+		self.lfs_paths = paths;
 	}
 
 	#[cfg(test)]
@@ -221,15 +229,15 @@ impl StatusTreeComponent {
 		}
 	}
 
-	fn item_to_text<'b>(
+	fn item_to_text(
+		&self,
 		string: &str,
 		indent: usize,
 		visible: bool,
 		file_item_kind: &FileTreeItemKind,
 		width: u16,
 		selected: bool,
-		theme: &'b SharedTheme,
-	) -> Option<Span<'b>> {
+	) -> Option<Span<'_>> {
 		let indent_str = if indent == 0 {
 			String::new()
 		} else {
@@ -248,6 +256,12 @@ impl StatusTreeComponent {
 					.file_name()
 					.and_then(std::ffi::OsStr::to_str)
 					.expect("invalid path.");
+				let file =
+					if self.lfs_paths.contains(&status_item.path) {
+						Cow::Owned(format!("[LFS] {file}"))
+					} else {
+						Cow::Borrowed(file)
+					};
 
 				let txt = if selected {
 					format!(
@@ -263,7 +277,7 @@ impl StatusTreeComponent {
 
 				Some(Span::styled(
 					Cow::from(txt),
-					theme.item(status_item.status, selected),
+					self.theme.item(status_item.status, selected),
 				))
 			}
 
@@ -285,7 +299,7 @@ impl StatusTreeComponent {
 
 				Some(Span::styled(
 					Cow::from(txt),
-					theme.text(true, selected),
+					self.theme.text(true, selected),
 				))
 			}
 		}
@@ -470,14 +484,13 @@ impl DrawableComponent for StatusTreeComponent {
 				.skip(self.scroll_top.get())
 				.take(tree_height)
 				.filter_map(|(index, draw_text_info)| {
-					Self::item_to_text(
+					self.item_to_text(
 						&draw_text_info.name,
 						draw_text_info.indent as usize,
 						draw_text_info.visible,
 						&draw_text_info.item_kind,
 						r.width,
 						self.show_selection && select == index,
-						&self.theme,
 					)
 				});
 

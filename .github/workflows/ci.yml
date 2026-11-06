@@ -63,6 +63,14 @@ jobs:
       - name: Run tests
         run: make test
 
+      - name: Test Git LFS workflows
+        if: matrix.rust == 'stable'
+        env:
+          GITUI_REQUIRE_LFS_TESTS: "1"
+        run: |
+          git lfs version
+          cargo test -p asyncgit --test lfs_worktree --test lfs_transfer --test lfs_backend_regressions
+
       - name: Run clippy
         run: |
           make clippy

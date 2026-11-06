@@ -1,5 +1,12 @@
-use super::{utils::get_head_repo, CommitId, RepoPath};
-use crate::{error::Result, sync::repository::repo};
+use super::{
+	lfs,
+	utils::{get_head_repo, path_or_repo_root},
+	CommitId, RepoPath,
+};
+use crate::{
+	error::{Error, Result},
+	sync::repository::repo,
+};
 use git2::{build::CheckoutBuilder, ObjectType, ResetType};
 use scopetime::scope_time;
 
@@ -8,6 +15,34 @@ pub fn reset_stage(repo_path: &RepoPath, path: &str) -> Result<()> {
 	scope_time!("reset_stage");
 
 	let repo = repo(repo_path)?;
+	if lfs::is_repo(&repo)? {
+		let path = path_or_repo_root(path);
+		let unborn = repo.head().is_err_and(|error| {
+			error.code() == git2::ErrorCode::UnbornBranch
+		});
+		let args = if unborn {
+			vec![
+				"--literal-pathspecs",
+				"rm",
+				"-r",
+				"--cached",
+				"-f",
+				"--ignore-unmatch",
+				"--",
+				path,
+			]
+		} else {
+			vec![
+				"--literal-pathspecs",
+				"reset",
+				"--quiet",
+				"HEAD",
+				"--",
+				path,
+			]
+		};
+		return lfs::git(&repo, args, false).map(|_| ());
+	}
 
 	if let Ok(id) = get_head_repo(&repo) {
 		let obj =
@@ -26,6 +61,45 @@ pub fn reset_workdir(repo_path: &RepoPath, path: &str) -> Result<()> {
 	scope_time!("reset_workdir");
 
 	let repo = repo(repo_path)?;
+	if lfs::is_repo(&repo)? {
+		if path == "*" {
+			return Err(Error::Generic("Discard all is unavailable in LFS repositories; discard individual changes instead".into()));
+		}
+		lfs::require_ready(&repo)?;
+		let tracked = lfs::git(
+			&repo,
+			["--literal-pathspecs", "ls-files", "-z", "--", path],
+			false,
+		)?;
+		if !tracked.is_empty() {
+			let tracked = String::from_utf8(tracked)?;
+			let paths = tracked
+				.split('\0')
+				.filter(|path| !path.is_empty())
+				.collect::<Vec<_>>();
+			// Restore from the index, including any staged version differing from HEAD.
+			lfs::git(
+				&repo,
+				[
+					"--literal-pathspecs",
+					"restore",
+					"--worktree",
+					"--",
+					path,
+				],
+				true,
+			)?;
+			// Discard must not trigger a network transfer. Expand only the
+			// selected index pointers whose objects are already local.
+			lfs::checkout_index_local(&repo, &paths)?;
+		}
+		lfs::git(
+			&repo,
+			["--literal-pathspecs", "clean", "-f", "-d", "--", path],
+			false,
+		)?;
+		return Ok(());
+	}
 
 	let mut checkout_opts = CheckoutBuilder::new();
 	checkout_opts
@@ -47,6 +121,10 @@ pub fn reset_repo(
 	scope_time!("reset_repo");
 
 	let repo = repo(repo_path)?;
+	if kind == ResetType::Hard {
+		let target = git2::Oid::from(commit).to_string();
+		lfs::guard(&repo, "Hard reset", Some(&target))?;
+	}
 
 	let c = repo.find_commit(commit.into())?;
 

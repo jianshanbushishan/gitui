@@ -63,6 +63,10 @@ impl FilesTab {
 		self.files.any_work_pending()
 	}
 
+	pub fn selected_file_path(&self) -> Option<String> {
+		self.files.selected_file_path()
+	}
+
 	///
 	pub fn update_async(&mut self, ev: AsyncNotification) {
 		if self.is_visible() {

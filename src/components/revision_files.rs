@@ -360,7 +360,7 @@ impl RevisionFilesComponent {
 			.map(|file| file.full_path_str().to_string())
 	}
 
-	fn selected_file_path(&self) -> Option<String> {
+	pub fn selected_file_path(&self) -> Option<String> {
 		self.tree.selected_file().map(|file| {
 			file.full_path_str()
 				.strip_prefix("./")

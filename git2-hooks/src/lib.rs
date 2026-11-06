@@ -251,6 +251,28 @@ pub fn hooks_pre_push(
 	url: &str,
 	updates: &[PrePushRef],
 ) -> Result<HookResult> {
+	hooks_pre_push_with_progress(
+		repo,
+		other_paths,
+		remote,
+		url,
+		updates,
+		None,
+	)
+}
+
+/// Thread-safe observer for live hook output chunks.
+pub type HookProgress<'a> = &'a (dyn Fn(&[u8]) + Sync + 'a);
+
+/// Run pre-push while forwarding stdout/stderr chunks to a thread-safe observer.
+pub fn hooks_pre_push_with_progress(
+	repo: &Repository,
+	other_paths: Option<&[&str]>,
+	remote: Option<&str>,
+	url: &str,
+	updates: &[PrePushRef],
+	progress: Option<HookProgress<'_>>,
+) -> Result<HookResult> {
 	let hook = HookPaths::new(repo, other_paths, HOOK_PRE_PUSH)?;
 
 	if !hook.found() {
@@ -265,9 +287,10 @@ pub fn hooks_pre_push(
 
 	let stdin_data = PrePushRef::to_stdin(updates);
 
-	hook.run_hook_os_str_with_stdin(
+	hook.run_hook_with_progress(
 		[remote_name, url],
 		Some(stdin_data.as_bytes()),
+		progress,
 	)
 }
 
@@ -538,7 +561,7 @@ exit 0
 		assert_eq!(response.code, 42);
 		assert_eq!(response.hook, hook.hook);
 		assert_eq!(stdout, TEXT, "{:?} != {TEXT:?}", stdout);
-		assert!(response.stderr.is_empty());
+		assert_eq!(response.stderr, "");
 	}
 
 	#[test]

@@ -104,7 +104,9 @@ fn real_repository_refresh() {
 				)
 			);
 			let handler_start = Instant::now();
-			status.update_async(event);
+			status
+				.update_async(event)
+				.expect("status notification failed");
 			if let AsyncNotification::Git(event) = event {
 				status
 					.update_git(event)

@@ -8,7 +8,7 @@ use crate::{
 	},
 	keys::{key_match, SharedKeyConfig},
 	options::SharedOptions,
-	queue::{Action, InternalEvent, NeedsUpdate, Queue, ResetItem},
+	queue::{Action, InternalEvent, NeedsUpdate, Queue},
 	strings, try_or_popup,
 	ui::style::Theme,
 	AsyncAppNotification, AsyncNotification,
@@ -34,10 +34,13 @@ use ratatui::{
 };
 
 mod file_preview;
+mod lfs;
 #[cfg(test)]
 #[path = "status_perf.rs"]
 mod perf;
 use file_preview::{PreviewResult, StatusFilePreviewJob};
+use lfs::{PathsJob, SelectionJob};
+use std::{collections::HashSet, rc::Rc};
 
 /// what part of the screen is focused
 #[derive(PartialEq)]
@@ -78,6 +81,7 @@ const fn uses_full_file_preview(status: StatusItemType) -> bool {
 enum RightPane {
 	Diff,
 	File,
+	Lfs,
 }
 
 struct PreviewState {
@@ -86,6 +90,18 @@ struct PreviewState {
 	generation: u64,
 	hash: Option<u64>,
 	dirty: bool,
+}
+
+struct LfsState {
+	paths: Rc<HashSet<String>>,
+	examined_paths: HashSet<String>,
+	paths_job: AsyncSingleJob<PathsJob>,
+	paths_generation: u64,
+	applied_paths_generation: u64,
+	selection_job: AsyncSingleJob<SelectionJob>,
+	selection_generation: u64,
+	selected: Option<(String, bool)>,
+	lines: Vec<String>,
 }
 
 pub struct Status {
@@ -99,6 +115,7 @@ pub struct Status {
 	file_preview: SyntaxTextComponent,
 	right_pane: RightPane,
 	preview: PreviewState,
+	lfs: LfsState,
 	remotes: RemoteStatus,
 	git_diff: AsyncDiff,
 	git_state: RepoState,
@@ -184,10 +201,33 @@ impl DrawableComponent for Status {
 
 		self.index_wd.draw(f, left_chunks[0])?;
 		self.index.draw(f, left_chunks[1])?;
-		if self.right_pane == RightPane::File {
-			self.file_preview.draw(f, chunks[1])?;
-		} else {
-			self.diff.draw(f, chunks[1])?;
+		match self.right_pane {
+			RightPane::File => {
+				self.file_preview.draw(f, chunks[1])?;
+			}
+			RightPane::Diff => self.diff.draw(f, chunks[1])?,
+			RightPane::Lfs => {
+				let lines = if self.lfs.lines.is_empty() {
+					"Checking Git LFS…".into()
+				} else {
+					format!(
+						"{}\n\n{}",
+						self.lfs.lines.join("\n"),
+						strings::commands::open_lfs(&self.key_config)
+							.name,
+					)
+				};
+				f.render_widget(
+					Paragraph::new(lines)
+						.block(
+							Block::default()
+								.borders(Borders::ALL)
+								.title("Git LFS"),
+						)
+						.wrap(ratatui::widgets::Wrap { trim: false }),
+					chunks[1],
+				);
+			}
 		}
 		self.draw_branch_state(f, &left_chunks);
 
@@ -203,23 +243,27 @@ impl DrawableComponent for Status {
 
 impl Status {
 	fn components(&self) -> Vec<&dyn Component> {
-		let right: &dyn Component =
-			if self.right_pane == RightPane::File {
-				&self.file_preview
-			} else {
-				&self.diff
-			};
-		vec![&self.index, &self.index_wd, right]
+		let mut components: Vec<&dyn Component> =
+			vec![&self.index, &self.index_wd];
+		match self.right_pane {
+			RightPane::File => components.push(&self.file_preview),
+			RightPane::Diff => components.push(&self.diff),
+			RightPane::Lfs => (),
+		}
+		components
 	}
 
 	fn components_mut(&mut self) -> Vec<&mut dyn Component> {
-		let right: &mut dyn Component =
-			if self.right_pane == RightPane::File {
-				&mut self.file_preview
-			} else {
-				&mut self.diff
-			};
-		vec![&mut self.index, &mut self.index_wd, right]
+		let mut components: Vec<&mut dyn Component> =
+			vec![&mut self.index, &mut self.index_wd];
+		match self.right_pane {
+			RightPane::File => {
+				components.push(&mut self.file_preview);
+			}
+			RightPane::Diff => components.push(&mut self.diff),
+			RightPane::Lfs => (),
+		}
+		components
 	}
 
 	///
@@ -256,6 +300,21 @@ impl Status {
 				generation: 0,
 				hash: None,
 				dirty: false,
+			},
+			lfs: LfsState {
+				paths: Rc::default(),
+				examined_paths: HashSet::new(),
+				paths_job: AsyncSingleJob::new(
+					env.sender_app.clone(),
+				),
+				paths_generation: 0,
+				applied_paths_generation: 0,
+				selection_job: AsyncSingleJob::new(
+					env.sender_app.clone(),
+				),
+				selection_generation: 0,
+				selected: None,
+				lines: Vec::new(),
 			},
 			git_diff: AsyncDiff::new(
 				repo_clone.clone(),
@@ -440,6 +499,9 @@ impl Status {
 	}
 
 	fn can_focus_diff(&self) -> bool {
+		if self.right_pane == RightPane::Lfs {
+			return false;
+		}
 		match self.focus {
 			Focus::WorkDir => self.index_wd.is_file_selected(),
 			Focus::Stage => self.index.is_file_selected(),
@@ -495,7 +557,7 @@ impl Status {
 		self.index.focus_select(is_stage);
 	}
 
-	fn selected_status_item(&self) -> Option<(StatusItem, bool)> {
+	pub fn selected_status_item(&self) -> Option<(StatusItem, bool)> {
 		let (idx, is_stage) = match self.diff_target {
 			DiffTarget::Stage => (&self.index, true),
 			DiffTarget::WorkingDir => (&self.index_wd, false),
@@ -525,6 +587,10 @@ impl Status {
 				// Status equality does not imply content equality. Poll bytes
 				// independently, including when StatusPairUnchanged is ignored.
 				self.request_file_preview(false);
+			} else if self.right_pane == RightPane::Lfs {
+				if !self.lfs.selection_job.is_pending() {
+					self.request_lfs_selection();
+				}
 			} else {
 				self.git_diff.refresh()?;
 			}
@@ -550,17 +616,64 @@ impl Status {
 			|| self.git_branch_compare.is_pending()
 			|| self.file_preview.any_work_pending()
 			|| self.preview.job.is_pending()
+			|| self.lfs.paths_job.is_pending()
+			|| self.lfs.selection_job.is_pending()
 	}
 
 	/// Forward application-level async notifications to the full-file
 	/// preview used for newly added files.
-	pub fn update_async(&mut self, ev: AsyncNotification) {
+	pub fn update_async(
+		&mut self,
+		ev: AsyncNotification,
+	) -> Result<()> {
 		self.file_preview.update(ev);
-		if ev
-			== AsyncNotification::App(
+		match ev {
+			AsyncNotification::App(
 				AsyncAppNotification::StatusFilePreview,
-			) {
-			self.apply_file_preview();
+			) => self.apply_file_preview(),
+			AsyncNotification::App(
+				AsyncAppNotification::LfsStatus,
+			) => {
+				if let Some(job) = self.lfs.paths_job.take_last() {
+					if job.generation == self.lfs.paths_generation {
+						self.lfs.paths = Rc::new(job.tracked);
+						self.lfs.examined_paths = job.examined;
+						self.lfs.applied_paths_generation =
+							job.generation;
+						self.index
+							.set_lfs_paths(self.lfs.paths.clone());
+						self.index_wd
+							.set_lfs_paths(self.lfs.paths.clone());
+						self.update_diff()?;
+					}
+				}
+			}
+			AsyncNotification::App(
+				AsyncAppNotification::LfsSelection,
+			) => {
+				if let Some(job) = self.lfs.selection_job.take_last()
+				{
+					if job.generation == self.lfs.selection_generation
+						&& self.lfs.selected.as_ref()
+							== Some(&job.file)
+					{
+						self.lfs.lines = job.lines;
+					}
+				}
+			}
+			_ => (),
+		}
+		Ok(())
+	}
+
+	fn request_lfs_selection(&self) {
+		if let Some(file) = &self.lfs.selected {
+			self.lfs.selection_job.spawn(SelectionJob {
+				repo: self.repo.borrow().clone(),
+				generation: self.lfs.selection_generation,
+				file: file.clone(),
+				lines: Vec::new(),
+			});
 		}
 	}
 
@@ -724,6 +837,15 @@ impl Status {
 		self.request_line_stats()?;
 
 		if !changed {
+			// Do not replace an outstanding annotation scan on every poll.
+			// Even an idle worker can still have its completion queued for
+			// the UI, so wait until that generation has actually been applied.
+			if self.lfs.paths_generation
+				== self.lfs.applied_paths_generation
+			{
+				let status = self.changes_fetcher.last()?;
+				self.request_lfs_paths(&status);
+			}
 			return Ok(());
 		}
 
@@ -754,9 +876,28 @@ impl Status {
 	) -> Result<()> {
 		self.index.set_items(&status.staged)?;
 		self.index_wd.set_items(&status.workdir)?;
+		self.request_lfs_paths(status);
 		self.update_diff()?;
 		self.request_branch_compare();
 		Ok(())
+	}
+
+	fn request_lfs_paths(&mut self, status: &StatusPair) {
+		if status.staged.is_empty()
+			&& status.workdir.is_empty()
+			&& self.lfs.paths.is_empty()
+		{
+			return;
+		}
+		self.lfs.paths_generation =
+			self.lfs.paths_generation.wrapping_add(1);
+		self.lfs.paths_job.spawn(PathsJob {
+			repo: self.repo.borrow().clone(),
+			status: status.clone(),
+			generation: self.lfs.paths_generation,
+			tracked: HashSet::new(),
+			examined: HashSet::new(),
+		});
 	}
 
 	/// Pull the latest background-computed `(+.. -..)` counts into the
@@ -771,9 +912,65 @@ impl Status {
 		}
 	}
 
+	fn present_lfs_selection(
+		&mut self,
+		selection: Option<&(StatusItem, bool)>,
+	) -> Result<bool> {
+		if let Some((item, is_stage)) = selection {
+			if self.lfs.paths.contains(&item.path) {
+				let file = (item.path.clone(), *is_stage);
+				if self.lfs.selected.as_ref() != Some(&file) {
+					self.lfs.selected = Some(file);
+					self.lfs.lines.clear();
+					self.lfs.selection_generation =
+						self.lfs.selection_generation.wrapping_add(1);
+					self.request_lfs_selection();
+				}
+				if self.right_pane != RightPane::Lfs {
+					self.clear_file_preview();
+					self.diff.clear(false);
+					self.right_pane = RightPane::Lfs;
+					if self.focus == Focus::Diff {
+						let focus = if *is_stage {
+							Focus::Stage
+						} else {
+							Focus::WorkDir
+						};
+						self.switch_focus(focus)?;
+					}
+					self.sync_right_focus();
+				}
+				return Ok(true);
+			}
+		}
+		if self.lfs.selected.take().is_some() {
+			self.lfs.lines.clear();
+			self.lfs.selection_job.cancel();
+		}
+		if self.right_pane == RightPane::Lfs {
+			self.right_pane = RightPane::Diff;
+			self.sync_right_focus();
+		}
+		Ok(false)
+	}
+
 	///
 	pub fn update_diff(&mut self) -> Result<()> {
-		if let Some((item, is_stage)) = self.selected_status_item() {
+		let selection = self.selected_status_item();
+		if self.present_lfs_selection(selection.as_ref())? {
+			return Ok(());
+		}
+		if let Some((item, is_stage)) = selection {
+			if self.lfs.paths_generation
+				!= self.lfs.applied_paths_generation
+				&& !self.lfs.examined_paths.contains(&item.path)
+			{
+				self.right_pane = RightPane::Diff;
+				self.clear_file_preview();
+				self.diff.clear(true);
+				self.sync_right_focus();
+				return Ok(());
+			}
 			let path = item.path;
 			let diff_type = if is_stage {
 				DiffType::Stage
@@ -859,27 +1056,6 @@ impl Status {
 		}
 
 		Ok(())
-	}
-
-	/// called after confirmation
-	pub fn reset(&self, item: &ResetItem) -> bool {
-		if let Err(e) = sync::reset_workdir(
-			&self.repo.borrow(),
-			item.path.as_str(),
-		) {
-			self.queue.push(InternalEvent::ShowErrorMsg(format!(
-				"reset failed:\n{e}"
-			)));
-
-			false
-		} else {
-			true
-		}
-	}
-
-	/// Discard working-directory changes while preserving the index.
-	pub fn reset_all(&self) -> bool {
-		self.reset(&ResetItem { path: "*".into() })
 	}
 
 	pub fn last_file_moved(&mut self) -> Result<()> {
@@ -1135,6 +1311,7 @@ mod tests {
 	#[test]
 	fn reset_all_untracked_files_before_first_commit() {
 		use crate::app::Environment;
+		use asyncgit::sync;
 		use std::fs;
 
 		let (dir, _repo) = git2_testing::repo_init_empty();
@@ -1144,7 +1321,7 @@ mod tests {
 		fs::write(dir.path().join(".hidden"), "new\n").unwrap();
 		let mut env = Environment::test_env();
 		*env.repo.get_mut() = dir.path().to_path_buf().into();
-		assert!(Status::new(&env).reset_all());
+		sync::reset_workdir(&env.repo.borrow(), "*").unwrap();
 		assert!(!dir.path().join("untracked/new.txt").exists());
 		assert!(!dir.path().join(".hidden").exists());
 	}
@@ -1188,7 +1365,7 @@ mod tests {
 
 		let mut env = Environment::test_env();
 		*env.repo.get_mut() = repo_path;
-		assert!(super::Status::new(&env).reset_all());
+		sync::reset_workdir(&env.repo.borrow(), "*").unwrap();
 		assert_eq!(
 			fs::read_to_string(dir.path().join("tracked.txt"))
 				.unwrap(),
@@ -1287,8 +1464,111 @@ mod tests {
 	}
 
 	#[test]
+	fn unchanged_status_polls_do_not_supersede_lfs_annotations() {
+		use crate::{
+			app::Environment, AsyncAppNotification, AsyncNotification,
+		};
+
+		let (dir, _repo) = git2_testing::repo_init();
+		std::fs::write(dir.path().join("new.txt"), "new\n").unwrap();
+		let mut env = Environment::test_env();
+		*env.repo.get_mut() = dir.path().to_path_buf().into();
+		let (git_sender, git_receiver) =
+			crossbeam_channel::unbounded();
+		env.sender_git = git_sender;
+		let (app_sender, app_receiver) =
+			crossbeam_channel::unbounded();
+		env.sender_app = app_sender;
+		let mut status = Status::new(&env);
+		status.changes_fetcher.fetch(None).unwrap();
+		wait_for_status_scan(&git_receiver);
+		status.update_status(true).unwrap();
+		let generation = status.lfs.paths_generation;
+		assert_ne!(generation, status.lfs.applied_paths_generation);
+
+		// Includes the race where the worker has finished, but its
+		// notification is still waiting behind another status poll.
+		let notice = app_receiver
+			.recv_timeout(Duration::from_secs(10))
+			.unwrap();
+		assert_eq!(notice, AsyncAppNotification::LfsStatus);
+		for _ in 0..10 {
+			status.update_status(false).unwrap();
+			assert_eq!(status.lfs.paths_generation, generation);
+		}
+		status.update_async(AsyncNotification::App(notice)).unwrap();
+		assert_eq!(status.lfs.applied_paths_generation, generation);
+		assert_eq!(
+			status.preview.key,
+			Some(("new.txt".into(), false))
+		);
+		assert!(status.right_pane == RightPane::File);
+	}
+
+	#[test]
+	fn selected_lfs_path_loads_metadata_instead_of_file_preview() {
+		use crate::{
+			app::Environment, AsyncAppNotification, AsyncNotification,
+		};
+		use asyncgit::{StatusItem, StatusPair};
+
+		let (dir, _repo) = git2_testing::repo_init();
+		std::fs::write(
+			dir.path().join(".gitattributes"),
+			"*.bin filter=lfs\n",
+		)
+		.unwrap();
+		let oid = "a".repeat(64);
+		std::fs::write(
+			dir.path().join("asset.bin"),
+			format!("version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize 2048\n"),
+		).unwrap();
+		let mut env = Environment::test_env();
+		*env.repo.get_mut() = dir.path().to_path_buf().into();
+		let (sender, notifications) = crossbeam_channel::unbounded();
+		env.sender_app = sender;
+		let mut status = Status::new(&env);
+		status
+			.apply_status_snapshot(&StatusPair {
+				staged: [].into(),
+				workdir: [StatusItem {
+					path: "asset.bin".into(),
+					status: StatusItemType::New,
+				}]
+				.into(),
+			})
+			.unwrap();
+		let deadline = Instant::now() + Duration::from_secs(10);
+		loop {
+			let notice =
+				notifications.recv_deadline(deadline).unwrap();
+			status
+				.update_async(AsyncNotification::App(notice))
+				.unwrap();
+			if notice == AsyncAppNotification::LfsSelection {
+				break;
+			}
+		}
+		assert!(status.right_pane == RightPane::Lfs);
+		assert!(!status.preview.job.is_pending());
+		assert!(status
+			.lfs
+			.lines
+			.iter()
+			.any(|line| line == "Size: 2048 bytes"));
+		assert!(status
+			.lfs
+			.lines
+			.iter()
+			.any(|line| line.ends_with(&oid)));
+	}
+
+	#[test]
 	fn show_restores_status_updated_while_hidden() {
-		use crate::{app::Environment, components::Component};
+		use crate::{
+			app::Environment, components::Component,
+			AsyncNotification,
+		};
 
 		let (dir, _repo) = git2_testing::repo_init();
 		std::fs::write(dir.path().join("before.txt"), "before\n")
@@ -1297,7 +1577,7 @@ mod tests {
 		*env.repo.get_mut() = dir.path().to_path_buf().into();
 		let (sender, receiver) = crossbeam_channel::unbounded();
 		env.sender_git = sender;
-		let (sender, _app_receiver) = crossbeam_channel::unbounded();
+		let (sender, app_receiver) = crossbeam_channel::unbounded();
 		env.sender_app = sender;
 		let mut status = Status::new(&env);
 		status.changes_fetcher.fetch(None).unwrap();
@@ -1322,6 +1602,19 @@ mod tests {
 		status.git_action_executed = true;
 		status.show().unwrap();
 		let after = status.index_wd.selection().unwrap();
+		let deadline = Instant::now() + Duration::from_secs(5);
+		while status
+			.preview
+			.key
+			.as_ref()
+			.is_none_or(|(path, _)| path != "after.txt")
+		{
+			let notification =
+				app_receiver.recv_deadline(deadline).unwrap();
+			status
+				.update_async(AsyncNotification::App(notification))
+				.unwrap();
+		}
 		let preview = status.preview.key.clone();
 		let action_pending = status.git_action_executed;
 		let notification = wait_for_status_scan(&receiver);
@@ -1517,7 +1810,9 @@ mod tests {
 				notification,
 				AsyncAppNotification::StatusFilePreview
 			);
-			status.update_async(AsyncNotification::App(notification));
+			status
+				.update_async(AsyncNotification::App(notification))
+				.unwrap();
 		}
 		assert_eq!(status.preview.key, Some(("b.bin".into(), false)));
 		assert_eq!(
@@ -1559,7 +1854,9 @@ mod tests {
 			notification,
 			AsyncAppNotification::StatusFilePreview
 		);
-		status.update_async(AsyncNotification::App(notification));
+		status
+			.update_async(AsyncNotification::App(notification))
+			.unwrap();
 		let hash = status.preview.hash;
 		assert!(hash.is_some());
 
@@ -1574,7 +1871,9 @@ mod tests {
 			notification,
 			AsyncAppNotification::StatusFilePreview
 		);
-		status.update_async(AsyncNotification::App(notification));
+		status
+			.update_async(AsyncNotification::App(notification))
+			.unwrap();
 		assert_ne!(status.preview.hash, hash);
 		assert!(status.git_diff.last().unwrap().is_none());
 		assert!(!status.git_diff.is_pending());

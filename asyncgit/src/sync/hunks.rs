@@ -20,6 +20,7 @@ pub fn stage_hunk(
 	scope_time!("stage_hunk");
 
 	let repo = repo(repo_path)?;
+	super::staging::ensure_partial_edit_allowed(&repo, file_path)?;
 
 	let diff = get_diff_raw(&repo, file_path, false, false, options)?;
 
@@ -46,6 +47,7 @@ pub fn reset_hunk(
 	scope_time!("reset_hunk");
 
 	let repo = repo(repo_path)?;
+	super::staging::ensure_partial_edit_allowed(&repo, file_path)?;
 
 	let diff = get_diff_raw(&repo, file_path, false, false, options)?;
 
@@ -105,6 +107,7 @@ pub fn unstage_hunk(
 	scope_time!("revert_hunk");
 
 	let repo = repo(repo_path)?;
+	super::staging::ensure_partial_edit_allowed(&repo, file_path)?;
 
 	let diff = get_diff_raw(&repo, file_path, true, false, options)?;
 	let diff_count_positive = diff.deltas().len();
