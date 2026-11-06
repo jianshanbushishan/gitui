@@ -47,6 +47,7 @@ use super::InspectCommitOpen;
 pub struct BranchListPopup {
 	repo: RepoPathRef,
 	branches: Vec<BranchInfo>,
+	remote_url_width: usize,
 	local: bool,
 	has_remotes: bool,
 	visible: bool,
@@ -249,6 +250,7 @@ impl BranchListPopup {
 	pub fn new(env: &Environment) -> Self {
 		Self {
 			branches: Vec::new(),
+			remote_url_width: 0,
 			local: true,
 			has_remotes: false,
 			visible: false,
@@ -357,6 +359,12 @@ impl BranchListPopup {
 					})
 				})
 				.unwrap_or(usize::from(self.selection));
+			self.remote_url_width = branches
+				.iter()
+				.filter_map(Self::remote_url)
+				.map(UnicodeWidthStr::width)
+				.max()
+				.unwrap_or_default();
 			self.branches = branches;
 			self.set_selection(selection.try_into()?)?;
 		}
@@ -513,6 +521,15 @@ impl BranchListPopup {
 		Ok(())
 	}
 
+	fn remote_url(branch: &BranchInfo) -> Option<&str> {
+		match &branch.details {
+			BranchDetails::Remote(details) => {
+				details.remote_url.as_deref()
+			}
+			BranchDetails::Local(_) => None,
+		}
+	}
+
 	fn truncate_text(text: &str, width: usize) -> String {
 		const ELLIPSIS: &str = "...";
 		if text.width() <= width {
@@ -569,19 +586,15 @@ impl BranchListPopup {
 			let name_padding = branch_name_width
 				.saturating_sub(branch_name.width())
 				+ 1;
-			let details = match &displaybranch.details {
-				BranchDetails::Remote(RemoteBranch {
-					remote_url: Some(url),
-					..
-				}) => format!(
-					"{url}  {}",
-					displaybranch.top_commit_message
-				),
-				_ => displaybranch.top_commit_message.clone(),
-			};
+			let details_width = content_width - branch_name_width;
+			let url_width = self
+				.remote_url_width
+				.min(details_width.saturating_sub(1));
+			let url_column_width =
+				url_width + usize::from(url_width > 0);
 			let commit_message = Self::truncate_text(
-				&details,
-				content_width - branch_name_width,
+				&displaybranch.top_commit_message,
+				details_width - url_column_width,
 			);
 
 			let selected = (self.selection as usize
@@ -625,13 +638,26 @@ impl BranchListPopup {
 				theme.branch(selected, is_head),
 			);
 
-			txt.push(Line::from(vec![
-				span_prefix,
-				span_name,
+			let mut spans = vec![span_prefix, span_name];
+			if url_width > 0 {
+				let url = Self::truncate_text(
+					Self::remote_url(displaybranch)
+						.unwrap_or_default(),
+					url_width,
+				);
+				let padding =
+					url_column_width.saturating_sub(url.width());
+				spans.push(Span::styled(
+					format!("{url}{:padding$}", ""),
+					theme.text(true, selected),
+				));
+			}
+			spans.extend([
 				span_hash,
 				Span::styled(time, theme.commit_time(selected)),
 				span_msg,
-			]));
+			]);
+			txt.push(Line::from(spans));
 		}
 
 		Text::from(txt)
@@ -929,24 +955,26 @@ mod tests {
 		assert_eq!(text.lines.len(), 2);
 		let origin = &text.lines[0];
 		assert!(origin.to_string().contains("origin/feature"));
-		assert!(origin.to_string().contains(&head_time));
-		assert!(origin
-			.to_string()
-			.contains(&commit.id().to_string()[..7]));
-		assert_eq!(
-			origin.spans.last().unwrap().content,
-			format!("{url}  {summary}"),
-		);
+		let hash = commit.id().to_string();
+		assert_eq!(origin.spans[2].content.trim_end(), url);
+		assert_eq!(origin.spans[3].content.trim_end(), &hash[..7]);
+		assert_eq!(origin.spans[4].content.trim_end(), head_time);
+		assert_eq!(origin.spans.last().unwrap().content, summary,);
 		let other = &text.lines[1];
 		assert!(other.to_string().contains(other_branch));
+		assert!(other.spans[2].content.trim().is_empty());
+		assert_eq!(other.spans[2].width(), origin.spans[2].width());
 		assert!(other.to_string().contains(&other_time));
 		assert_eq!(other.spans.last().unwrap().content, "other tip");
 
 		// The URL has priority over the summary when space is limited.
 		let text = popup.get_text(&env.theme, 60, 2);
-		let detail = &text.lines[0].spans.last().unwrap().content;
-		assert!(detail.starts_with("https://"));
-		assert!(detail.ends_with("..."));
+		let spans = &text.lines[0].spans;
+		let shortened_url = spans[2].content.trim_end();
+		assert!(shortened_url.starts_with("https://"));
+		assert!(shortened_url.ends_with("..."));
+		assert_eq!(spans[3].content.trim_end(), &hash[..7]);
+		assert_eq!(spans[4].content.trim_end(), head_time);
 		// Include widths that truncate inside the multibyte URL, and
 		// widths too small to fit the full ellipsis.
 		for width in 32..=120 {
