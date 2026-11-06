@@ -13,4 +13,4 @@ expression: terminal.backend()
 "│                                                                                        ║"
 "│                                                                                        ║"
 "└────────────────────────────────────────────────────────────────────────────────────────┘"
-"Scroll [↑↓] Mark [˽] Details [⏎] Branches [b] Copy Hash [y] Tag [t] Checkout [⇧S] more [.]"
+"Git LFS / Download [^l] Scroll [↑↓] Mark [˽] Details [⏎] Branches [b]             more [.]"

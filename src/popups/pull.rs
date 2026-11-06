@@ -6,7 +6,8 @@ use crate::{
 	},
 	keys::SharedKeyConfig,
 	popups::PushPopup,
-	queue::{Action, InternalEvent, Queue},
+	queue::{InternalEvent, Queue},
+	repo_operation::RepoOperation,
 	strings, try_or_popup,
 	ui::{self, style::SharedTheme},
 };
@@ -90,7 +91,6 @@ impl PullPopup {
 		&mut self,
 		cred: Option<BasicAuthCredential>,
 	) -> Result<()> {
-		self.pending = true;
 		self.progress = None;
 		self.git_fetch.request(FetchRequest {
 			remote: get_default_remote_for_fetch(
@@ -99,6 +99,7 @@ impl PullPopup {
 			branch: self.branch.clone(),
 			basic_credential: cred,
 		})?;
+		self.pending = true;
 
 		Ok(())
 	}
@@ -110,7 +111,10 @@ impl PullPopup {
 
 	///
 	pub fn update_git(&mut self, ev: AsyncGitNotification) {
-		if self.is_visible() && ev == AsyncGitNotification::Pull {
+		if self.pending
+			&& self.is_visible()
+			&& ev == AsyncGitNotification::Pull
+		{
 			if let Err(error) = self.update() {
 				self.pending = false;
 				self.hide();
@@ -131,7 +135,7 @@ impl PullPopup {
 				self.git_fetch.last_result()?
 			{
 				if err.is_empty() {
-					self.try_ff_merge()?;
+					self.finish_fetch();
 				} else {
 					anyhow::bail!(err);
 				}
@@ -141,29 +145,11 @@ impl PullPopup {
 		Ok(())
 	}
 
-	// check if something is incoming and try a ff merge then
-	fn try_ff_merge(&mut self) -> Result<()> {
-		let branch_compare = sync::branch_compare_upstream(
-			&self.repo.borrow(),
-			&self.branch,
-		)?;
-		if branch_compare.behind > 0 {
-			let ff_res = sync::branch_merge_upstream_fastforward(
-				&self.repo.borrow(),
-				&self.branch,
-			);
-			match ff_res {
-				Ok(()) => (),
-				Err(asyncgit::Error::FastForwardNotPossible(_)) => {
-					self.confirm_merge(branch_compare.behind);
-				}
-				Err(error) => return Err(error.into()),
-			}
-		}
-
+	fn finish_fetch(&mut self) {
+		self.queue.push(InternalEvent::RepoOperation(
+			RepoOperation::FinishPull(self.branch.clone()),
+		));
 		self.hide();
-
-		Ok(())
 	}
 
 	pub fn try_conflict_free_merge(&self, rebase: bool) {
@@ -186,19 +172,6 @@ impl PullPopup {
 				)
 			);
 		}
-	}
-
-	fn confirm_merge(&mut self, incoming: usize) {
-		self.queue.push(InternalEvent::ConfirmAction(
-			Action::PullMerge {
-				incoming,
-				rebase: sync::config_is_pull_rebase(
-					&self.repo.borrow(),
-				)
-				.unwrap_or_default(),
-			},
-		));
-		self.hide();
 	}
 }
 
@@ -302,8 +275,13 @@ impl Component for PullPopup {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::{
+		repo_operation::{OperationOutcome, PendingOperation},
+		AsyncAppNotification,
+	};
 	use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 	use git2::{Repository, Signature};
+	use std::time::Duration;
 	use tempfile::TempDir;
 
 	const PULL_FILE: &str = "pull-file.txt";
@@ -359,6 +337,31 @@ mod tests {
 		(dir, repo, popup)
 	}
 
+	fn run_queued_pull(
+		popup: &PullPopup,
+	) -> Result<OperationOutcome> {
+		let Some(InternalEvent::RepoOperation(operation)) =
+			popup.queue.pop()
+		else {
+			panic!("expected a queued pull operation");
+		};
+		assert!(!popup.is_visible());
+		assert!(popup.queue.pop().is_none());
+
+		let (sender, receiver) = crossbeam_channel::bounded(1);
+		let pending = PendingOperation::start(
+			popup.repo.borrow().clone(),
+			operation,
+			sender,
+		)
+		.unwrap();
+		assert_eq!(
+			receiver.recv_timeout(Duration::from_secs(10)).unwrap(),
+			AsyncAppNotification::RepoOperation
+		);
+		pending.result()
+	}
+
 	#[test]
 	fn pull_fastforwards_without_confirmation() {
 		let (dir, repo, mut popup) = prepare_pull();
@@ -367,15 +370,17 @@ mod tests {
 			.unwrap()
 			.id();
 
-		popup.try_ff_merge().unwrap();
+		popup.finish_fetch();
+		assert!(matches!(
+			run_queued_pull(&popup).unwrap(),
+			OperationOutcome::Done
+		));
 
 		assert_eq!(repo.head().unwrap().target(), Some(upstream));
 		assert_eq!(
 			std::fs::read(dir.path().join(PULL_FILE)).unwrap(),
 			b"remote\n"
 		);
-		assert!(popup.queue.pop().is_none());
-		assert!(!popup.is_visible());
 	}
 
 	#[test]
@@ -383,16 +388,12 @@ mod tests {
 		let (_dir, repo, mut popup) = prepare_pull();
 		commit_file(&repo, "HEAD", b"local\n");
 
-		popup.try_ff_merge().unwrap();
+		popup.finish_fetch();
 
 		assert!(matches!(
-			popup.queue.pop(),
-			Some(InternalEvent::ConfirmAction(Action::PullMerge {
-				incoming: 1,
-				..
-			}))
+			run_queued_pull(&popup).unwrap(),
+			OperationOutcome::PullMerge { incoming: 1, .. }
 		));
-		assert!(popup.queue.pop().is_none());
 	}
 
 	#[test]
@@ -400,15 +401,12 @@ mod tests {
 		let (_dir, repo, mut popup) = prepare_pull();
 		repo.config().unwrap().set_bool("merge.ff", false).unwrap();
 
-		popup.try_ff_merge().unwrap();
+		popup.finish_fetch();
 
 		assert!(matches!(
-			popup.queue.pop(),
-			Some(InternalEvent::ConfirmAction(
-				Action::PullMerge { .. }
-			))
+			run_queued_pull(&popup).unwrap(),
+			OperationOutcome::PullMerge { .. }
 		));
-		assert!(popup.queue.pop().is_none());
 	}
 
 	#[test]
@@ -421,7 +419,10 @@ mod tests {
 		)
 		.unwrap();
 
-		let error = popup.try_ff_merge().unwrap_err();
+		popup.finish_fetch();
+		let Err(error) = run_queued_pull(&popup) else {
+			panic!("expected a checkout error");
+		};
 
 		assert!(matches!(
 			error.downcast_ref::<asyncgit::Error>(),
@@ -432,7 +433,6 @@ mod tests {
 			std::fs::read(dir.path().join(PULL_FILE)).unwrap(),
 			b"unsaved changes\n"
 		);
-		assert!(popup.queue.pop().is_none());
 	}
 
 	#[cfg(windows)]
@@ -467,19 +467,17 @@ mod tests {
 		popup.fetch(popup.branch.clone()).unwrap();
 		while popup.is_visible() {
 			let event = receiver
-				.recv_timeout(std::time::Duration::from_secs(10))
+				.recv_timeout(Duration::from_secs(10))
 				.unwrap();
 			popup.update_git(event);
 		}
 
-		let Some(InternalEvent::ShowErrorMsg(message)) =
-			popup.queue.pop()
-		else {
+		let Err(error) = run_queued_pull(&popup) else {
 			panic!(
 				"expected a pull error instead of merge confirmation"
 			);
 		};
-		assert!(message.starts_with("pull failed:\n"), "{message}");
+		let message = error.to_string();
 		let os_reason = std::io::Error::from_raw_os_error(32);
 		// The Windows message is localized; compare with the system's text.
 		let reason = os_reason.to_string();
@@ -488,7 +486,6 @@ mod tests {
 		assert!(message.contains(reason.trim()), "{message}");
 		assert_eq!(repo.head().unwrap().target(), head);
 		assert!(!popup.any_work_pending());
-		assert!(popup.queue.pop().is_none());
 		drop(locked);
 	}
 

@@ -246,9 +246,14 @@ These are the high level goals before calling out `1.0`:
 
 Install Git and Git LFS and configure the repository with `git lfs install --local`.
 GitUI supports LFS status and pointer metadata, whole-file staging and restore,
-branch checkout, and branch/tag push via the repository's pre-push hook.
+branch checkout, fast-forward pull, and branch/tag push via the repository's
+pre-push hook.
 Checkout uses locally cached objects. Press `Ctrl+L` to open Git LFS and
 download objects for the current commit or restore existing pointers from cache.
+A fast-forward pull downloads LFS content for added or changed files, respecting
+the repository's LFS path filters and skip-smudge settings. If a download fails
+after the branch advances, use the Git LFS menu to retry the affected files.
+Reset All keeps staged changes and restores LFS files using the local cache.
 A custom pre-push hook must invoke Git LFS for uploads to run.
 LFS transfers use Git's credential configuration. Extension-filtered LFS files
 require an existing commit for local restoration.

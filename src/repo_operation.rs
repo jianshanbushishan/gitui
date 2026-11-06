@@ -30,6 +30,7 @@ pub enum RepoOperation {
 		discard: bool,
 	},
 	CheckoutCommit(CommitId),
+	FinishPull(String),
 	InitializeLfs,
 	DownloadLfs(Option<String>),
 	RestoreLfs,
@@ -39,8 +40,17 @@ pub enum OperationOutcome {
 	Done,
 	LastFileMoved,
 	CheckoutOptions(BranchInfo),
-	CheckoutDone { reopen_branches: bool },
-	LfsDone(&'static str),
+	CheckoutDone {
+		reopen_branches: bool,
+	},
+	PullMerge {
+		incoming: usize,
+		rebase: bool,
+	},
+	LfsDone {
+		title: &'static str,
+		message: &'static str,
+	},
 }
 
 pub fn literal_selection(path: String) -> String {
@@ -62,6 +72,7 @@ impl RepoOperation {
 			Self::CheckoutBranch { .. } | Self::CheckoutCommit(_) => {
 				"Checking out"
 			}
+			Self::FinishPull(_) => "Pull",
 			Self::InitializeLfs => "Initializing Git LFS",
 			Self::DownloadLfs(_) => "Downloading LFS objects",
 			Self::RestoreLfs => "Restoring local LFS objects",
@@ -130,23 +141,34 @@ impl RepoOperation {
 				sync::checkout_commit(repo, commit)?;
 				false
 			}
+			Self::FinishPull(branch) => {
+				return finish_pull(repo, &branch)
+			}
 			Self::InitializeLfs => {
 				lfs::initialize(repo)?;
-				return Ok(OperationOutcome::LfsDone(
-					"Git LFS initialized for this repository.",
-				));
+				return Ok(OperationOutcome::LfsDone {
+					title: "Git LFS initialized",
+					message: "Setup completed for this repository.",
+				});
 			}
 			Self::DownloadLfs(path) => {
 				lfs::download(repo, None, path.as_deref())?;
-				return Ok(OperationOutcome::LfsDone(
-					"Git LFS download finished.",
-				));
+				return Ok(OperationOutcome::LfsDone {
+					title: "LFS download complete",
+					message: if path.is_some() {
+						"Processed LFS objects for the selected file."
+					} else {
+						"Processed LFS objects for the current commit."
+					},
+				});
 			}
 			Self::RestoreLfs => {
 				lfs::restore_local(repo, None)?;
-				return Ok(OperationOutcome::LfsDone(
-					"Git LFS local restore finished.",
-				));
+				return Ok(OperationOutcome::LfsDone {
+					title: "LFS restore complete",
+					message:
+						"Finished restoring from local LFS storage.",
+				});
 			}
 		};
 		Ok(if last_file_moved {
@@ -157,8 +179,31 @@ impl RepoOperation {
 	}
 }
 
+fn finish_pull(
+	repo: &RepoPath,
+	branch: &str,
+) -> Result<OperationOutcome> {
+	let incoming =
+		sync::branch_compare_upstream(repo, branch)?.behind;
+	if incoming == 0 {
+		return Ok(OperationOutcome::Done);
+	}
+	match sync::branch_merge_upstream_fastforward(repo, branch) {
+		Ok(()) => Ok(OperationOutcome::Done),
+		Err(asyncgit::Error::FastForwardNotPossible(_)) => {
+			Ok(OperationOutcome::PullMerge {
+				incoming,
+				rebase: sync::config_is_pull_rebase(repo)
+					.unwrap_or_default(),
+			})
+		}
+		Err(error) => Err(error.into()),
+	}
+}
+
 pub struct PendingOperation {
 	pub label: &'static str,
+	pub refresh_branch_compare: bool,
 	result: Receiver<Result<OperationOutcome>>,
 }
 
@@ -169,6 +214,8 @@ impl PendingOperation {
 		notification: Sender<AsyncAppNotification>,
 	) -> Result<Self> {
 		let label = operation.label();
+		let refresh_branch_compare =
+			matches!(operation, RepoOperation::FinishPull(_));
 		let (send, result) = bounded(1);
 		thread::Builder::new()
 			.name("gitui-repo-operation".into())
@@ -184,7 +231,11 @@ impl PendingOperation {
 				let _ = notification
 					.send(AsyncAppNotification::RepoOperation);
 			})?;
-		Ok(Self { label, result })
+		Ok(Self {
+			label,
+			refresh_branch_compare,
+			result,
+		})
 	}
 
 	pub fn result(self) -> Result<OperationOutcome> {

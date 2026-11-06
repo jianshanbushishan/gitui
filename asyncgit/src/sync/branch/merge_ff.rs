@@ -1,6 +1,6 @@
 //! merging from upstream
 
-use super::BranchType;
+use super::{super::lfs, BranchType};
 use crate::{
 	error::{Error, Result},
 	sync::{repository::repo, RepoPath},
@@ -17,21 +17,31 @@ pub fn branch_merge_upstream_fastforward(
 	let repo = repo(repo_path)?;
 
 	let branch = repo.find_branch(branch, BranchType::Local)?;
+	let head = repo.head()?;
+	if head.name_bytes() != branch.get().name_bytes() {
+		return Err(Error::Generic(
+			"The checked-out branch changed during Pull.".into(),
+		));
+	}
 	let upstream = branch.upstream()?;
-
 	let upstream_commit =
 		upstream.into_reference().peel_to_commit()?;
-	super::super::lfs::guard(
-		&repo,
-		"Pull",
-		Some(&upstream_commit.id().to_string()),
-	)?;
+	let target = upstream_commit.id().to_string();
+	let uses_lfs =
+		lfs::is_repo(&repo)? || lfs::is_repo_at(&repo, &target)?;
 
 	let annotated =
 		repo.find_annotated_commit(upstream_commit.id())?;
 
 	let (analysis, pref) = repo.merge_analysis(&[&annotated])?;
 
+	if uses_lfs
+		&& (!analysis.is_fast_forward() || pref.is_no_fast_forward())
+	{
+		return Err(Error::Generic(
+			"Git LFS Pull supports fast-forward updates only. Use Git from the command line to merge or rebase.".into(),
+		));
+	}
 	if !analysis.is_fast_forward() {
 		return Err(Error::FastForwardNotPossible(
 			"fast forward merge not possible",
@@ -47,6 +57,16 @@ pub fn branch_merge_upstream_fastforward(
 	//TODO: support merge on unborn
 	if analysis.is_unborn() {
 		return Err(Error::Generic("head is unborn".into()));
+	}
+
+	if uses_lfs {
+		let head_commit = head.peel_to_commit()?;
+		return lfs::pull_fast_forward(
+			&repo,
+			&head,
+			&head_commit,
+			&upstream_commit,
+		);
 	}
 
 	repo.checkout_tree(upstream_commit.as_object(), None)?;

@@ -1,4 +1,3 @@
-use super::render_popup;
 use crate::{
 	app::Environment,
 	components::{
@@ -15,17 +14,25 @@ use crate::{
 use anyhow::Result;
 use asyncgit::{
 	asyncjob::{AsyncJob, AsyncSingleJob, RunParams},
-	sync::{lfs, RepoPath, RepoPathRef},
+	sync::{lfs, utils::repo_work_dir, RepoPath, RepoPathRef},
 };
 use crossterm::event::Event;
-use ratatui::{layout::Rect, Frame};
+use ratatui::{
+	layout::Rect,
+	text::{Line, Span},
+	widgets::{Block, BorderType, Borders, Clear, Padding},
+	Frame,
+};
+use std::path::Path;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Clone)]
 struct Diagnostics {
 	repo: RepoPath,
 	generation: u64,
 	file: Option<(String, bool)>,
-	lines: Vec<String>,
+	summary: Vec<String>,
+	details: Vec<String>,
 }
 
 impl AsyncJob for Diagnostics {
@@ -36,29 +43,20 @@ impl AsyncJob for Diagnostics {
 		&mut self,
 		_: RunParams<Self::Notification, ()>,
 	) -> asyncgit::Result<Self::Notification> {
-		match lfs::environment(&self.repo) {
-			Ok(env) => self.lines.extend([
-				env.version.unwrap_or_else(|| {
-					"Git LFS is unavailable".into()
-				}),
-				format!(
-					"Filters: {}   ·   Pre-push hook: {}",
-					if env.filters_ready {
-						"configured"
-					} else {
-						"not configured"
-					},
-					if env.pre_push_hook {
-						"present"
-					} else {
-						"missing"
-					},
-				),
-			]),
-			Err(error) => self.lines.push(error.to_string()),
+		if let Ok(workdir) = repo_work_dir(&self.repo) {
+			if let Some(name) = Path::new(&workdir).file_name() {
+				self.summary.push(format!(
+					"Repo · {}",
+					name.to_string_lossy()
+				));
+			}
 		}
+		self.summary.push(match lfs::environment(&self.repo) {
+			Ok(env) => environment_summary(&env),
+			Err(error) => error.to_string(),
+		});
 		if let Some((path, staged)) = &self.file {
-			self.lines.push(path.clone());
+			self.details.push(path.clone());
 			let source = if *staged {
 				lfs::LfsSource::Index
 			} else {
@@ -66,16 +64,43 @@ impl AsyncJob for Diagnostics {
 			};
 			match lfs::file_info(&self.repo, path, source) {
 				Ok(Some(info)) => {
-					self.lines.extend(file_details(&info, source));
+					self.details.extend(file_details(&info, source));
 				}
 				Ok(None) => self
-					.lines
+					.details
 					.push("The selected file is outside LFS.".into()),
-				Err(error) => self.lines.push(error.to_string()),
+				Err(error) => self.details.push(error.to_string()),
 			}
 		}
 		Ok(AsyncAppNotification::LfsDiagnostics)
 	}
+}
+
+fn environment_summary(env: &lfs::LfsEnvironment) -> String {
+	let version = env.version.as_deref().map_or_else(
+		|| "Git LFS unavailable".into(),
+		|output| {
+			output
+				.split_whitespace()
+				.next()
+				.and_then(|word| word.strip_prefix("git-lfs/"))
+				.map_or_else(
+					|| "Version unknown".into(),
+					|v| format!("Version {v}"),
+				)
+		},
+	);
+	let filters = if env.filters_ready {
+		"ready"
+	} else {
+		"unconfigured"
+	};
+	let hook = if env.pre_push_hook {
+		"present"
+	} else {
+		"missing"
+	};
+	format!("{version} · Filters {filters} · Pre-push hook {hook}")
 }
 
 pub fn file_details(
@@ -128,15 +153,26 @@ enum Choice {
 impl Choice {
 	const fn title(self) -> &'static str {
 		match self {
+			Self::DownloadCurrent => "Download checkout",
+			Self::DownloadSelected => "Download selected file",
+			Self::Restore => "Restore from cache",
+			Self::Initialize => "Initialize LFS",
+		}
+	}
+
+	const fn description(self) -> &'static str {
+		match self {
 			Self::DownloadCurrent => {
-				"Download and restore files at HEAD"
+				"Fetch LFS objects and restore file contents."
 			}
 			Self::DownloadSelected => {
-				"Download and restore the selected file at HEAD"
+				"Fetch and restore the selected LFS file."
 			}
-			Self::Restore => "Restore files from local LFS storage",
+			Self::Restore => {
+				"Replace pointers with cached file contents."
+			}
 			Self::Initialize => {
-				"Initialize Git LFS for this repository"
+				"Configure filters and the local pre-push hook."
 			}
 		}
 	}
@@ -151,7 +187,8 @@ pub struct LfsPopup {
 	generation: u64,
 	selected: usize,
 	file: Option<(String, bool)>,
-	lines: Vec<String>,
+	summary: Vec<String>,
+	details: Vec<String>,
 	visible: bool,
 }
 
@@ -166,7 +203,8 @@ impl LfsPopup {
 			generation: 0,
 			selected: 0,
 			file: None,
-			lines: Vec::new(),
+			summary: Vec::new(),
+			details: Vec::new(),
 			visible: false,
 		}
 	}
@@ -177,13 +215,15 @@ impl LfsPopup {
 	) -> Result<()> {
 		self.file = file;
 		self.selected = 0;
-		self.lines.clear();
+		self.summary.clear();
+		self.details.clear();
 		self.generation = self.generation.wrapping_add(1);
 		self.job.spawn(Diagnostics {
 			repo: self.repo.borrow().clone(),
 			generation: self.generation,
 			file: self.file.clone(),
-			lines: Vec::new(),
+			summary: Vec::new(),
+			details: Vec::new(),
 		});
 		self.show()
 	}
@@ -195,7 +235,8 @@ impl LfsPopup {
 			) {
 			if let Some(result) = self.job.take_last() {
 				if result.generation == self.generation {
-					self.lines = result.lines;
+					self.summary = result.summary;
+					self.details = result.details;
 				}
 			}
 		}
@@ -221,37 +262,98 @@ impl LfsPopup {
 
 impl DrawableComponent for LfsPopup {
 	fn draw(&self, f: &mut Frame, area: Rect) -> Result<()> {
-		if self.visible {
-			let mut lines = self
-				.choices()
-				.iter()
-				.enumerate()
-				.map(|(index, choice)| {
-					let marker = if index == self.selected {
-						"›"
-					} else {
-						" "
-					};
-					format!("{marker} {}", choice.title())
-				})
-				.collect::<Vec<_>>();
-			lines.push(String::new());
-			if self.lines.is_empty() {
-				lines.push("Checking Git LFS…".into());
-			} else {
-				lines.extend(self.lines.iter().cloned());
-			}
-			let rect = ui::centered_rect_absolute(84, 16, area);
-			render_popup(
-				f.buffer_mut(),
-				rect,
-				"Git LFS",
-				lines.join("\n"),
-				&self.theme,
-				true,
-				true,
-			);
+		if !self.visible || area.width < 3 || area.height < 3 {
+			return Ok(());
 		}
+
+		let keys = &self.keys.keys;
+		let up = self.keys.get_hint(keys.popup_up);
+		let down = self.keys.get_hint(keys.popup_down);
+		let enter = self.keys.get_hint(keys.enter);
+		let close = self.keys.get_hint(keys.exit_popup);
+		let mut footer = format!(
+			" {up}/{down} Move · {enter} Run · {close} Close "
+		);
+		if footer.width() + 2 > usize::from(area.width) {
+			footer = format!(" {up}/{down} · {enter} · {close} ");
+		}
+
+		let choices = self.choices();
+		let padding = u16::from(area.width >= 6);
+		let inset = 2 + 2 * padding;
+		let width = choices
+			.iter()
+			.map(|choice| choice.description().width())
+			.chain(self.summary.iter().map(|line| line.width()))
+			.max()
+			.unwrap_or(0)
+			.saturating_add(usize::from(inset))
+			.max(footer.width() + 2)
+			.min(72);
+		let width = u16::try_from(width)?.min(area.width);
+		let text_width = usize::from(width - inset);
+		let available = usize::from(area.height - 2);
+		let choice_count = available.min(choices.len());
+		let first =
+			ui::calc_scroll_top(0, choice_count, self.selected);
+		let mut lines: Vec<_> = choices
+			.iter()
+			.enumerate()
+			.skip(first)
+			.take(choice_count)
+			.map(|(index, choice)| {
+				let selected = index == self.selected;
+				let marker = if selected { '›' } else { ' ' };
+				Line::styled(
+					format!("{marker} {}", choice.title()),
+					self.theme.text(true, selected),
+				)
+			})
+			.collect();
+
+		let description = bwrap::wrap_maybrk!(
+			choices[self.selected].description(),
+			text_width
+		);
+		let summary = if self.summary.is_empty() {
+			"Checking Git LFS…".into()
+		} else {
+			self.summary.join("\n")
+		};
+		let summary = bwrap::wrap_maybrk!(&summary, text_width);
+		let details = self.details.join("\n");
+		let details = bwrap::wrap_maybrk!(&details, text_width);
+		let sections = [&description, &summary, &details];
+		let content_height = lines.len()
+			+ sections
+				.iter()
+				.map(|text| text.lines().count())
+				.sum::<usize>();
+		let mut gaps = available.saturating_sub(content_height);
+		for section in
+			sections.into_iter().filter(|text| !text.is_empty())
+		{
+			if gaps > 0 {
+				lines.push(Line::default());
+				gaps -= 1;
+			}
+			lines.extend(section.lines().map(Line::from));
+		}
+
+		let height = u16::try_from(lines.len().min(available))? + 2;
+		let rect = ui::centered_rect_absolute(width, height, area);
+		let block = Block::default()
+			.title(Span::styled(" Git LFS ", self.theme.title(true)))
+			.title_bottom(Span::styled(
+				footer,
+				self.theme.text(false, false),
+			))
+			.borders(Borders::ALL)
+			.border_type(BorderType::Thick)
+			.border_style(self.theme.block(true))
+			.padding(Padding::horizontal(padding));
+		f.render_widget(Clear, rect);
+		ui::render_block_text(f.buffer_mut(), rect, block, &lines);
 		Ok(())
 	}
 }
@@ -323,5 +425,49 @@ impl Component for LfsPopup {
 	fn show(&mut self) -> Result<()> {
 		self.visible = true;
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use ratatui::{backend::TestBackend, Terminal};
+
+	#[test]
+	fn menu_renders_condensed_diagnostics_and_selected_file() {
+		let env = Environment::test_env();
+		let mut popup = LfsPopup::new(&env);
+		popup.file = Some(("assets/model.bin".into(), false));
+		popup.selected = 1;
+		popup.summary = vec![
+			"Repo · example".into(),
+			environment_summary(&lfs::LfsEnvironment {
+				version: Some(
+					"git-lfs/3.8.1 (GitHub; windows amd64)".into(),
+				),
+				filters_ready: true,
+				pre_push_hook: false,
+			}),
+		];
+		popup.details = vec![
+			"assets/model.bin".into(),
+			"Local object: missing".into(),
+		];
+		popup.show().unwrap();
+		let mut terminal =
+			Terminal::new(TestBackend::new(90, 24)).unwrap();
+		terminal
+			.draw(|frame| popup.draw(frame, frame.area()).unwrap())
+			.unwrap();
+		let rendered = terminal.backend().to_string();
+		assert!(rendered.contains("› Download selected file"));
+		assert!(rendered
+			.contains("Fetch and restore the selected LFS file."));
+		assert!(rendered.contains("Repo · example"));
+		assert!(rendered.contains(
+			"Version 3.8.1 · Filters ready · Pre-push hook missing"
+		));
+		assert!(rendered.contains("assets/model.bin"));
+		assert!(rendered.contains("Local object: missing"));
 	}
 }

@@ -569,7 +569,7 @@ pub(super) fn get_lfs_status(
 	parse_porcelain_status(&output)
 }
 
-fn parse_porcelain_status(
+pub(super) fn parse_porcelain_status(
 	output: &[u8],
 ) -> Result<(Vec<StatusItem>, Vec<StatusItem>)> {
 	let mut staged = Vec::new();

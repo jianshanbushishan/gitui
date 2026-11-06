@@ -669,7 +669,7 @@ pub mod commands {
 	pub fn open_lfs(key_config: &SharedKeyConfig) -> CommandText {
 		CommandText::new(
 			format!(
-				"Git LFS [{}]",
+				"Git LFS / Download [{}]",
 				key_config.get_hint(key_config.keys.open_lfs)
 			),
 			"show Git LFS information and file download actions",

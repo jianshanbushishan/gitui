@@ -376,6 +376,7 @@ impl App {
 					self.options_popup.show()?;
 					NeedsUpdate::ALL
 				} else if key_match(k, self.key_config.keys.open_lfs)
+					&& self.repo_operation.is_none()
 					&& !self.any_popup_visible()
 				{
 					self.open_lfs_menu();
@@ -1292,6 +1293,9 @@ impl App {
 		let Some(operation) = self.repo_operation.take() else {
 			return Ok(());
 		};
+		if operation.refresh_branch_compare {
+			self.status_tab.request_branch_compare();
+		}
 		let label = operation.label;
 		match operation.result() {
 			Ok(OperationOutcome::Done) => {}
@@ -1308,9 +1312,13 @@ impl App {
 					self.select_branch_popup.show_local()?;
 				}
 			}
-			Ok(OperationOutcome::LfsDone(message)) => {
-				self.queue
-					.push(InternalEvent::ShowInfoMsg(message.into()));
+			Ok(OperationOutcome::PullMerge { incoming, rebase }) => {
+				self.queue.push(InternalEvent::ConfirmAction(
+					Action::PullMerge { incoming, rebase },
+				));
+			}
+			Ok(OperationOutcome::LfsDone { title, message }) => {
+				self.msg_popup.show_success(title, message)?;
 			}
 			Err(error) => {
 				self.queue.push(InternalEvent::ShowErrorMsg(
@@ -1439,11 +1447,10 @@ impl App {
 		res.push(
 			CommandInfo::new(
 				strings::commands::open_lfs(&self.key_config),
-				true,
+				self.repo_operation.is_none(),
 				!self.any_popup_visible(),
 			)
-			.order(order::NAV)
-			.hidden(),
+			.order(order::PRIORITY),
 		);
 
 		res.push(

@@ -41,10 +41,15 @@ pub(super) fn output(
 
 pub(super) fn with_input(
 	repo: &Repository,
-	args: &[&str],
+	args: impl IntoIterator<Item = impl AsRef<OsStr>>,
 	input: Vec<u8>,
+	skip_smudge: bool,
 ) -> Result<Vec<u8>> {
-	let mut child = command(repo)
+	let mut command = command(repo);
+	if skip_smudge {
+		command.env("GIT_LFS_SKIP_SMUDGE", "1");
+	}
+	let mut child = command
 		.args(args)
 		.stdin(Stdio::piped())
 		.stdout(Stdio::piped())

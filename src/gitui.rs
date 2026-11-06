@@ -289,6 +289,51 @@ mod tests {
 
 		assert_snapshot!("app_loading_finished", terminal.backend());
 
+		gitui.input_event(
+			key_config.keys.open_lfs.code,
+			key_config.keys.open_lfs.modifiers,
+		);
+		gitui.draw(&mut terminal).unwrap();
+		let rendered = terminal.backend().to_string();
+		assert!(rendered.contains("↑/↓ Move · ⏎ Run · ⎋ Close"));
+		assert!(rendered.contains("› Download checkout"));
+		assert!(rendered.contains("Restore from cache"));
+		assert!(rendered.contains("Initialize LFS"));
+		assert!(rendered.contains(
+			"Fetch LFS objects and restore file contents."
+		));
+		let buffer = terminal.backend().buffer();
+		let marker = buffer
+			.content
+			.iter()
+			.find(|cell| cell.symbol() == "›")
+			.unwrap();
+		assert_eq!(
+			Some(marker.bg),
+			Theme::default().text(true, true).bg
+		);
+		let top = rendered
+			.lines()
+			.find(|line| line.contains("┏ Git LFS ━"))
+			.unwrap();
+		assert!(top.chars().filter(|&c| c == '━').count() < 60);
+
+		gitui.input_event(
+			key_config.keys.popup_down.code,
+			key_config.keys.popup_down.modifiers,
+		);
+		let mut narrow =
+			Terminal::new(TestBackend::new(28, 8)).unwrap();
+		gitui.draw(&mut narrow).unwrap();
+		let rendered = narrow.backend().to_string();
+		assert!(rendered.contains("› Restore from cache"));
+		assert!(rendered.contains("Replace pointers with"));
+		assert!(rendered.contains("↑/↓ · ⏎ · ⎋"));
+		gitui.input_event(
+			key_config.keys.exit_popup.code,
+			key_config.keys.exit_popup.modifiers,
+		);
+
 		gitui.input_event(KeyCode::Char('2'), KeyModifiers::empty());
 		gitui.input_event(
 			key_config.keys.tab_log.code,

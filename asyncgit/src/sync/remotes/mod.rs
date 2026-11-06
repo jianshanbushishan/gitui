@@ -403,6 +403,8 @@ pub(crate) fn fetch(
 	let remote_name = repo.branch_upstream_remote(&branch_ref)?;
 	let remote_name = bytes2string(&remote_name)?;
 	let mut remote = repo.find_remote(&remote_name)?;
+	let upstream = repo.branch_upstream_merge(&branch_ref)?;
+	let upstream = bytes2string(&upstream)?;
 
 	let mut options = FetchOptions::new();
 	options.download_tags(git2::AutotagOption::All);
@@ -410,7 +412,7 @@ pub(crate) fn fetch(
 	options.remote_callbacks(callbacks.callbacks());
 	options.proxy_options(proxy_auto());
 
-	remote.fetch(&[branch], Some(&mut options), None)?;
+	remote.fetch(&[upstream], Some(&mut options), None)?;
 
 	Ok(remote.stats().received_bytes())
 }

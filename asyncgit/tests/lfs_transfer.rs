@@ -141,12 +141,67 @@ fn push_and_download_lfs_assets() {
 	assert_eq!(other_info.local_object, Some(false));
 	assert_eq!(other_info.worktree, lfs::LfsWorktree::Pointer);
 
+	let other_pointer =
+		git(&receiver, &["show", &format!(":{other}")]);
 	fs::write(receiver.join(name), b"user edits").unwrap();
+	fs::write(
+		receiver.join(".lfsconfig"),
+		"[lfs]\n\tfetchexclude = asset 1.bin\n",
+	)
+	.unwrap();
 	lfs::download(&destination, None, None).unwrap();
 	assert_eq!(fs::read(receiver.join(name)).unwrap(), b"user edits");
 	assert_eq!(
 		fs::read(receiver.join(other)).unwrap(),
+		other_pointer
+	);
+	assert_eq!(
+		lfs::file_info(&destination, other, lfs::LfsSource::Index)
+			.unwrap()
+			.unwrap()
+			.local_object,
+		Some(false)
+	);
+
+	// A targeted download overrides the filter. A later bulk download still
+	// respects its include list even when the excluded content is cached.
+	lfs::download(&destination, None, Some(other)).unwrap();
+	assert_eq!(
+		fs::read(receiver.join(other)).unwrap(),
 		b"different content"
+	);
+	fs::write(receiver.join(other), &other_pointer).unwrap();
+	fs::write(receiver.join(name), &pointer).unwrap();
+	fs::remove_file(receiver.join(".lfsconfig")).unwrap();
+	git(
+		&receiver,
+		&["config", "lfs.fetchinclude", r"/asset \[1\].bin"],
+	);
+	lfs::download(&destination, None, None).unwrap();
+	assert_eq!(fs::read(receiver.join(name)).unwrap(), content);
+	assert_eq!(
+		fs::read(receiver.join(other)).unwrap(),
+		other_pointer
+	);
+	lfs::restore_local(&destination, None).unwrap();
+	assert_eq!(
+		fs::read(receiver.join(other)).unwrap(),
+		b"different content"
+	);
+	git(&receiver, &["config", "--unset", "lfs.fetchinclude"]);
+
+	fs::write(receiver.join(name), b"user edits").unwrap();
+	fs::write(receiver.join(other), b"new staged content").unwrap();
+	git(&receiver, &["add", "--", other]);
+	let staged = git(&receiver, &["show", &format!(":{other}")]);
+	fs::write(receiver.join(other), &staged).unwrap();
+	lfs::download(&destination, None, None).unwrap();
+	assert_eq!(fs::read(receiver.join(name)).unwrap(), b"user edits");
+	assert_eq!(fs::read(receiver.join(other)).unwrap(), staged);
+	lfs::restore_local(&destination, None).unwrap();
+	assert_eq!(
+		fs::read(receiver.join(other)).unwrap(),
+		b"new staged content"
 	);
 	fs::remove_file(receiver.join(other)).unwrap();
 	lfs::restore_local(&destination, None).unwrap();

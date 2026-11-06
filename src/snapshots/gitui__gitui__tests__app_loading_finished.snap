@@ -13,4 +13,4 @@ expression: terminal.backend()
 "│                                           ││                                           │"
 "│                                           ││                                           │"
 "└───────────────────────────────────────────┘└───────────────────────────────────────────┘"
-"Branches [b] Undo Commit [⇧U] Submodules [⇧S] To stage [w]                                "
+"Git LFS / Download [^l] Branches [b] Undo Commit [⇧U] Submodules [⇧S] To stage [w]        "

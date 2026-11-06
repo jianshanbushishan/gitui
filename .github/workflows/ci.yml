@@ -69,7 +69,7 @@ jobs:
           GITUI_REQUIRE_LFS_TESTS: "1"
         run: |
           git lfs version
-          cargo test -p asyncgit --test lfs_worktree --test lfs_transfer --test lfs_backend_regressions
+          cargo test -p asyncgit --test lfs_worktree --test lfs_transfer --test lfs_backend_regressions --test lfs_pull
 
       - name: Run clippy
         run: |

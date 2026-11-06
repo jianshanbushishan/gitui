@@ -14,10 +14,11 @@ use ratatui::text::Line;
 use ratatui::{
 	layout::Rect,
 	text::Span,
-	widgets::{Block, BorderType, Borders, Clear},
+	widgets::{Block, BorderType, Borders, Clear, Padding},
 	Frame,
 };
 use ui::style::SharedTheme;
+use unicode_width::UnicodeWidthStr;
 
 pub struct MsgPopup {
 	title: String,
@@ -25,6 +26,7 @@ pub struct MsgPopup {
 	/// Optional green label rendered as the first line of the body,
 	/// above `msg`. Used by copy-success popups ("Copied Text:").
 	label: Option<String>,
+	compact: bool,
 	visible: bool,
 	theme: SharedTheme,
 	key_config: SharedKeyConfig,
@@ -36,45 +38,16 @@ const BORDER_WIDTH: u16 = 2;
 const MINIMUM_WIDTH: u16 = 60;
 
 impl DrawableComponent for MsgPopup {
-	fn draw(&self, f: &mut Frame, _rect: Rect) -> Result<()> {
+	fn draw(&self, f: &mut Frame, rect: Rect) -> Result<()> {
 		if !self.visible {
 			return Ok(());
 		}
 
-		let max_width = f.area().width.max(MINIMUM_WIDTH);
-
-		// determine the maximum width of text block, accounting for
-		// the optional label line.
-		let label = self.label.as_deref().unwrap_or("");
-		let width = self
-			.msg
-			.lines()
-			.chain(std::iter::once(label))
-			.map(str::len)
-			.max()
-			.unwrap_or(0)
-			.saturating_add(BORDER_WIDTH.into())
-			.clamp(MINIMUM_WIDTH.into(), max_width.into())
-			.try_into()
-			.expect("can't fail because we're clamping to u16 value");
-
-		let area =
-			ui::centered_rect_absolute(width, POPUP_HEIGHT, f.area());
-
-		// Wrap lines and break words if there is not enough space
-		let wrapped_msg = bwrap::wrap_maybrk!(
-			&self.msg,
-			area.width.saturating_sub(BORDER_WIDTH).into()
-		);
-
-		let msg_lines: Vec<String> =
-			wrapped_msg.lines().map(String::from).collect();
-		let line_num =
-			msg_lines.len() + usize::from(self.label.is_some());
-
-		let height = POPUP_HEIGHT
-			.saturating_sub(BORDER_WIDTH)
-			.min(f.area().height.saturating_sub(BORDER_WIDTH));
+		let viewport = if self.compact { rect } else { f.area() };
+		let (area, block, wrapped_msg) = self.layout(viewport)?;
+		let height = block.inner(area).height;
+		let line_num = wrapped_msg.lines().count()
+			+ usize::from(self.label.is_some());
 
 		let top =
 			self.scroll.update_no_selection(line_num, height.into());
@@ -94,10 +67,10 @@ impl DrawableComponent for MsgPopup {
 		let remaining = (usize::from(height))
 			.saturating_sub(scrolled_lines.len());
 		scrolled_lines.extend(
-			msg_lines.iter().skip(body_skip).take(remaining).map(
+			wrapped_msg.lines().skip(body_skip).take(remaining).map(
 				|line| {
 					Line::from(vec![Span::styled(
-						line.clone(),
+						line,
 						self.theme.text(true, false),
 					)])
 				},
@@ -115,13 +88,6 @@ impl DrawableComponent for MsgPopup {
 		);
 		f.render_widget(Clear, clear_area);
 
-		let block = Block::default()
-			.title(Span::styled(
-				self.title.as_str(),
-				self.theme.text_danger(),
-			))
-			.borders(Borders::ALL)
-			.border_type(BorderType::Thick);
 		ui::render_block_text(
 			f.buffer_mut(),
 			area,
@@ -202,11 +168,88 @@ impl MsgPopup {
 			title: String::new(),
 			msg: String::new(),
 			label: None,
+			compact: false,
 			visible: false,
 			theme: env.theme.clone(),
 			key_config: env.key_config.clone(),
 			scroll: VerticalScroll::new(),
 		}
+	}
+
+	fn layout(
+		&self,
+		viewport: Rect,
+	) -> Result<(Rect, Block<'_>, String)> {
+		let mut block = Block::default()
+			.borders(Borders::ALL)
+			.border_type(BorderType::Thick);
+		let padding = u16::from(self.compact && viewport.width >= 6);
+		let horizontal_inset = BORDER_WIDTH + 2 * padding;
+		let min_width = if self.compact {
+			let close = format!(
+				" {} Close ",
+				self.key_config
+					.get_hint(self.key_config.keys.exit_popup)
+			);
+			let min_width = self.title.width().max(close.width())
+				+ usize::from(BORDER_WIDTH);
+			block = block
+				.title(Span::styled(
+					self.title.as_str(),
+					self.theme.title(true),
+				))
+				.title_bottom(Span::styled(
+					close,
+					self.theme.text(false, false),
+				))
+				.border_style(self.theme.block(true))
+				.padding(Padding::horizontal(padding));
+			min_width
+		} else {
+			block = block.title(Span::styled(
+				self.title.as_str(),
+				self.theme.text_danger(),
+			));
+			MINIMUM_WIDTH.into()
+		};
+		let label = self.label.as_deref().unwrap_or("");
+		let width = self
+			.msg
+			.lines()
+			.chain(std::iter::once(label))
+			.map(|line| {
+				if self.compact {
+					line.width()
+				} else {
+					line.len()
+				}
+			})
+			.max()
+			.unwrap_or(0)
+			.saturating_add(horizontal_inset.into())
+			.max(min_width)
+			.min(viewport.width.into());
+		let width = u16::try_from(width)?;
+
+		let text_width =
+			usize::from(width.saturating_sub(horizontal_inset));
+		let wrapped = if text_width > 0 {
+			bwrap::wrap_maybrk!(&self.msg, text_width)
+		} else {
+			String::new()
+		};
+		let height = if self.compact {
+			u16::try_from(wrapped.lines().count())
+				.unwrap_or(u16::MAX)
+				.saturating_add(BORDER_WIDTH)
+		} else {
+			POPUP_HEIGHT
+		};
+		Ok((
+			ui::centered_rect_absolute(width, height, viewport),
+			block,
+			wrapped,
+		))
 	}
 
 	fn set_new_msg(
@@ -217,6 +260,7 @@ impl MsgPopup {
 		self.title = title;
 		self.msg = msg.to_string();
 		self.label = None;
+		self.compact = false;
 		self.scroll.reset();
 		self.show()
 	}
@@ -237,6 +281,16 @@ impl MsgPopup {
 		)
 	}
 
+	pub fn show_success(
+		&mut self,
+		title: &str,
+		msg: &str,
+	) -> Result<()> {
+		self.set_new_msg(msg, format!(" {title} "))?;
+		self.compact = true;
+		Ok(())
+	}
+
 	/// Show an info popup with a green label line above the body.
 	/// A `:` is appended to the label. Used for copy-success popups
 	/// so the "Copied Text:" label stands out from the content.
@@ -245,11 +299,12 @@ impl MsgPopup {
 		label: &str,
 		msg: &str,
 	) -> Result<()> {
-		self.title = strings::msg_title_info(&self.key_config);
-		self.msg = msg.to_string();
+		self.set_new_msg(
+			msg,
+			strings::msg_title_info(&self.key_config),
+		)?;
 		self.label = Some(format!("{label}:"));
-		self.scroll.reset();
-		self.show()
+		Ok(())
 	}
 }
 
@@ -258,6 +313,35 @@ mod tests {
 	use super::*;
 	use crate::app::Environment;
 	use ratatui::{backend::TestBackend, Terminal};
+
+	#[test]
+	fn success_popup_fits_message_and_uses_theme() {
+		let env = Environment::test_env();
+		let mut popup = MsgPopup::new(&env);
+		popup
+			.show_success(
+				"LFS download complete",
+				"Processed the current checkout.",
+			)
+			.unwrap();
+		let mut terminal =
+			Terminal::new(TestBackend::new(90, 30)).unwrap();
+		terminal.draw(|f| popup.draw(f, f.area()).unwrap()).unwrap();
+
+		let rendered = terminal.backend().to_string();
+		assert!(rendered.contains("┏ LFS download complete ━"));
+		assert!(rendered.contains("Processed the current checkout."));
+		assert!(rendered.contains("┗ ⎋ Close ━"));
+		assert_eq!(rendered.matches('┃').count(), 2);
+		let title = terminal
+			.backend()
+			.buffer()
+			.content
+			.iter()
+			.find(|cell| cell.symbol() == "L")
+			.unwrap();
+		assert_eq!(Some(title.fg), env.theme.title(true).fg);
+	}
 
 	/// Reproduces the wide-char border overflow on `MsgPopup`: when the
 	/// buffer behind the popup is filled with CJK chars (e.g. a fullscreen

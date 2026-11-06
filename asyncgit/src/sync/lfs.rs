@@ -485,14 +485,31 @@ fn attributed_paths(
 	repo: &Repository,
 	paths: &[&str],
 ) -> Result<HashSet<String>> {
+	attributed_path_bytes(
+		repo,
+		paths.iter().map(|path| path.as_bytes()),
+	)?
+	.into_iter()
+	.map(|path| Ok(String::from_utf8(path)?))
+	.collect()
+}
+
+fn attributed_path_bytes<'a>(
+	repo: &Repository,
+	paths: impl IntoIterator<Item = &'a [u8]>,
+) -> Result<HashSet<Vec<u8>>> {
 	let input = paths
-		.iter()
-		.flat_map(|path| path.bytes().chain([0]))
-		.collect();
+		.into_iter()
+		.flat_map(|path| path.iter().copied().chain([0]))
+		.collect::<Vec<_>>();
+	if input.is_empty() {
+		return Ok(HashSet::new());
+	}
 	let output = git_cli::with_input(
 		repo,
-		&["check-attr", "-z", "--stdin", "filter"],
+		["check-attr", "-z", "--stdin", "filter"],
 		input,
+		false,
 	)?;
 	let fields: Vec<_> = output
 		.strip_suffix(&[0])
@@ -508,7 +525,7 @@ fn attributed_paths(
 	}
 	for [path, _, value] in entries {
 		if *value == b"lfs" {
-			tracked.insert(String::from_utf8(path.to_vec())?);
+			tracked.insert(path.to_vec());
 		}
 	}
 	Ok(tracked)
@@ -638,8 +655,11 @@ fn worktree_pointer(
 	let Some(root) = repo.workdir() else {
 		return (LfsWorktree::Unknown, None);
 	};
-	let path = root.join(path);
-	let metadata = match fs::symlink_metadata(&path) {
+	file_pointer(&root.join(path))
+}
+
+fn file_pointer(path: &Path) -> (LfsWorktree, Option<LfsPointer>) {
+	let metadata = match fs::symlink_metadata(path) {
 		Ok(metadata) => metadata,
 		Err(error)
 			if error.kind() == std::io::ErrorKind::NotFound =>
@@ -668,14 +688,19 @@ fn worktree_pointer(
 	})
 }
 
-fn media_directory(repo: &Repository) -> Result<PathBuf> {
-	let output = git(repo, ["lfs", "env"], false)?;
-	let output = String::from_utf8(output)?;
-	output
-		.lines()
-		.find_map(|line| line.strip_prefix("LocalMediaDir="))
-		.filter(|path| !path.is_empty())
-		.map(PathBuf::from)
+fn lfs_env(repo: &Repository) -> Result<String> {
+	Ok(String::from_utf8(git(repo, ["lfs", "env"], false)?)?)
+}
+
+fn env_value<'a>(env: &'a str, key: &str) -> Option<&'a str> {
+	env.lines()
+		.find_map(|line| line.strip_prefix(key))
+		.filter(|value| !value.is_empty())
+}
+
+fn media_directory(env: &str) -> Result<&Path> {
+	env_value(env, "LocalMediaDir=")
+		.map(Path::new)
 		.ok_or_else(|| {
 			Error::Generic(
 				"Git LFS did not report its local object directory."
@@ -695,7 +720,8 @@ fn object_exists(
 	repo: &Repository,
 	pointer: &LfsPointer,
 ) -> Option<bool> {
-	Some(object_path(&media_directory(repo).ok()?, pointer).is_file())
+	let env = lfs_env(repo).ok()?;
+	Some(object_path(media_directory(&env).ok()?, pointer).is_file())
 }
 
 /// Inspect the pointer and local content status of one file.
@@ -760,24 +786,34 @@ struct LfsPath {
 	name: String,
 }
 
+fn lfs_files(
+	repo: &Repository,
+	args: &[&str],
+) -> Result<Vec<LfsPath>> {
+	let output = git(
+		repo,
+		["lfs", "ls-files", "--json"]
+			.into_iter()
+			.chain(args.iter().copied()),
+		false,
+	)?;
+	let list: LfsFiles =
+		serde_json::from_slice(&output).map_err(|error| {
+			Error::Generic(format!(
+				"Could not read Git LFS file list: {error}"
+			))
+		})?;
+	Ok(list.files.unwrap_or_default())
+}
+
 pub(crate) fn checkout_local(
 	repo: &Repository,
 	path: Option<&Path>,
 ) -> Result<()> {
-	let files = if let Some(path) = path {
-		vec![LfsPath {
-			name: checked_path(path)?.to_owned(),
-		}]
-	} else {
-		let output = git(repo, ["lfs", "ls-files", "--json"], false)?;
-		let list: LfsFiles = serde_json::from_slice(&output)
-			.map_err(|error| {
-				Error::Generic(format!(
-					"Could not read Git LFS file list: {error}"
-				))
-			})?;
-		list.files.unwrap_or_default()
-	};
+	if let Some(path) = path {
+		return checkout_index_local(repo, &[checked_path(path)?]);
+	}
+	let files = lfs_files(repo, &[])?;
 	checkout_index_local(
 		repo,
 		&files
@@ -792,120 +828,478 @@ pub(crate) fn checkout_index_local(
 	repo: &Repository,
 	paths: &[&str],
 ) -> Result<()> {
-	let mut index = repo.index()?;
-	index.read(true)?;
-	let mut candidates = Vec::new();
-	for name in paths {
-		let path = Path::new(name);
-		checked_path(path)?;
-		if checkout_candidate(repo, &index, path) {
-			candidates.push((path, literal_pattern(name)?));
-		}
-	}
-	// git-lfs checkout requires HEAD even though the restored version comes
-	// from the index. Before the first commit, materialize local objects only.
-	if repo.head().is_err_and(|error| {
-		error.code() == git2::ErrorCode::UnbornBranch
-	}) {
-		restore_unborn(
-			repo,
-			candidates.iter().map(|(path, _)| *path),
-		)?;
-		return check_restore(
-			repo,
-			candidates.into_iter().map(|(path, _)| path),
-		);
-	}
-	// Only existing, unchanged pointers are selected. An unfiltered Git LFS
-	// checkout would also restore files that the user deleted.
-	for batch in candidates.chunks(16) {
-		git(
-			repo,
-			["lfs", "checkout", "--"].into_iter().chain(
-				batch.iter().map(|(_, pattern)| pattern.as_str()),
-			),
-			false,
-		)?;
-	}
-	check_restore(repo, candidates.into_iter().map(|(path, _)| path))
+	checkout_index_paths(repo, paths, None, &lfs_env(repo)?)
 }
 
-fn restore_unborn<'a>(
+fn checkout_index_paths(
 	repo: &Repository,
-	paths: impl IntoIterator<Item = &'a Path>,
+	paths: &[&str],
+	tree: Option<&git2::Tree<'_>>,
+	env: &str,
 ) -> Result<()> {
-	let store = media_directory(repo)?;
+	if paths.is_empty() {
+		return Ok(());
+	}
 	let root = repo.workdir().ok_or(Error::NoWorkDir)?;
-	for path in paths {
-		let (_, Some(pointer)) = worktree_pointer(repo, path) else {
-			continue;
-		};
-		let object = object_path(&store, &pointer);
-		if !object.is_file() {
+	let store = media_directory(env)?;
+	let has_references =
+		env_value(env, "LocalReferenceDirs=").is_some();
+	let unborn = repo.head().is_err_and(|error| {
+		error.code() == git2::ErrorCode::UnbornBranch
+	});
+	let mut index = repo.index()?;
+	index.read(true)?;
+	let candidates =
+		checkout_candidates(repo, &index, root, paths, tree)?;
+	if candidates.is_empty() {
+		return Ok(());
+	}
+	let names =
+		candidates.iter().map(|item| item.name).collect::<Vec<_>>();
+	let attributed = attributed_paths(repo, &names)?;
+	let mut remaining = 0;
+	let mut fallback = Vec::new();
+	for CheckoutCandidate {
+		name,
+		entry,
+		original,
+		permissions,
+		pointer,
+	} in candidates
+	{
+		let path = Path::new(name);
+		if !attributed.contains(name) {
 			continue;
 		}
-		let destination = root.join(path);
-		let original = fs::read(&destination)?;
-		// Extension objects need their smudge pipeline, which checkout cannot
-		// run before HEAD exists. Do not expose transformed cache bytes.
+		let object = object_path(store, &pointer);
+		if pointer.size != 0
+			&& !object.is_file()
+			&& (unborn || !has_references)
+		{
+			remaining += 1;
+			continue;
+		}
+		// Native checkout applies extension filters and refreshes the index
+		// stat cache after switching from a pointer to a different-sized file.
+		if !unborn {
+			fallback.push((path, literal_pattern(name)?));
+			continue;
+		}
 		if original
-			.split(|b| *b == b'\n')
+			.split(|byte| *byte == b'\n')
 			.any(|line| line.starts_with(b"ext-"))
 		{
 			return Err(Error::Generic("Git LFS extension files cannot be restored before the first commit.".into()));
 		}
+		let destination = root.join(path);
 		let temporary = tempfile::NamedTempFile::new_in(
 			destination.parent().ok_or(Error::NoWorkDir)?,
 		)?;
-		let length = fs::copy(object, temporary.path())?;
-		if length != pointer.size {
+		if pointer.size != 0
+			&& fs::copy(object, temporary.path())? != pointer.size
+		{
 			return Err(Error::Generic(
 				"The local Git LFS object has an unexpected size."
 					.into(),
 			));
 		}
-		fs::set_permissions(
-			temporary.path(),
-			fs::metadata(&destination)?.permissions(),
-		)?;
-		// Leave edits made during the copy intact.
-		if worktree_pointer(repo, path).1.as_ref() != Some(&pointer) {
-			continue;
+		fs::set_permissions(temporary.path(), permissions.clone())?;
+		index.read(false)?;
+		// Leave edits, deletions and index changes made during the copy intact.
+		if index.get_path(path, 0).is_some_and(|current| {
+			current.id == entry.id && current.mode == entry.mode
+		}) && checkout_pointer(root, path).is_some_and(
+			|(bytes, current_permissions)| {
+				bytes == original
+					&& current_permissions == permissions
+			},
+		) {
+			temporary
+				.persist(&destination)
+				.map_err(|error| Error::Generic(error.to_string()))?;
 		}
-		temporary
-			.persist(&destination)
-			.map_err(|error| Error::Generic(error.to_string()))?;
+	}
+
+	remaining += checkout_batches(repo, &fallback)?;
+	if remaining != 0 {
+		return Err(Error::Generic(format!(
+			"{remaining} Git LFS file(s) are still pointers. Download the required LFS objects to restore them."
+		)));
 	}
 	Ok(())
 }
 
-fn checkout_candidate(
+fn checkout_batches(
 	repo: &Repository,
-	index: &git2::Index,
-	path: &Path,
-) -> bool {
-	let (_, working) = worktree_pointer(repo, path);
-	let Some(working) = working else {
-		return false;
-	};
-	let staged = index
-		.get_path(path, 0)
-		.and_then(|entry| blob_pointer(repo, entry.id));
-	staged.as_ref() == Some(&working)
-}
-fn check_restore<'a>(
-	repo: &Repository,
-	paths: impl IntoIterator<Item = &'a Path>,
-) -> Result<()> {
-	let remaining = paths
-		.into_iter()
-		.filter(|path| {
+	paths: &[(&Path, String)],
+) -> Result<usize> {
+	// Each invocation scans the repository. Group short paths while leaving
+	// space for command-line quoting and platform argument limits.
+	let limit = if cfg!(windows) { 12_000 } else { 64_000 };
+	let prefix = ["lfs", "checkout", "--"];
+	let mut batch = prefix.to_vec();
+	let mut used = 0;
+	for (_, pattern) in paths {
+		let cost = pattern.len() + 3;
+		if used + cost > limit && used != 0 {
+			git(repo, batch.iter().copied(), false)?;
+			batch.truncate(prefix.len());
+			used = 0;
+		}
+		used += cost;
+		batch.push(pattern.as_str());
+	}
+	if used != 0 {
+		git(repo, batch, false)?;
+	}
+	Ok(paths
+		.iter()
+		.filter(|(path, _)| {
 			worktree_pointer(repo, path).0 == LfsWorktree::Pointer
 		})
-		.count();
+		.count())
+}
+
+struct CheckoutCandidate<'a> {
+	name: &'a str,
+	entry: git2::IndexEntry,
+	original: Vec<u8>,
+	permissions: fs::Permissions,
+	pointer: LfsPointer,
+}
+
+fn checkout_candidates<'a>(
+	repo: &Repository,
+	index: &git2::Index,
+	root: &Path,
+	paths: &[&'a str],
+	tree: Option<&git2::Tree<'_>>,
+) -> Result<Vec<CheckoutCandidate<'a>>> {
+	let mut candidates = Vec::new();
+	let odb = repo.odb()?;
+	for name in paths {
+		let path = Path::new(name);
+		checked_path(path)?;
+		let Some((original, permissions)) =
+			checkout_pointer(root, path)
+		else {
+			continue;
+		};
+		let Some(pointer) = parse_pointer(&original) else {
+			continue;
+		};
+		let Some(entry) = index.get_path(path, 0) else {
+			continue;
+		};
+		if !matches!(entry.mode, 0o100_644 | 0o100_755)
+			|| !odb.read_header(entry.id).is_ok_and(|(size, kind)| {
+				kind == ObjectType::Blob && size < POINTER_LIMIT
+			}) || tree.is_some_and(|tree| {
+			!tree
+				.get_path(path)
+				.is_ok_and(|item| item.id() == entry.id)
+		}) {
+			continue;
+		}
+		let blob = repo.find_blob(entry.id)?;
+		// Compare all pointer lines, including extension identities. Git can
+		// write CRLF line endings for paths with text conversion enabled.
+		if !std::str::from_utf8(&original).is_ok_and(|original| {
+			std::str::from_utf8(blob.content()).is_ok_and(|staged| {
+				original.lines().eq(staged.lines())
+			})
+		}) {
+			continue;
+		}
+		candidates.push(CheckoutCandidate {
+			name,
+			entry,
+			original,
+			permissions,
+			pointer,
+		});
+	}
+	Ok(candidates)
+}
+
+fn checkout_parent_is_safe(root: &Path, path: &Path) -> bool {
+	// Do not follow a directory symlink from a tracked path into another tree.
+	path.ancestors()
+		.skip(1)
+		.take_while(|path| !path.as_os_str().is_empty())
+		.all(|parent| {
+			fs::symlink_metadata(root.join(parent)).is_ok_and(
+				|metadata| {
+					metadata.is_dir()
+						&& !metadata.file_type().is_symlink()
+				},
+			)
+		})
+}
+
+fn checkout_pointer(
+	root: &Path,
+	path: &Path,
+) -> Option<(Vec<u8>, fs::Permissions)> {
+	let destination = root.join(path);
+	let metadata = fs::symlink_metadata(&destination).ok()?;
+	if !metadata.is_file()
+		|| metadata.len() >= POINTER_LIMIT as u64
+		|| !checkout_parent_is_safe(root, path)
+	{
+		return None;
+	}
+	let mut bytes = Vec::new();
+	fs::File::open(destination)
+		.ok()?
+		.take(POINTER_LIMIT as u64)
+		.read_to_end(&mut bytes)
+		.ok()?;
+	Some((bytes, metadata.permissions()))
+}
+
+/// Update the branch first with pointers, then materialize only the paths
+/// changed by the update. A failed transfer leaves the new index and HEAD
+/// intact, so downloads can be retried without pulling again.
+pub(super) fn pull_fast_forward(
+	repo: &Repository,
+	branch: &git2::Reference<'_>,
+	before: &git2::Commit<'_>,
+	target: &git2::Commit<'_>,
+) -> Result<()> {
+	require_ready(repo)?;
+	if !pull_head_matches(repo, branch, before.id())? {
+		return Err(Error::Generic(
+			"The checked-out branch changed during Pull.".into(),
+		));
+	}
+	let target_id = target.id().to_string();
+	let merged = git_cli::output(
+		repo,
+		[
+			"merge",
+			"--ff-only",
+			"--no-autostash",
+			"--no-overwrite-ignore",
+			"--no-stat",
+			"--",
+			&target_id,
+		],
+		true,
+	)?;
+	if let Err(error) = git_cli::checked(merged) {
+		if pull_head_matches(repo, branch, target.id())
+			.unwrap_or(false)
+		{
+			return Err(pull_restore_error(&error));
+		}
+		return Err(Error::Generic(format!(
+			"Git could not complete the fast-forward. Review the working tree for partially updated files before retrying.\n{error}"
+		)));
+	}
+	hydrate_pull_paths(repo, branch, before, target)
+		.map_err(|error| pull_restore_error(&error))
+}
+
+fn pull_head_matches(
+	repo: &Repository,
+	branch: &git2::Reference<'_>,
+	commit: git2::Oid,
+) -> Result<bool> {
+	let head = repo.head()?;
+	Ok(head.name_bytes() == branch.name_bytes()
+		&& head.target() == Some(commit))
+}
+
+fn pull_restore_error(error: &Error) -> Error {
+	Error::Generic(format!(
+		"The branch was updated, but Git LFS files could not be restored. \
+			Open the Git LFS menu to retry downloading the affected files.\n{error}"
+	))
+}
+
+struct PullPath<'a> {
+	path: &'a Path,
+	git_path: &'a [u8],
+	id: git2::Oid,
+	mode: u32,
+	pointer: LfsPointer,
+	snapshot: (Vec<u8>, fs::Permissions),
+}
+
+impl PullPath<'_> {
+	fn matches_index(&self, index: &git2::Index) -> bool {
+		index.get_path(self.path, 0).is_some_and(|entry| {
+			entry.id == self.id && entry.mode == self.mode
+		})
+	}
+
+	fn matches_worktree(&self, root: &Path) -> bool {
+		checkout_pointer(root, self.path).as_ref()
+			== Some(&self.snapshot)
+	}
+}
+
+fn same_pointer_text(left: &[u8], right: &[u8]) -> bool {
+	// Git may translate newlines when the path has text attributes.
+	fn lines(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+		bytes
+			.split(|byte| *byte == b'\n')
+			.map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+	}
+	left == right || lines(left).eq(lines(right))
+}
+
+fn pull_candidates<'a>(
+	repo: &Repository,
+	root: &Path,
+	index: &git2::Index,
+	diff: &'a git2::Diff<'_>,
+) -> Result<Vec<PullPath<'a>>> {
+	let odb = repo.odb()?;
+	let mut candidates =
+		diff.deltas()
+			.filter_map(|delta| {
+				let file = delta.new_file();
+				let id = file.id();
+				let mode = u32::from(file.mode());
+				if id == delta.old_file().id()
+					|| !matches!(mode, 0o100_644 | 0o100_755)
+				{
+					return None;
+				}
+				let (size, _) = odb.read_header(id).ok()?;
+				if size >= POINTER_LIMIT {
+					return None;
+				}
+				let blob = repo.find_blob(id).ok()?;
+				let pointer = parse_pointer(blob.content())?;
+				let git_path = file.path_bytes()?;
+				#[cfg(windows)]
+				std::str::from_utf8(git_path).ok()?;
+				let path = file.path()?;
+				if git_path.is_empty()
+					|| !path.components().all(|part| {
+						matches!(part, Component::Normal(_))
+					}) {
+					return None;
+				}
+				let snapshot = checkout_pointer(root, path)?;
+				if !same_pointer_text(&snapshot.0, blob.content()) {
+					return None;
+				}
+				let change = PullPath {
+					path,
+					git_path,
+					id,
+					mode,
+					pointer,
+					snapshot,
+				};
+				change.matches_index(index).then_some(change)
+			})
+			.collect::<Vec<_>>();
+	let attributed = attributed_path_bytes(
+		repo,
+		candidates.iter().map(|change| change.git_path),
+	)?;
+	candidates.retain(|change| attributed.contains(change.git_path));
+	Ok(candidates)
+}
+
+fn hydrate_pull_paths(
+	repo: &Repository,
+	branch: &git2::Reference<'_>,
+	before: &git2::Commit<'_>,
+	target: &git2::Commit<'_>,
+) -> Result<()> {
+	if !pull_head_matches(repo, branch, target.id())? {
+		return Err(Error::Generic(
+			"The checked-out branch changed before LFS download."
+				.into(),
+		));
+	}
+	let root = repo.workdir().ok_or(Error::NoWorkDir)?;
+	let mut index = repo.index()?;
+	index.read(true)?;
+	let old_tree = before.tree()?;
+	let new_tree = target.tree()?;
+	let diff = repo.diff_tree_to_tree(
+		Some(&old_tree),
+		Some(&new_tree),
+		None,
+	)?;
+	let mut candidates = pull_candidates(repo, root, &index, &diff)?;
+	if candidates.is_empty() {
+		return Ok(());
+	}
+
+	// Git skips rewriting an up-to-date worktree pointer in place. A fresh
+	// destination forces the normal smudge filter to run, honoring the
+	// user's skip-smudge, fetchinclude, and fetchexclude settings.
+	let scratch = tempfile::tempdir_in(repo.path())?;
+	#[cfg(windows)]
+	let scratch_path = scratch.path().to_str().ok_or_else(|| {
+		Error::Generic(
+			"The temporary LFS directory path is not UTF-8.".into(),
+		)
+	})?;
+	#[cfg(windows)]
+	let scratch_path = scratch_path.replace('\\', "/");
+	#[cfg(not(windows))]
+	let scratch_path = scratch.path();
+	let mut prefix = std::ffi::OsString::from("--prefix=");
+	prefix.push(scratch_path);
+	prefix.push("/");
+	let input = candidates
+		.iter()
+		.flat_map(|change| change.git_path.iter().copied().chain([0]))
+		.collect();
+	git_cli::with_input(
+		repo,
+		[
+			OsStr::new("checkout-index"),
+			&prefix,
+			OsStr::new("-z"),
+			OsStr::new("--stdin"),
+		],
+		input,
+		false,
+	)?;
+
+	// A pointer returned by the filter means smudge was skipped for this path.
+	candidates.retain(|change| {
+		let source = scratch.path().join(change.path);
+		source.is_file()
+			&& file_pointer(&source).1.as_ref()
+				!= Some(&change.pointer)
+	});
+	drop(scratch);
+
+	// Keep edits made while Git LFS was downloading.
+	if !pull_head_matches(repo, branch, target.id())? {
+		return Err(Error::Generic(
+			"The checked-out branch changed during LFS download."
+				.into(),
+		));
+	}
+	index.read(true)?;
+	let mut eligible = Vec::new();
+	for change in candidates {
+		if !change.matches_index(&index)
+			|| !change.matches_worktree(root)
+		{
+			continue;
+		}
+		let pattern = literal_pattern(checked_path(change.path)?)?;
+		eligible.push((change.path, pattern));
+	}
+	// Native LFS checkout restores the downloaded objects and updates Git's
+	// cached file stats. Moving scratch files alone leaves them marked dirty.
+	let remaining = checkout_batches(repo, &eligible)?;
 	if remaining != 0 {
 		return Err(Error::Generic(format!(
-			"{remaining} Git LFS file(s) are still pointers. Download the required LFS objects to restore them."
+			"{remaining} Git LFS file(s) are still pointers."
 		)));
 	}
 	Ok(())
@@ -929,26 +1323,43 @@ pub fn download(
 ) -> Result<()> {
 	let repo = repo(repo_path)?;
 	require_ready(&repo)?;
-	let head = repo.head()?.peel_to_commit()?;
+	let head_ref = repo.head()?;
+	let head = head_ref.peel_to_commit()?;
+	let tree = head.tree()?;
 	let head_id = head.id().to_string();
+	let env = lfs_env(&repo)?;
 	let mut args =
 		vec!["-c", "lfs.fetchrecentalways=false", "lfs", "fetch"];
-	let include;
-	if let Some(path) = path {
-		checked_path(Path::new(path))?;
-		let pointer =
-			tree_pointer(&repo, &head.tree()?, Path::new(path));
-		if pointer.is_none()
-			|| pointer != index_pointer(&repo, Path::new(path))
-		{
+	let (include, exclude) = if let Some(path) = path {
+		let file = Path::new(path);
+		checked_path(file)?;
+		let index = repo.index()?;
+		if !tree.get_path(file).is_ok_and(|entry| {
+			matches!(entry.filemode(), 0o100_644 | 0o100_755)
+				&& index.get_path(file, 0).is_some_and(|staged| {
+					matches!(staged.mode, 0o100_644 | 0o100_755)
+						&& staged.id == entry.id()
+				}) && blob_pointer(&repo, entry.id()).is_some()
+		}) {
 			return Err(Error::Generic("Select an LFS file whose index version matches HEAD.".into()));
 		}
 		if path.contains(',') {
 			return Err(Error::Generic("Git LFS include filters cannot select this file alone. Download the current version instead.".into()));
 		}
-		include = format!("--include={}", literal_pattern(path)?);
-		args.extend([include.as_str(), "--exclude="]);
-	}
+		(literal_pattern(path)?, "")
+	} else {
+		(
+			env_value(&env, "FetchInclude=")
+				.unwrap_or_default()
+				.to_owned(),
+			env_value(&env, "FetchExclude=").unwrap_or_default(),
+		)
+	};
+	// Use the same effective settings for the fetch and the later tree scan.
+	// ls-files does not apply configured fetch filters on its own.
+	let include = format!("--include={include}");
+	let exclude = format!("--exclude={exclude}");
+	args.extend([include.as_str(), exclude.as_str()]);
 	// An explicit ref needs an explicit remote. Git's upstream remote is the
 	// normal default; Git LFS additionally accepts remote.lfsdefault.
 	let default_remote;
@@ -975,10 +1386,30 @@ pub fn download(
 	};
 	args.extend(["--", remote, &head_id]);
 	git(&repo, args, false)?;
-	if repo.head()?.peel_to_commit()?.id() != head.id() {
+	let current = repo.head()?;
+	if current.name_bytes() != head_ref.name_bytes()
+		|| current.peel_to_commit()?.id() != head.id()
+	{
 		return Err(Error::Generic("Git LFS objects were downloaded, but HEAD changed. Run restore for the current version.".into()));
 	}
-	checkout_local(&repo, path.map(Path::new))
+	if let Some(path) = path {
+		return checkout_index_paths(
+			&repo,
+			&[path],
+			Some(&tree),
+			&env,
+		);
+	}
+	let files = lfs_files(&repo, &[&include, &exclude, &head_id])?;
+	checkout_index_paths(
+		&repo,
+		&files
+			.iter()
+			.map(|file| file.name.as_str())
+			.collect::<Vec<_>>(),
+		Some(&tree),
+		&env,
+	)
 }
 
 #[cfg(test)]

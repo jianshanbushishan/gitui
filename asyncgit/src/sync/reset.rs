@@ -1,5 +1,6 @@
 use super::{
-	lfs,
+	git_cli, lfs,
+	status::{parse_porcelain_status, StatusItemType},
 	utils::{get_head_repo, path_or_repo_root},
 	CommitId, RepoPath,
 };
@@ -9,6 +10,7 @@ use crate::{
 };
 use git2::{build::CheckoutBuilder, ObjectType, ResetType};
 use scopetime::scope_time;
+use std::{collections::HashSet, fs, io::ErrorKind, path::Path};
 
 ///
 pub fn reset_stage(repo_path: &RepoPath, path: &str) -> Result<()> {
@@ -63,7 +65,7 @@ pub fn reset_workdir(repo_path: &RepoPath, path: &str) -> Result<()> {
 	let repo = repo(repo_path)?;
 	if lfs::is_repo(&repo)? {
 		if path == "*" {
-			return Err(Error::Generic("Discard all is unavailable in LFS repositories; discard individual changes instead".into()));
+			return reset_all_lfs(&repo);
 		}
 		lfs::require_ready(&repo)?;
 		let tracked = lfs::git(
@@ -109,6 +111,119 @@ pub fn reset_workdir(repo_path: &RepoPath, path: &str) -> Result<()> {
 		.path(path);
 
 	repo.checkout_index(None, Some(&mut checkout_opts))?;
+	Ok(())
+}
+
+fn reset_all_lfs(repo: &git2::Repository) -> Result<()> {
+	// Compare with the index through Git's clean filters so a hydrated,
+	// unchanged LFS file is never replaced by its pointer during reset.
+	let status = lfs::git(
+		repo,
+		[
+			"status",
+			"--porcelain=v2",
+			"-z",
+			"--no-renames",
+			"--untracked-files=no",
+			"--ignore-submodules=all",
+		],
+		false,
+	)?;
+	let (_, changes) = parse_porcelain_status(&status)?;
+	if changes
+		.iter()
+		.any(|change| change.status == StatusItemType::Conflicted)
+	{
+		return Err(Error::Generic(
+			"Reset All cannot restore unmerged files. Resolve or abort the conflict first.".into(),
+		));
+	}
+	let paths = changes
+		.iter()
+		.map(|change| change.path.as_str())
+		.collect::<Vec<_>>();
+
+	if !paths.is_empty() {
+		lfs::require_ready(repo)?;
+	}
+	// Apply the current ignore rules before restoring tracked files. A
+	// reset of .gitignore must not expose previously ignored files to clean.
+	lfs::git(repo, ["clean", "-f", "-d", "-q", "--", "."], false)?;
+	if paths.is_empty() {
+		return Ok(());
+	}
+	// Git restore can replace an entire directory even when clean kept
+	// ignored files or a nested repository there.
+	check_restore_obstructions(
+		repo.workdir().ok_or(Error::NoWorkDir)?,
+		&paths,
+	)?;
+	let input = paths
+		.iter()
+		.flat_map(|path| path.bytes().chain([0]))
+		.collect();
+	git_cli::with_input(
+		repo,
+		[
+			"--literal-pathspecs",
+			"restore",
+			"--worktree",
+			"--no-recurse-submodules",
+			"--pathspec-from-file=-",
+			"--pathspec-file-nul",
+		],
+		input,
+		true,
+	)
+	.map_err(|error| {
+		Error::Generic(format!(
+			"Untracked files were cleaned, but restoring tracked files failed.\n{error}"
+		))
+	})?;
+	lfs::checkout_index_local(repo, &paths)
+}
+
+fn check_restore_obstructions(
+	root: &Path,
+	paths: &[&str],
+) -> Result<()> {
+	let mut checked_parents = HashSet::new();
+	for name in paths {
+		let path = Path::new(name);
+		let blocked = |path: &Path| {
+			Error::Generic(format!(
+			"Untracked files were cleaned, but Reset All stopped to protect files at '{}'. Move them before restoring the tracked files.",
+			path.display()
+		))
+		};
+		for parent in path
+			.ancestors()
+			.skip(1)
+			.take_while(|parent| !parent.as_os_str().is_empty())
+		{
+			if checked_parents.insert(parent) {
+				match fs::symlink_metadata(root.join(parent)) {
+					Ok(metadata) if !metadata.is_dir() => {
+						return Err(blocked(parent))
+					}
+					Ok(_) => {}
+					Err(error)
+						if error.kind() == ErrorKind::NotFound => {}
+					Err(error) => return Err(error.into()),
+				}
+			}
+		}
+		match fs::symlink_metadata(root.join(path)) {
+			Ok(metadata) if metadata.is_dir() => {
+				if fs::read_dir(root.join(path))?.next().is_some() {
+					return Err(blocked(path));
+				}
+			}
+			Ok(_) => {}
+			Err(error) if error.kind() == ErrorKind::NotFound => {}
+			Err(error) => return Err(error.into()),
+		}
+	}
 	Ok(())
 }
 

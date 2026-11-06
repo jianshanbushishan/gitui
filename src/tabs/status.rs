@@ -1092,7 +1092,7 @@ impl Status {
 			.push(InternalEvent::ConfirmAction(Action::UndoCommit));
 	}
 
-	fn request_branch_compare(&self) {
+	pub fn request_branch_compare(&self) {
 		if let Some(branch) = self.git_branch_name.last() {
 			self.git_branch_compare.spawn(
 				AsyncBranchCompareJob::new(

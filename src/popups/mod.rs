@@ -117,7 +117,6 @@ fn render_popup<'a, T>(
 		return;
 	}
 
-	let style = theme.text_danger();
 	let text: Text<'a> = content.into();
 	let max_width = usize::from(inner.width);
 
@@ -130,7 +129,7 @@ fn render_popup<'a, T>(
 			break;
 		}
 
-		let line_style = line.style.patch(style);
+		let line_style = text.style.patch(line.style);
 		let wrapped = wrap_line(line, max_width);
 		for (j, chunk) in wrapped.iter().enumerate() {
 			let Ok(sub_row) = u16::try_from(j) else {
