@@ -47,6 +47,7 @@ use super::InspectCommitOpen;
 pub struct BranchListPopup {
 	repo: RepoPathRef,
 	branches: Vec<BranchInfo>,
+	longest_branch_name_width: usize,
 	remote_url_width: usize,
 	local: bool,
 	has_remotes: bool,
@@ -250,6 +251,7 @@ impl BranchListPopup {
 	pub fn new(env: &Environment) -> Self {
 		Self {
 			branches: Vec::new(),
+			longest_branch_name_width: 0,
 			remote_url_width: 0,
 			local: true,
 			has_remotes: false,
@@ -359,6 +361,11 @@ impl BranchListPopup {
 					})
 				})
 				.unwrap_or(usize::from(self.selection));
+			self.longest_branch_name_width = branches
+				.iter()
+				.map(|branch| branch.name.width())
+				.max()
+				.unwrap_or_default();
 			self.remote_url_width = branches
 				.iter()
 				.filter_map(Self::remote_url)
@@ -577,8 +584,12 @@ impl BranchListPopup {
 			let content_width = width_without_time.saturating_sub(
 				COMMIT_HASH_LENGTH + IS_HEAD_STAR_LENGTH + 1,
 			);
-			let branch_name_width =
+			let mut branch_name_width =
 				(width_without_time * 40 / 100).min(content_width);
+			if !self.local {
+				branch_name_width = branch_name_width
+					.min(self.longest_branch_name_width);
+			}
 			let branch_name = Self::truncate_text(
 				&displaybranch.name,
 				branch_name_width,
@@ -919,7 +930,8 @@ mod tests {
 		)
 		.unwrap();
 		let other_branch = "archive/很长的分支名字/HEAD";
-		let url = "https://example.com/仓库.git";
+		let url =
+			"https://example.com/organization/long-project/仓库.git";
 		repo.remote("origin", url).unwrap();
 		for (name, tip) in [
 			("origin/feature", commit.id()),
@@ -966,6 +978,15 @@ mod tests {
 		assert_eq!(other.spans[2].width(), origin.spans[2].width());
 		assert!(other.to_string().contains(&other_time));
 		assert_eq!(other.spans.last().unwrap().content, "other tip");
+
+		let text = popup.get_text(&env.theme, 120, 2);
+		for line in &text.lines {
+			assert_eq!(
+				line.spans[1].width(),
+				other_branch.width() + 1
+			);
+		}
+		assert_eq!(text.lines[0].spans[2].content.trim_end(), url);
 
 		// The URL has priority over the summary when space is limited.
 		let text = popup.get_text(&env.theme, 60, 2);
