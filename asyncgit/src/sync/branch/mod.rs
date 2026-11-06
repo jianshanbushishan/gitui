@@ -69,6 +69,8 @@ pub struct UpstreamBranch {
 pub struct RemoteBranch {
 	///
 	pub has_tracking: bool,
+	/// Whether this ref is an alias for another ref.
+	pub is_symbolic: bool,
 	/// Fetch URL of the remote whose refspec owns this branch.
 	pub remote_url: Option<String>,
 }
@@ -93,6 +95,8 @@ pub struct BranchInfo {
 	pub top_commit_message: String,
 	///
 	pub top_commit: CommitId,
+	/// Committer timestamp of the branch tip, in seconds since the Unix epoch.
+	pub top_commit_time: i64,
 	///
 	pub details: BranchDetails,
 }
@@ -193,6 +197,10 @@ pub fn get_branches_info(
 				BranchDetails::Remote(RemoteBranch {
 					has_tracking: remotes_with_tracking
 						.contains(name_bytes),
+					is_symbolic: branch
+						.get()
+						.symbolic_target_bytes()
+						.is_some(),
 					remote_url,
 				})
 			};
@@ -204,6 +212,7 @@ pub fn get_branches_info(
 					top_commit.summary_bytes().unwrap_or_default(),
 				)?,
 				top_commit: top_commit.id().into(),
+				top_commit_time: top_commit.time().seconds(),
 				details,
 			})
 		})

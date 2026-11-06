@@ -1,6 +1,7 @@
 use crate::components::{
-	visibility_blocking, CommandBlocking, CommandInfo, Component,
-	DrawableComponent, EventState, FuzzyFinderTarget, VerticalScroll,
+	time_to_string, visibility_blocking, CommandBlocking,
+	CommandInfo, Component, DrawableComponent, EventState,
+	FuzzyFinderTarget, VerticalScroll,
 };
 use crate::{
 	app::Environment,
@@ -38,6 +39,7 @@ use ratatui::{
 use std::cell::Cell;
 use ui::style::SharedTheme;
 use unicode_truncate::UnicodeTruncateStr;
+use unicode_width::UnicodeWidthStr;
 
 use super::InspectCommitOpen;
 
@@ -328,16 +330,35 @@ impl BranchListPopup {
 	pub fn update_branches(&mut self) -> Result<()> {
 		if self.is_visible() {
 			self.check_remotes();
-			self.branches =
+			let selected_branch =
+				self.branches.get(usize::from(self.selection));
+			let mut branches =
 				get_branches_info(&self.repo.borrow(), self.local)?;
-			//remove remote branch called `HEAD`
-			if !self.local {
-				self.branches
-					.iter()
-					.position(|b| b.name.ends_with("/HEAD"))
-					.map(|idx| self.branches.remove(idx));
-			}
-			self.set_selection(self.selection)?;
+			// Skip remote HEAD aliases while keeping branches ending in /HEAD.
+			branches.retain(|branch| {
+				!(branch.name.ends_with("/HEAD")
+					&& matches!(
+						branch.details,
+						BranchDetails::Remote(RemoteBranch {
+							is_symbolic: true,
+							..
+						})
+					))
+			});
+			branches.sort_unstable_by(|a, b| {
+				b.top_commit_time
+					.cmp(&a.top_commit_time)
+					.then_with(|| a.name.cmp(&b.name))
+			});
+			let selection = selected_branch
+				.and_then(|selected| {
+					branches.iter().position(|branch| {
+						branch.reference == selected.reference
+					})
+				})
+				.unwrap_or(usize::from(self.selection));
+			self.branches = branches;
+			self.set_selection(selection.try_into()?)?;
 		}
 		Ok(())
 	}
@@ -492,28 +513,17 @@ impl BranchListPopup {
 		Ok(())
 	}
 
-	fn branch_details_text(
-		branch: &BranchInfo,
-		width: usize,
-	) -> String {
+	fn truncate_text(text: &str, width: usize) -> String {
 		const ELLIPSIS: &str = "...";
-		let details = match &branch.details {
-			BranchDetails::Remote(RemoteBranch {
-				remote_url: Some(url),
-				..
-			}) => format!("{url}  {}", branch.top_commit_message),
-			_ => branch.top_commit_message.clone(),
-		};
-		if details.unicode_truncate(width).0.len() == details.len() {
-			return details;
+		if text.width() <= width {
+			return text.to_string();
 		}
 		format!(
 			"{}{}",
-			details
-				.unicode_truncate(
-					width.saturating_sub(ELLIPSIS.len())
-				)
-				.0,
+			text.unicode_truncate(
+				width.saturating_sub(ELLIPSIS.len())
+			)
+			.0,
 			ELLIPSIS.unicode_truncate(width).0,
 		)
 	}
@@ -529,19 +539,9 @@ impl BranchListPopup {
 		const TRACKING_SYMBOL: char = '\u{2193}';
 		const HEAD_SYMBOL: char = '*';
 		const EMPTY_SYMBOL: char = ' ';
-		const THREE_DOTS: &str = "...";
-		const THREE_DOTS_LENGTH: usize = THREE_DOTS.len(); // "..."
 		const COMMIT_HASH_LENGTH: usize = 8;
 		const IS_HEAD_STAR_LENGTH: usize = 3; // "*  "
 
-		let branch_name_length: usize =
-			width_available as usize * 40 / 100;
-		// commit message takes up the remaining width
-		let commit_message_length: usize = (width_available as usize)
-			.saturating_sub(COMMIT_HASH_LENGTH)
-			.saturating_sub(branch_name_length)
-			.saturating_sub(IS_HEAD_STAR_LENGTH)
-			.saturating_sub(THREE_DOTS_LENGTH);
 		let mut txt = Vec::new();
 
 		for (i, displaybranch) in self
@@ -551,24 +551,38 @@ impl BranchListPopup {
 			.take(height)
 			.enumerate()
 		{
-			let commit_message = Self::branch_details_text(
-				displaybranch,
-				commit_message_length,
+			let time = format!(
+				"{} ",
+				time_to_string(displaybranch.top_commit_time, false)
 			);
-
-			let mut branch_name = displaybranch.name.clone();
-			if branch_name.len()
-				> branch_name_length.saturating_sub(THREE_DOTS_LENGTH)
-			{
-				branch_name = branch_name
-					.unicode_truncate(
-						branch_name_length
-							.saturating_sub(THREE_DOTS_LENGTH),
-					)
-					.0
-					.to_string();
-				branch_name += THREE_DOTS;
-			}
+			let width_without_time = usize::from(width_available)
+				.saturating_sub(time.len());
+			let content_width = width_without_time.saturating_sub(
+				COMMIT_HASH_LENGTH + IS_HEAD_STAR_LENGTH + 1,
+			);
+			let branch_name_width =
+				(width_without_time * 40 / 100).min(content_width);
+			let branch_name = Self::truncate_text(
+				&displaybranch.name,
+				branch_name_width,
+			);
+			let name_padding = branch_name_width
+				.saturating_sub(branch_name.width())
+				+ 1;
+			let details = match &displaybranch.details {
+				BranchDetails::Remote(RemoteBranch {
+					remote_url: Some(url),
+					..
+				}) => format!(
+					"{url}  {}",
+					displaybranch.top_commit_message
+				),
+				_ => displaybranch.top_commit_message.clone(),
+			};
+			let commit_message = Self::truncate_text(
+				&details,
+				content_width - branch_name_width,
+			);
 
 			let selected = (self.selection as usize
 				- self.scroll.get_top())
@@ -603,11 +617,11 @@ impl BranchListPopup {
 				theme.commit_hash(selected),
 			);
 			let span_msg = Span::styled(
-				commit_message.clone(),
+				commit_message,
 				theme.text(true, selected),
 			);
 			let span_name = Span::styled(
-				format!("{branch_name:branch_name_length$} "),
+				format!("{branch_name}{:name_padding$}", ""),
 				theme.branch(selected, is_head),
 			);
 
@@ -615,6 +629,7 @@ impl BranchListPopup {
 				span_prefix,
 				span_name,
 				span_hash,
+				Span::styled(time, theme.commit_time(selected)),
 				span_msg,
 			]));
 		}
@@ -848,19 +863,56 @@ mod tests {
 	use crossterm::event::{KeyCode, KeyModifiers};
 
 	#[test]
-	fn branch_rows_show_remote_urls_and_preserve_commit_details() {
+	fn branch_rows_sort_by_tip_time_and_preserve_commit_details() {
 		let (dir, repo) = git2_testing::repo_init();
 		let head = repo.head().unwrap();
 		let commit = head.peel_to_commit().unwrap();
 		let summary = commit.summary().unwrap().unwrap();
+		let tip_time = commit.time().seconds() - 86_400;
+		let committer = git2::Signature::new(
+			"name",
+			"email",
+			&git2::Time::new(tip_time, 0),
+		)
+		.unwrap();
+		let other_tip = repo
+			.commit(
+				None,
+				&commit.author(),
+				&committer,
+				"other tip",
+				&commit.tree().unwrap(),
+				&[&commit],
+			)
+			.unwrap();
+		let other_local_branch = "a-older";
+		repo.branch(
+			other_local_branch,
+			&repo.find_commit(other_tip).unwrap(),
+			false,
+		)
+		.unwrap();
+		let other_branch = "archive/很长的分支名字/HEAD";
 		let url = "https://example.com/仓库.git";
 		repo.remote("origin", url).unwrap();
-		for name in ["origin/feature", "orphan/feature"] {
+		for (name, tip) in [
+			("origin/feature", commit.id()),
+			(other_branch, other_tip),
+		] {
 			repo.reference(
 				&format!("refs/remotes/{name}"),
-				commit.id(),
+				tip,
 				false,
-				"test remote URL",
+				"test remote branch",
+			)
+			.unwrap();
+		}
+		for remote in ["origin", "upstream"] {
+			repo.reference_symbolic(
+				&format!("refs/remotes/{remote}/HEAD"),
+				"refs/remotes/origin/feature",
+				false,
+				"test remote HEAD alias",
 			)
 			.unwrap();
 		}
@@ -870,9 +922,14 @@ mod tests {
 		popup.local = false;
 		popup.open().unwrap();
 
-		let text = popup.get_text(&env.theme, 240, 2);
+		let head_time =
+			time_to_string(commit.time().seconds(), false);
+		let other_time = time_to_string(tip_time, false);
+		let text = popup.get_text(&env.theme, 240, 4);
+		assert_eq!(text.lines.len(), 2);
 		let origin = &text.lines[0];
 		assert!(origin.to_string().contains("origin/feature"));
+		assert!(origin.to_string().contains(&head_time));
 		assert!(origin
 			.to_string()
 			.contains(&commit.id().to_string()[..7]));
@@ -880,10 +937,10 @@ mod tests {
 			origin.spans.last().unwrap().content,
 			format!("{url}  {summary}"),
 		);
-		assert_eq!(
-			text.lines[1].spans.last().unwrap().content,
-			summary,
-		);
+		let other = &text.lines[1];
+		assert!(other.to_string().contains(other_branch));
+		assert!(other.to_string().contains(&other_time));
+		assert_eq!(other.spans.last().unwrap().content, "other tip");
 
 		// The URL has priority over the summary when space is limited.
 		let text = popup.get_text(&env.theme, 60, 2);
@@ -892,24 +949,38 @@ mod tests {
 		assert!(detail.ends_with("..."));
 		// Include widths that truncate inside the multibyte URL, and
 		// widths too small to fit the full ellipsis.
-		for width in 0..=120 {
+		for width in 32..=120 {
 			let text = popup.get_text(&env.theme, width, 2);
-			let available = (usize::from(width))
-				.saturating_sub(usize::from(width) * 40 / 100)
-				.saturating_sub(14);
-			assert!(
-				text.lines[0].spans.last().unwrap().width()
-					<= available
-			);
+			for line in &text.lines {
+				assert!(line.width() <= usize::from(width));
+			}
 		}
+
+		// A ref update can move the selected branch to a different row.
+		popup.set_selection(1).unwrap();
+		repo.reference(
+			&format!("refs/remotes/{other_branch}"),
+			commit.id(),
+			true,
+			"update test branch",
+		)
+		.unwrap();
+		popup.update_branches().unwrap();
+		assert_eq!(popup.branches[0].name, other_branch);
+		assert_eq!(popup.selection, 0);
 
 		popup.local = true;
 		popup.update_branches().unwrap();
-		let text = popup.get_text(&env.theme, 240, 1);
+		let text = popup.get_text(&env.theme, 240, 2);
+		assert!(text.lines[0].to_string().contains(&head_time));
 		assert_eq!(
 			text.lines[0].spans.last().unwrap().content,
 			summary,
 		);
+		assert!(text.lines[1]
+			.to_string()
+			.contains(other_local_branch));
+		assert!(text.lines[1].to_string().contains(&other_time));
 	}
 
 	#[test]
