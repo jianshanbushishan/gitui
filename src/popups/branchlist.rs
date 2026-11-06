@@ -48,7 +48,7 @@ pub struct BranchListPopup {
 	repo: RepoPathRef,
 	branches: Vec<BranchInfo>,
 	longest_branch_name_width: usize,
-	remote_url_width: usize,
+	remote_text_width: usize,
 	local: bool,
 	has_remotes: bool,
 	visible: bool,
@@ -252,7 +252,7 @@ impl BranchListPopup {
 		Self {
 			branches: Vec::new(),
 			longest_branch_name_width: 0,
-			remote_url_width: 0,
+			remote_text_width: 0,
 			local: true,
 			has_remotes: false,
 			visible: false,
@@ -366,9 +366,9 @@ impl BranchListPopup {
 				.map(|branch| branch.name.width())
 				.max()
 				.unwrap_or_default();
-			self.remote_url_width = branches
+			self.remote_text_width = branches
 				.iter()
-				.filter_map(Self::remote_url)
+				.filter_map(Self::remote_text)
 				.map(UnicodeWidthStr::width)
 				.max()
 				.unwrap_or_default();
@@ -528,12 +528,14 @@ impl BranchListPopup {
 		Ok(())
 	}
 
-	fn remote_url(branch: &BranchInfo) -> Option<&str> {
+	fn remote_text(branch: &BranchInfo) -> Option<&str> {
 		match &branch.details {
 			BranchDetails::Remote(details) => {
 				details.remote_url.as_deref()
 			}
-			BranchDetails::Local(_) => None,
+			BranchDetails::Local(details) => {
+				details.remote_branch_name.as_deref()
+			}
 		}
 	}
 
@@ -584,12 +586,9 @@ impl BranchListPopup {
 			let content_width = width_without_time.saturating_sub(
 				COMMIT_HASH_LENGTH + IS_HEAD_STAR_LENGTH + 1,
 			);
-			let mut branch_name_width =
-				(width_without_time * 40 / 100).min(content_width);
-			if !self.local {
-				branch_name_width = branch_name_width
-					.min(self.longest_branch_name_width);
-			}
+			let branch_name_width = (width_without_time * 40 / 100)
+				.min(content_width)
+				.min(self.longest_branch_name_width);
 			let branch_name = Self::truncate_text(
 				&displaybranch.name,
 				branch_name_width,
@@ -598,14 +597,14 @@ impl BranchListPopup {
 				.saturating_sub(branch_name.width())
 				+ 1;
 			let details_width = content_width - branch_name_width;
-			let url_width = self
-				.remote_url_width
+			let remote_width = self
+				.remote_text_width
 				.min(details_width.saturating_sub(1));
-			let url_column_width =
-				url_width + usize::from(url_width > 0);
+			let remote_column_width =
+				remote_width + usize::from(remote_width > 0);
 			let commit_message = Self::truncate_text(
 				&displaybranch.top_commit_message,
-				details_width - url_column_width,
+				details_width - remote_column_width,
 			);
 
 			let selected = (self.selection as usize
@@ -650,16 +649,16 @@ impl BranchListPopup {
 			);
 
 			let mut spans = vec![span_prefix, span_name];
-			if url_width > 0 {
-				let url = Self::truncate_text(
-					Self::remote_url(displaybranch)
+			if remote_width > 0 {
+				let remote = Self::truncate_text(
+					Self::remote_text(displaybranch)
 						.unwrap_or_default(),
-					url_width,
+					remote_width,
 				);
-				let padding =
-					url_column_width.saturating_sub(url.width());
+				let padding = remote_column_width
+					.saturating_sub(remote.width());
 				spans.push(Span::styled(
-					format!("{url}{:padding$}", ""),
+					format!("{remote}{:padding$}", ""),
 					theme.text(true, selected),
 				));
 			}
@@ -945,6 +944,10 @@ mod tests {
 			)
 			.unwrap();
 		}
+		repo.find_branch(other_local_branch, git2::BranchType::Local)
+			.unwrap()
+			.set_upstream(Some("origin/feature"))
+			.unwrap();
 		for remote in ["origin", "upstream"] {
 			repo.reference_symbolic(
 				&format!("refs/remotes/{remote}/HEAD"),
@@ -1021,6 +1024,20 @@ mod tests {
 		popup.local = true;
 		popup.update_branches().unwrap();
 		let text = popup.get_text(&env.theme, 240, 2);
+		let name_column_width = head
+			.shorthand()
+			.unwrap()
+			.width()
+			.max(other_local_branch.width())
+			+ 1;
+		for line in &text.lines {
+			assert_eq!(line.spans[1].width(), name_column_width);
+		}
+		assert!(text.lines[0].spans[2].content.trim().is_empty());
+		assert_eq!(
+			text.lines[1].spans[2].content.trim_end(),
+			"origin/feature"
+		);
 		assert!(text.lines[0].to_string().contains(&head_time));
 		assert_eq!(
 			text.lines[0].spans.last().unwrap().content,
@@ -1030,6 +1047,17 @@ mod tests {
 			.to_string()
 			.contains(other_local_branch));
 		assert!(text.lines[1].to_string().contains(&other_time));
+
+		repo.find_reference("refs/remotes/origin/feature")
+			.unwrap()
+			.delete()
+			.unwrap();
+		popup.update_branches().unwrap();
+		let text = popup.get_text(&env.theme, 240, 2);
+		assert_eq!(
+			text.lines[1].spans[2].content.trim_end(),
+			"origin/feature"
+		);
 	}
 
 	#[test]

@@ -55,6 +55,8 @@ pub struct LocalBranch {
 	pub upstream: Option<UpstreamBranch>,
 	///
 	pub remote: Option<String>,
+	/// Configured upstream branch as `remote/branch`.
+	pub remote_branch_name: Option<String>,
 }
 
 ///
@@ -179,11 +181,25 @@ pub fn get_branches_info(
 				});
 
 			let details = if local {
+				let remote_branch_name = remote
+					.as_deref()
+					.filter(|name| *name != ".")
+					.and_then(|name| {
+						let merge = repo
+							.branch_upstream_merge(&reference)
+							.ok()?;
+						let branch = merge
+							.as_str()
+							.ok()?
+							.strip_prefix("refs/heads/")?;
+						Some(format!("{name}/{branch}"))
+					});
 				BranchDetails::Local(LocalBranch {
 					is_head: branch.is_head(),
 					has_upstream: upstream_branch.is_some(),
 					upstream: upstream_branch,
 					remote,
+					remote_branch_name,
 				})
 			} else {
 				let remote_url = repo
