@@ -43,10 +43,11 @@ pub struct TagListPopup {
 	theme: SharedTheme,
 	queue: Queue,
 	tags: Option<Vec<TagWithMetadata>>,
+	tag_name_width: usize,
 	visible: bool,
 	table_state: std::cell::Cell<TableState>,
 	current_height: std::cell::Cell<usize>,
-	missing_remote_tags: Option<Vec<String>>,
+	missing_remote_tags: Option<std::collections::HashSet<String>>,
 	has_remotes: bool,
 	basic_credential: Option<BasicAuthCredential>,
 	async_remote_tags: AsyncSingleJob<AsyncRemoteTagsJob>,
@@ -68,11 +69,7 @@ impl DrawableComponent for TagListPopup {
 				ui::rect_inside(MIN_SIZE, f.area().into(), area);
 			let area = area.intersection(rect);
 
-			let tag_name_width =
-				self.tags.as_ref().map_or(0, |tags| {
-					tags.iter()
-						.fold(0, |acc, tag| acc.max(tag.name.len()))
-				});
+			let tag_name_width = self.tag_name_width;
 
 			let constraints = [
 				// symbol if tag is not yet on remote and can be pushed
@@ -89,8 +86,25 @@ impl DrawableComponent for TagListPopup {
 				Constraint::Percentage(100),
 			];
 
-			let rows = self.get_rows();
-			let number_of_rows = rows.len();
+			let number_of_rows =
+				self.tags.as_ref().map_or(0, Vec::len);
+			let inner_height =
+				usize::from(area.height.saturating_sub(2));
+			let mut table_state = self.table_state.take();
+			let selected = table_state.selected();
+			let mut offset = table_state.offset();
+			if let Some(sel) = selected {
+				if sel < offset {
+					offset = sel;
+				} else if inner_height > 0
+					&& sel >= offset + inner_height
+				{
+					offset = sel + 1 - inner_height;
+				}
+			}
+			let end =
+				offset.saturating_add(inner_height).min(number_of_rows);
+			let rows = self.get_rows_slice(offset, end);
 
 			let table = Table::new(rows, constraints)
 				.column_spacing(1)
@@ -106,10 +120,16 @@ impl DrawableComponent for TagListPopup {
 						.border_type(BorderType::Thick),
 				);
 
-			let mut table_state = self.table_state.take();
+			let mut view_state = TableState::default()
+				.with_selected(
+					selected.map(|s| s.saturating_sub(offset)),
+				)
+				.with_offset(0);
 
 			f.render_widget(Clear, area);
-			f.render_stateful_widget(table, area, &mut table_state);
+			f.render_stateful_widget(table, area, &mut view_state);
+
+			*table_state.offset_mut() = offset;
 
 			let area = area.inner(Margin {
 				vertical: 1,
@@ -297,6 +317,7 @@ impl TagListPopup {
 			theme: env.theme.clone(),
 			queue: env.queue.clone(),
 			tags: None,
+			tag_name_width: 0,
 			visible: false,
 			has_remotes: false,
 			table_state: std::cell::Cell::new(TableState::default()),
@@ -317,8 +338,8 @@ impl TagListPopup {
 		self.show()?;
 
 		self.has_remotes =
-			sync::get_branches_info(&self.repo.borrow(), false)
-				.is_ok_and(|branches| !branches.is_empty());
+			sync::has_remote_branches(&self.repo.borrow())
+				.unwrap_or(false);
 
 		let basic_credential = if self.has_remotes {
 			if need_username_password(&self.repo.borrow())? {
@@ -353,8 +374,18 @@ impl TagListPopup {
 		) {
 			if let Some(job) = self.async_remote_tags.take_last() {
 				if let Some(Ok(missing_remote_tags)) = job.result() {
-					self.missing_remote_tags =
-						Some(missing_remote_tags);
+					self.missing_remote_tags = Some(
+						missing_remote_tags
+							.into_iter()
+							.map(|t| {
+								t.strip_prefix("refs/tags/")
+									.map_or_else(
+										|| t.clone(),
+										str::to_owned,
+									)
+							})
+							.collect(),
+					);
 				}
 			}
 		} else if matches!(
@@ -373,7 +404,8 @@ impl TagListPopup {
 	/// fetch list of tags
 	pub fn update_tags(&mut self) -> Result<()> {
 		let tags = get_tags_with_metadata(&self.repo.borrow())?;
-
+		self.tag_name_width =
+			tags.iter().fold(0, |acc, tag| acc.max(tag.name.len()));
 		self.tags = Some(tags);
 
 		Ok(())
@@ -437,15 +469,19 @@ impl TagListPopup {
 			.is_some()
 	}
 
-	///
-	fn get_rows(&self) -> Vec<Row<'_>> {
+	fn get_rows_slice(&self, start: usize, end: usize) -> Vec<Row<'_>> {
 		self.tags.as_ref().map_or_else(Vec::new, |tags| {
-			tags.iter().map(|tag| self.get_row(tag)).collect()
+			let end = end.min(tags.len());
+			let start = start.min(end);
+			tags[start..end]
+				.iter()
+				.map(|tag| self.get_row(tag))
+				.collect()
 		})
 	}
 
 	///
-	fn get_row(&self, tag: &TagWithMetadata) -> Row<'_> {
+	fn get_row<'a>(&self, tag: &'a TagWithMetadata) -> Row<'a> {
 		const UPSTREAM_SYMBOL: &str = "\u{2191}";
 		const ATTACHMENT_SYMBOL: &str = "@";
 		const EMPTY_SYMBOL: &str = " ";
@@ -454,9 +490,7 @@ impl TagListPopup {
 			.missing_remote_tags
 			.as_ref()
 			.is_some_and(|missing_remote_tags| {
-				let remote_tag = format!("refs/tags/{}", tag.name);
-
-				missing_remote_tags.contains(&remote_tag)
+				missing_remote_tags.contains(tag.name.as_str())
 			});
 
 		let has_remote_str = if is_tag_missing_on_remote {
@@ -471,18 +505,18 @@ impl TagListPopup {
 			EMPTY_SYMBOL
 		};
 
-		let cells: Vec<Cell> = vec![
+		let cells: Vec<Cell<'a>> = vec![
 			Cell::from(has_remote_str)
 				.style(self.theme.commit_author(false)),
-			Cell::from(tag.name.clone())
+			Cell::from(tag.name.as_str())
 				.style(self.theme.text(true, false)),
 			Cell::from(time_to_string(tag.time, true))
 				.style(self.theme.commit_time(false)),
-			Cell::from(tag.author.clone())
+			Cell::from(tag.author.as_str())
 				.style(self.theme.commit_author(false)),
 			Cell::from(has_attachment_str)
 				.style(self.theme.text_danger()),
-			Cell::from(tag.message.clone())
+			Cell::from(tag.message.as_str())
 				.style(self.theme.text(true, false)),
 		];
 

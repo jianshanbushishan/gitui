@@ -70,6 +70,15 @@ impl AsyncTags {
 			return Ok(());
 		}
 
+		// Harvest any completed job BEFORE checking `is_outdated` so that
+		// the freshly completed timestamp and hash prevent immediately
+		// spawning a redundant second tag scan.
+		if let Some(job) = self.job.take_last() {
+			if let Some(Ok(result)) = job.result() {
+				self.last = Some(result);
+			}
+		}
+
 		let outdated = self.is_outdated(dur);
 
 		if !force && !outdated {
@@ -78,19 +87,13 @@ impl AsyncTags {
 
 		let repo = self.repo.clone();
 
-		if outdated {
+		if outdated || force {
 			self.job.spawn(AsyncTagsJob::new(
 				self.last
 					.as_ref()
 					.map_or(0, |(_, result)| result.hash),
 				repo,
 			));
-
-			if let Some(job) = self.job.take_last() {
-				if let Some(Ok(result)) = job.result() {
-					self.last = Some(result);
-				}
-			}
 		} else {
 			self.sender
 				.send(AsyncGitNotification::FinishUnchanged)?;
@@ -146,24 +149,28 @@ impl AsyncJob for AsyncTagsJob {
 		_params: RunParams<Self::Notification, Self::Progress>,
 	) -> Result<Self::Notification> {
 		let mut notification = AsyncGitNotification::FinishUnchanged;
-		if let Ok(mut state) = self.state.lock() {
-			*state = state.take().map(|state| match state {
-				JobState::Request(last_hash, repo) => {
-					let tags = sync::get_tags(&repo);
+		let state = self
+			.state
+			.lock()
+			.ok()
+			.and_then(|mut guard| guard.take());
+		let next_state = state.map(|state| match state {
+			JobState::Request(last_hash, repo) => {
+				let tags = sync::get_tags(&repo);
 
-					JobState::Response(tags.map(|tags| {
-						let hash = hash(&tags);
-						if last_hash != hash {
-							notification = AsyncGitNotification::Tags;
-						}
+				JobState::Response(tags.map(|tags| {
+					let hash = hash(&tags);
+					if last_hash != hash {
+						notification = AsyncGitNotification::Tags;
+					}
 
-						(Instant::now(), TagsResult { hash, tags })
-					}))
-				}
-				JobState::Response(result) => {
-					JobState::Response(result)
-				}
-			});
+					(Instant::now(), TagsResult { hash, tags })
+				}))
+			}
+			JobState::Response(result) => JobState::Response(result),
+		});
+		if let Ok(mut guard) = self.state.lock() {
+			*guard = next_state;
 		}
 
 		Ok(notification)

@@ -103,10 +103,10 @@ impl CommitDetailsComponent {
 			}
 
 			if let Some((fetched_id, res)) =
-				self.git_commit_files.current()?
+				self.git_commit_files.current_arc()?
 			{
 				if fetched_id == id {
-					self.file_tree.update(res.as_slice())?;
+					self.file_tree.update(res.as_ref())?;
 					self.file_tree.set_title(self.get_files_title());
 
 					return Ok(());

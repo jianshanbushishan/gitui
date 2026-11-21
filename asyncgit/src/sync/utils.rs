@@ -102,7 +102,10 @@ pub fn stage_add_file(
 	scope_time!("stage_add_file");
 
 	let repo = repo(repo_path)?;
-	if lfs::is_path(&repo, path)? || lfs::is_repo(&repo)? {
+	let is_lfs_repo = lfs::is_repo(&repo)?;
+	if is_lfs_repo
+		|| lfs::is_path_with_repo_hint(&repo, path, Some(false))?
+	{
 		lfs::require_ready(&repo)?;
 		return lfs::git(
 			&repo,

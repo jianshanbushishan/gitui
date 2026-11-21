@@ -29,6 +29,7 @@ pub struct Gitui {
 	rx_app: Receiver<AsyncAppNotification>,
 	rx_ticker: Receiver<Instant>,
 	rx_watcher: Receiver<()>,
+	_watcher: Option<RepoWatcher>,
 }
 
 impl Gitui {
@@ -42,15 +43,15 @@ impl Gitui {
 		let (tx_git, rx_git) = unbounded();
 		let (tx_app, rx_app) = unbounded();
 
-		let (rx_ticker, rx_watcher) = match updater {
+		let (rx_ticker, rx_watcher, watcher) = match updater {
 			Updater::NotifyWatcher => {
 				let repo_watcher = RepoWatcher::new(
 					repo_work_dir(&cliargs.repo_path)?.as_str(),
 				);
-
-				(never(), repo_watcher.receiver())
+				let rx = repo_watcher.receiver();
+				(never(), rx, Some(repo_watcher))
 			}
-			Updater::Ticker => (tick(TICK_INTERVAL), never()),
+			Updater::Ticker => (tick(TICK_INTERVAL), never(), None),
 		};
 
 		let app = App::new(
@@ -69,6 +70,7 @@ impl Gitui {
 			rx_app,
 			rx_ticker,
 			rx_watcher,
+			_watcher: watcher,
 		})
 	}
 
@@ -81,6 +83,7 @@ impl Gitui {
 			'static + Send + Sync,
 	{
 		let spinner_ticker = tick(SPINNER_INTERVAL);
+		let never_ticker: Receiver<Instant> = never();
 		let mut spinner = Spinner::default();
 		let mut first_update = true;
 
@@ -89,26 +92,33 @@ impl Gitui {
 				first_update = false;
 				QueueEvent::Notify
 			} else {
+				let active_spinner_ticker = if spinner.is_active()
+					|| self.app.has_active_timers()
+					|| self.app.is_push_in_progress()
+				{
+					&spinner_ticker
+				} else {
+					&never_ticker
+				};
 				select_event(
 					&self.rx_input,
 					&self.rx_git,
 					&self.rx_app,
 					&self.rx_ticker,
 					&self.rx_watcher,
-					&spinner_ticker,
+					active_spinner_ticker,
 				)?
 			};
 
 			{
 				if matches!(event, QueueEvent::SpinnerUpdate) {
 					spinner.update();
-					let cursor_changed = self
-						.app
-						.update_search_cursor_blink(Instant::now());
+					let timers_changed =
+						self.app.update_timers(Instant::now());
 					// keep the push popup alive (elapsed time,
 					// progress) even when git reports nothing
 					if self.app.is_push_in_progress()
-						|| cursor_changed
+						|| timers_changed
 					{
 						self.draw(terminal)?;
 					}
@@ -128,7 +138,21 @@ impl Gitui {
 							//Note: external ed closed, we need to re-hide cursor
 							terminal.hide_cursor()?;
 						}
+						let is_mouse_move = matches!(
+							ev,
+							InputEvent::Input(
+								crossterm::event::Event::Mouse(
+									crossterm::event::MouseEvent {
+										kind: crossterm::event::MouseEventKind::Moved,
+										..
+									}
+								)
+							)
+						);
 						self.app.event(ev)?;
+						if is_mouse_move {
+							redraw = false;
+						}
 					}
 					QueueEvent::Tick | QueueEvent::Notify => {
 						self.app.update()?;
@@ -295,7 +319,23 @@ mod tests {
 		);
 		gitui.draw(&mut terminal).unwrap();
 		let rendered = terminal.backend().to_string();
-		assert!(rendered.contains("↑/↓ Move · ⏎ Run · ⎋ Close"));
+		let footer = rendered
+			.lines()
+			.skip_while(|line| {
+				!line.contains("↑/↓ Move · ⏎ Run · ⎋ Close")
+			})
+			.collect::<Vec<_>>();
+		assert!(footer[0].contains('┃'));
+		let bottom = footer[1]
+			.split_once('┗')
+			.unwrap()
+			.1
+			.split_once('┛')
+			.unwrap()
+			.0;
+		assert!(
+			!bottom.is_empty() && bottom.chars().all(|ch| ch == '━')
+		);
 		assert!(rendered.contains("› Download checkout"));
 		assert!(rendered.contains("Restore from cache"));
 		assert!(rendered.contains("Initialize LFS"));

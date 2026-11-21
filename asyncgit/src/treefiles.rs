@@ -60,20 +60,24 @@ impl AsyncJob for AsyncTreeFilesJob {
 		&mut self,
 		_params: RunParams<Self::Notification, Self::Progress>,
 	) -> Result<Self::Notification> {
-		if let Ok(mut state) = self.state.lock() {
-			*state = state.take().map(|state| match state {
-				JobState::Request { commit, repo } => {
-					let files = tree_files(&repo, commit);
+		let state = self
+			.state
+			.lock()
+			.ok()
+			.and_then(|mut guard| guard.take());
+		let next_state = state.map(|state| match state {
+			JobState::Request { commit, repo } => {
+				let files = tree_files(&repo, commit);
 
-					JobState::Response(FileTreeResult {
-						commit,
-						result: files,
-					})
-				}
-				JobState::Response(result) => {
-					JobState::Response(result)
-				}
-			});
+				JobState::Response(FileTreeResult {
+					commit,
+					result: files,
+				})
+			}
+			JobState::Response(result) => JobState::Response(result),
+		});
+		if let Ok(mut guard) = self.state.lock() {
+			*guard = next_state;
 		}
 
 		Ok(AsyncGitNotification::TreeFiles)

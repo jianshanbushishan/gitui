@@ -5,6 +5,7 @@ mod scrolllist;
 mod stateful_paragraph;
 pub mod style;
 mod syntax_text;
+mod toast;
 
 use filetreelist::MoveSelection;
 pub use image::{
@@ -19,6 +20,28 @@ pub use stateful_paragraph::{
 pub use syntax_text::{
 	bat_available, try_dir_listing, AsyncSyntaxJob, SyntaxText,
 };
+pub use toast::Toast;
+
+/// Clear `area` plus a 1-cell margin clamped to `bounds` so a wide
+/// (CJK/emoji) grapheme sitting just outside a popup cannot visually
+/// overflow into its border cells.
+pub fn clear_popup_area(
+	f: &mut ratatui::Frame,
+	area: Rect,
+) {
+	let bounds = f.area();
+	let x = area.x.saturating_sub(1).max(bounds.x);
+	let y = area.y.saturating_sub(1).max(bounds.y);
+	let right = area.right().saturating_add(1).min(bounds.right());
+	let bottom = area.bottom().saturating_add(1).min(bounds.bottom());
+	let clear_area = Rect::new(
+		x,
+		y,
+		right.saturating_sub(x),
+		bottom.saturating_sub(y),
+	);
+	f.render_widget(ratatui::widgets::Clear, clear_area);
+}
 
 use crate::keys::{key_match, SharedKeyConfig};
 

@@ -131,6 +131,10 @@ struct GlobalPreferences {
 	diff: DiffOptions,
 	status_show_untracked: Option<ShowUntrackedFilesConfig>,
 	diff_mode: DiffMode,
+	mouse_support: bool,
+	status_left_ratio: Option<u16>,
+	log_left_ratio: Option<u16>,
+	detail_left_ratio: Option<u16>,
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
@@ -144,11 +148,23 @@ struct OptionsData {
 
 const COMMIT_MSG_HISTORY_LENGTH: usize = 20;
 
+const fn adjust_ratio(current: u16, delta: i16) -> u16 {
+	let adjusted = current.saturating_add_signed(delta);
+	if adjusted < 15 {
+		15
+	} else if adjusted > 75 {
+		75
+	} else {
+		adjusted
+	}
+}
+
 #[derive(Clone)]
 pub struct Options {
 	repo: RepoPathRef,
 	data: OptionsData,
 	preferences: GlobalPreferences,
+	global: GlobalOptions,
 	config_dir: Option<PathBuf>,
 	#[cfg(test)]
 	_test_dir: Option<Rc<tempfile::TempDir>>,
@@ -163,6 +179,7 @@ impl Options {
 			repo: RefCell::new(dir.path().to_path_buf().into()),
 			data: Default::default(),
 			preferences: GlobalPreferences::default(),
+			global: GlobalOptions::default(),
 			config_dir: Some(dir.path().join("config")),
 			_test_dir: Some(dir),
 		}
@@ -184,10 +201,14 @@ impl Options {
 			data: Self::read(&repo).unwrap_or_default(),
 			repo,
 			preferences: GlobalPreferences::default(),
+			global: GlobalOptions::default(),
 			config_dir,
 			#[cfg(test)]
 			_test_dir: None,
 		};
+		if let Ok(global) = options.read_global() {
+			options.global = global;
+		}
 		match options.read_preferences() {
 			Ok(preferences) => options.preferences = preferences,
 			Err(error) => {
@@ -200,11 +221,7 @@ impl Options {
 	pub fn external_diff_tool(&self) -> ExternalDiffTool {
 		self.preferences
 			.external_diff_tool
-			.or_else(|| {
-				self.read_global()
-					.ok()
-					.and_then(|g| g.external_diff_tool)
-			})
+			.or(self.global.external_diff_tool)
 			.unwrap_or_default()
 	}
 
@@ -242,11 +259,7 @@ impl Options {
 	pub fn ai_commit_backend(&self) -> AiCommitBackend {
 		self.preferences
 			.ai_commit_backend
-			.or_else(|| {
-				self.read_global()
-					.ok()
-					.and_then(|g| g.ai_commit_backend)
-			})
+			.or(self.global.ai_commit_backend)
 			.unwrap_or_default()
 	}
 
@@ -302,6 +315,9 @@ impl Options {
 	}
 
 	pub fn set_current_tab(&mut self, tab: usize) {
+		if self.data.tab == tab {
+			return;
+		}
 		self.data.tab = tab;
 		self.save();
 	}
@@ -360,25 +376,64 @@ impl Options {
 		self.preferences.diff_mode
 	}
 
+	pub const fn mouse_support(&self) -> bool {
+		self.preferences.mouse_support
+	}
+
+	pub fn toggle_mouse_support(&mut self) -> bool {
+		let next = !self.preferences.mouse_support;
+		self.update_preferences(|preferences| {
+			preferences.mouse_support = next;
+		});
+		next
+	}
+
 	pub fn status_left_ratio(&self) -> u16 {
-		self.read_global()
-			.ok()
-			.and_then(|g| g.status_left_ratio)
+		self.preferences
+			.status_left_ratio
+			.or(self.global.status_left_ratio)
 			.map_or(50, |r| r.clamp(10, 90))
+	}
+
+	pub fn adjust_status_left_ratio(&mut self, delta: i16) -> u16 {
+		let current = self.status_left_ratio();
+		let next = adjust_ratio(current, delta);
+		self.update_preferences(|preferences| {
+			preferences.status_left_ratio = Some(next);
+		});
+		next
 	}
 
 	pub fn log_left_ratio(&self) -> u16 {
-		self.read_global()
-			.ok()
-			.and_then(|g| g.log_left_ratio)
+		self.preferences
+			.log_left_ratio
+			.or(self.global.log_left_ratio)
 			.map_or(60, |r| r.clamp(10, 90))
 	}
 
+	pub fn adjust_log_left_ratio(&mut self, delta: i16) -> u16 {
+		let current = self.log_left_ratio();
+		let next = adjust_ratio(current, delta);
+		self.update_preferences(|preferences| {
+			preferences.log_left_ratio = Some(next);
+		});
+		next
+	}
+
 	pub fn detail_left_ratio(&self) -> u16 {
-		self.read_global()
-			.ok()
-			.and_then(|g| g.detail_left_ratio)
+		self.preferences
+			.detail_left_ratio
+			.or(self.global.detail_left_ratio)
 			.map_or(50, |r| r.clamp(10, 90))
+	}
+
+	pub fn adjust_detail_left_ratio(&mut self, delta: i16) -> u16 {
+		let current = self.detail_left_ratio();
+		let next = adjust_ratio(current, delta);
+		self.update_preferences(|preferences| {
+			preferences.detail_left_ratio = Some(next);
+		});
+		next
 	}
 
 	/// Recursion depth for the directory tree shown in the Files preview
@@ -387,9 +442,8 @@ impl Options {
 	/// guarantees the `u16` fits in a `u8` without truncation.
 	pub fn preview_tree_depth(&self) -> u8 {
 		let depth = self
-			.read_global()
-			.ok()
-			.and_then(|g| g.preview_tree_depth)
+			.global
+			.preview_tree_depth
 			.map_or(2u16, |d| d.clamp(1, 10));
 		u8::try_from(depth).unwrap_or(2)
 	}

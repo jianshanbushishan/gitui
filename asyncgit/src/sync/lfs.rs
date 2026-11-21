@@ -1,21 +1,44 @@
 //! Git LFS detection, pointer metadata and explicit object transfers.
 
+mod download_progress;
+
+pub use download_progress::DownloadProgress;
+
 use super::{git_cli, repo, CommitId, RepoPath};
 use crate::error::{Error, Result};
 use git2::{ObjectType, Repository, TreeWalkMode, TreeWalkResult};
 use serde::Deserialize;
 use std::{
-	collections::{HashMap, HashSet},
+	collections::HashSet,
 	ffi::OsStr,
 	fs,
 	io::Read,
 	path::{Component, Path, PathBuf},
 	sync::{Mutex, OnceLock},
+	time::SystemTime,
 };
 
 const POINTER_LIMIT: usize = 1024;
-type TreeCache = HashMap<(PathBuf, git2::Oid), bool>;
+type TreeCache = Vec<(PathBuf, git2::Oid, bool)>;
 static TREE_CACHE: OnceLock<Mutex<TreeCache>> = OnceLock::new();
+
+#[derive(Clone, Eq, PartialEq)]
+struct IndexFingerprint {
+	modified: Option<SystemTime>,
+	file_len: u64,
+	entry_count: usize,
+}
+
+struct CachedIndexAttrs {
+	fingerprint: IndexFingerprint,
+	has_lfsconfig: bool,
+	gitattributes: Vec<(Vec<u8>, git2::Oid)>,
+}
+
+type IndexAttrCache = Vec<(PathBuf, CachedIndexAttrs)>;
+static INDEX_ATTR_CACHE: OnceLock<Mutex<IndexAttrCache>> =
+	OnceLock::new();
+const INDEX_CACHE_MIN_ENTRIES: usize = 512;
 
 /// Identity and size of the actual file represented by a Git LFS pointer.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -137,15 +160,24 @@ pub(crate) fn git(
 	git_cli::checked(git_cli::output(repo, args, skip_smudge)?)
 }
 
-fn blob_pointer(
+fn blob_pointer_in_odb(
 	repo: &Repository,
+	odb: &git2::Odb<'_>,
 	id: git2::Oid,
 ) -> Option<LfsPointer> {
-	let (size, kind) = repo.odb().ok()?.read_header(id).ok()?;
+	let (size, kind) = odb.read_header(id).ok()?;
 	if kind != ObjectType::Blob || size >= POINTER_LIMIT {
 		return None;
 	}
 	parse_pointer(repo.find_blob(id).ok()?.content())
+}
+
+fn blob_pointer(
+	repo: &Repository,
+	id: git2::Oid,
+) -> Option<LfsPointer> {
+	let odb = repo.odb().ok()?;
+	blob_pointer_in_odb(repo, &odb, id)
 }
 
 fn index_pointer(
@@ -211,26 +243,130 @@ pub fn is_repo(repo: &Repository) -> Result<bool> {
 		return Ok(true);
 	}
 	if !repo.is_bare() {
-		for entry in repo.index()?.iter() {
-			if entry.path == b".lfsconfig" {
+		let index = repo.index()?;
+		if index.get_path(Path::new(".lfsconfig"), 0).is_some() {
+			return Ok(true);
+		}
+		if let Some(root_attr) =
+			index.get_path(Path::new(".gitattributes"), 0)
+		{
+			if attributes_blob_uses_lfs(repo, root_attr.id) {
 				return Ok(true);
 			}
-			if (entry.path == b".gitattributes"
-				|| entry.path.ends_with(b"/.gitattributes"))
-				&& (attributes_blob_uses_lfs(repo, entry.id)
-					|| workdir
-						.zip(std::str::from_utf8(&entry.path).ok())
-						.is_some_and(|(dir, path)| {
-							attributes_file_uses_lfs(&dir.join(path))
-						})) {
-				return Ok(true);
-			}
+		}
+
+		if index_has_lfs_attrs(repo, &index, workdir)? {
+			return Ok(true);
 		}
 	}
 	if repo.head().is_ok() {
 		return is_repo_at(repo, "HEAD");
 	}
 	Ok(false)
+}
+
+fn index_has_lfs_attrs(
+	repo: &Repository,
+	index: &git2::Index,
+	workdir: Option<&Path>,
+) -> Result<bool> {
+	let entry_count = index.len();
+	let index_path = repo.path().join("index");
+	let fingerprint = if entry_count >= INDEX_CACHE_MIN_ENTRIES {
+		fs::metadata(&index_path).ok().map(|meta| IndexFingerprint {
+			modified: meta.modified().ok(),
+			file_len: meta.len(),
+			entry_count,
+		})
+	} else {
+		None
+	};
+
+	if let Some(ref fp) = fingerprint {
+		let cache = INDEX_ATTR_CACHE.get_or_init(Mutex::default);
+		if let Some(entry) = cache
+			.lock()?
+			.iter()
+			.find(|(p, c)| p == &index_path && c.fingerprint == *fp)
+		{
+			if entry.1.has_lfsconfig {
+				return Ok(true);
+			}
+			for (path_bytes, id) in &entry.1.gitattributes {
+				if attributes_blob_uses_lfs(repo, *id)
+					|| workdir
+						.zip(std::str::from_utf8(path_bytes).ok())
+						.is_some_and(|(dir, path)| {
+							attributes_file_uses_lfs(&dir.join(path))
+						}) {
+					return Ok(true);
+				}
+			}
+			return Ok(false);
+		}
+	}
+
+	let mut has_lfsconfig = false;
+	let mut gitattributes = Vec::new();
+	for entry in index.iter() {
+		if entry.path == b".lfsconfig" {
+			has_lfsconfig = true;
+			if fingerprint.is_none() {
+				return Ok(true);
+			}
+		} else if entry.path == b".gitattributes"
+			|| entry.path.ends_with(b"/.gitattributes")
+		{
+			if fingerprint.is_some() {
+				gitattributes.push((entry.path, entry.id));
+			} else if attributes_blob_uses_lfs(repo, entry.id)
+				|| workdir
+					.zip(std::str::from_utf8(&entry.path).ok())
+					.is_some_and(|(dir, path)| {
+						attributes_file_uses_lfs(&dir.join(path))
+					}) {
+				return Ok(true);
+			}
+		}
+	}
+
+	let found = has_lfsconfig
+		|| gitattributes.iter().any(|(path_bytes, id)| {
+			attributes_blob_uses_lfs(repo, *id)
+				|| workdir
+					.zip(std::str::from_utf8(path_bytes).ok())
+					.is_some_and(|(dir, path)| {
+						attributes_file_uses_lfs(&dir.join(path))
+					})
+		});
+
+	if let Some(fp) = fingerprint {
+		let cache = INDEX_ATTR_CACHE.get_or_init(Mutex::default);
+		let mut guard = cache.lock()?;
+		if let Some(slot) =
+			guard.iter_mut().find(|(p, _)| p == &index_path)
+		{
+			slot.1 = CachedIndexAttrs {
+				fingerprint: fp,
+				has_lfsconfig,
+				gitattributes,
+			};
+		} else {
+			if guard.len() >= 64 {
+				guard.clear();
+			}
+			guard.push((
+				index_path,
+				CachedIndexAttrs {
+					fingerprint: fp,
+					has_lfsconfig,
+					gitattributes,
+				},
+			));
+		}
+	}
+
+	Ok(found)
 }
 
 fn default_attributes_path() -> Option<PathBuf> {
@@ -259,11 +395,23 @@ pub fn is_repo_at(
 		}
 		_ => return Ok(false),
 	};
+	is_repo_at_tree(repo, &tree)
+}
+
+fn is_repo_at_tree(
+	repo: &Repository,
+	tree: &git2::Tree<'_>,
+) -> Result<bool> {
 	// Tree contents are immutable. Cache only this decision, never worktree
 	// attributes or effective configuration which can change between scans.
 	let cache = TREE_CACHE.get_or_init(Mutex::default);
-	let key = (repo.commondir().to_path_buf(), tree.id());
-	if let Some(found) = cache.lock()?.get(&key) {
+	let commondir = repo.commondir();
+	let tree_id = tree.id();
+	if let Some((_, _, found)) = cache
+		.lock()?
+		.iter()
+		.find(|(dir, id, _)| dir.as_path() == commondir && *id == tree_id)
+	{
 		return Ok(*found);
 	}
 	let mut found = tree.get_name(".lfsconfig").is_some();
@@ -283,10 +431,15 @@ pub fn is_repo_at(
 		}
 	}
 	let mut cache = cache.lock()?;
-	if cache.len() >= 64 {
-		cache.clear();
+	if !cache
+		.iter()
+		.any(|(dir, id, _)| dir.as_path() == commondir && *id == tree_id)
+	{
+		if cache.len() >= 64 {
+			cache.clear();
+		}
+		cache.push((commondir.to_path_buf(), tree_id, found));
 	}
-	cache.insert(key, found);
 	Ok(found)
 }
 
@@ -323,13 +476,28 @@ pub(crate) fn ensure_push_hook(
 			return Err(refuse());
 		}
 		has_sources = true;
-		if is_repo_at(repo, source.as_ref())? {
-			return Err(refuse());
-		}
-		if let Ok(commit) =
-			repo.revparse_single(source.as_ref())?.peel_to_commit()
-		{
+		let object = repo.revparse_single(source.as_ref())?;
+		if let Ok(commit) = object.peel_to_commit() {
+			if is_repo_at_tree(repo, &commit.tree()?)? {
+				return Err(refuse());
+			}
 			walk.push(commit.id())?;
+		} else {
+			let peeled = object.peel(ObjectType::Any)?;
+			match peeled.kind() {
+				Some(ObjectType::Commit | ObjectType::Tree) => {
+					if is_repo_at_tree(repo, &peeled.peel_to_tree()?)?
+					{
+						return Err(refuse());
+					}
+				}
+				Some(ObjectType::Blob)
+					if blob_pointer(repo, peeled.id()).is_some() =>
+				{
+					return Err(refuse());
+				}
+				_ => {}
+			}
 		}
 	}
 	for tip in remote_tips {
@@ -343,6 +511,7 @@ pub(crate) fn ensure_push_hook(
 	}
 	// Tip attributes alone miss LFS objects added and removed in unpushed
 	// history. Inspect only changed blobs, without loading large assets.
+	let odb = repo.odb()?;
 	let mut inspected = HashSet::new();
 	for id in walk {
 		let commit = repo.find_commit(id?)?;
@@ -361,7 +530,7 @@ pub(crate) fn ensure_push_hook(
 			let id = delta.new_file().id();
 			if !id.is_zero()
 				&& inspected.insert(id)
-				&& blob_pointer(repo, id).is_some()
+				&& blob_pointer_in_odb(repo, &odb, id).is_some()
 			{
 				return Err(refuse());
 			}
@@ -381,19 +550,49 @@ fn config_value(repo: &Repository, name: &str) -> Option<String> {
 }
 
 fn filters_ready(repo: &Repository) -> bool {
-	let required = git(
+	// Fetch all four filter.lfs.* keys in a single `git config` invocation
+	// (using `--null` so values containing newlines parse unambiguously)
+	// while still honoring Git's system/global/env config precedence.
+	let Ok(output) = git(
 		repo,
-		["config", "--bool", "--get", "filter.lfs.required"],
+		[
+			"config",
+			"--null",
+			"--get-regexp",
+			r"^filter\.lfs\.(required|process|clean|smudge)$",
+		],
 		false,
-	)
-	.is_ok_and(|value| value == b"true\n" || value == b"true\r\n");
-	required
-		&& (config_value(repo, "filter.lfs.process")
-			.is_some_and(|s| !s.is_empty())
-			|| (config_value(repo, "filter.lfs.clean")
-				.is_some_and(|s| !s.is_empty())
-				&& config_value(repo, "filter.lfs.smudge")
-					.is_some_and(|s| !s.is_empty())))
+	) else {
+		return false;
+	};
+	let mut required = false;
+	let mut has_process = false;
+	let mut has_clean = false;
+	let mut has_smudge = false;
+	for entry in output.split(|&b| b == 0) {
+		if entry.is_empty() {
+			continue;
+		}
+		let Some(nl) = entry.iter().position(|&b| b == b'\n') else {
+			continue;
+		};
+		let key = &entry[..nl];
+		let val = String::from_utf8_lossy(&entry[nl + 1..]);
+		let val = val.trim();
+		if key.eq_ignore_ascii_case(b"filter.lfs.required") {
+			required = val.eq_ignore_ascii_case("true")
+				|| val.eq_ignore_ascii_case("yes")
+				|| val.eq_ignore_ascii_case("on")
+				|| val == "1";
+		} else if key.eq_ignore_ascii_case(b"filter.lfs.process") {
+			has_process = !val.is_empty();
+		} else if key.eq_ignore_ascii_case(b"filter.lfs.clean") {
+			has_clean = !val.is_empty();
+		} else if key.eq_ignore_ascii_case(b"filter.lfs.smudge") {
+			has_smudge = !val.is_empty();
+		}
+	}
+	required && (has_process || (has_clean && has_smudge))
 }
 
 pub(crate) fn require_ready(repo: &Repository) -> Result<()> {
@@ -535,6 +734,14 @@ pub(crate) fn is_path(
 	repo: &Repository,
 	path: &Path,
 ) -> Result<bool> {
+	is_path_with_repo_hint(repo, path, None)
+}
+
+pub(crate) fn is_path_with_repo_hint(
+	repo: &Repository,
+	path: &Path,
+	repo_is_lfs: Option<bool>,
+) -> Result<bool> {
 	if index_pointer(repo, path).is_some() {
 		return Ok(true);
 	}
@@ -548,7 +755,17 @@ pub(crate) fn is_path(
 		)
 		.ok()
 		.flatten() == Some("lfs");
-	if local_attr || is_repo(repo)? {
+	let is_lfs_repo = match repo_is_lfs {
+		Some(v) => v,
+		None => {
+			if local_attr {
+				true
+			} else {
+				is_repo(repo)?
+			}
+		}
+	};
+	if local_attr || is_lfs_repo {
 		let Some(path_str) = path.to_str() else {
 			return Ok(local_attr);
 		};
@@ -569,7 +786,7 @@ pub(crate) fn is_any_path(
 			"--literal-pathspecs",
 			"ls-files",
 			"-z",
-			"--cached",
+			"--modified",
 			"--others",
 			"--exclude-standard",
 			"--",
@@ -1321,6 +1538,26 @@ pub fn download(
 	remote: Option<&str>,
 	path: Option<&str>,
 ) -> Result<()> {
+	download_inner(repo_path, remote, path, None)
+}
+
+/// Download and restore matching pointers, reporting phases and any transfer progress from Git LFS.
+pub fn download_with_progress(
+	repo_path: &RepoPath,
+	remote: Option<&str>,
+	path: Option<&str>,
+	mut progress: impl FnMut(DownloadProgress) + Send,
+) -> Result<()> {
+	progress(DownloadProgress::Fetching);
+	download_inner(repo_path, remote, path, Some(&mut progress))
+}
+
+fn download_inner(
+	repo_path: &RepoPath,
+	remote: Option<&str>,
+	path: Option<&str>,
+	mut progress: Option<&mut dyn FnMut(DownloadProgress)>,
+) -> Result<()> {
 	let repo = repo(repo_path)?;
 	require_ready(&repo)?;
 	let head_ref = repo.head()?;
@@ -1385,12 +1622,19 @@ pub fn download(
 		&default_remote
 	};
 	args.extend(["--", remote, &head_id]);
-	git(&repo, args, false)?;
+	if let Some(progress) = progress.as_mut() {
+		download_progress::fetch(&repo, &args, &tree, progress)?;
+	} else {
+		git(&repo, args, false)?;
+	}
 	let current = repo.head()?;
 	if current.name_bytes() != head_ref.name_bytes()
 		|| current.peel_to_commit()?.id() != head.id()
 	{
 		return Err(Error::Generic("Git LFS objects were downloaded, but HEAD changed. Run restore for the current version.".into()));
+	}
+	if let Some(progress) = progress {
+		progress(DownloadProgress::Restoring);
 	}
 	if let Some(path) = path {
 		return checkout_index_paths(

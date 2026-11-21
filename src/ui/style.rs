@@ -129,7 +129,7 @@ impl Theme {
 				Style::default().fg(self.diff_file_moved)
 			}
 			StatusItemType::Conflicted => Style::default()
-				.fg(self.diff_file_modified)
+				.fg(self.danger_fg)
 				.add_modifier(Modifier::BOLD),
 			StatusItemType::Typechange => Style::default(),
 		};
@@ -216,8 +216,36 @@ impl Theme {
 		self.line_break.clone()
 	}
 
-	pub fn commandbar(&self) -> Style {
-		Style::default().fg(self.command_fg).bg(self.cmdbar_bg)
+	/// Action label style in the command bar (cleaner, lower visual weight
+	/// than the key badge so shortcuts are easy to scan).
+	pub fn commandbar_label(&self) -> Style {
+		Style::default().fg(self.disabled_fg)
+	}
+
+	/// Highlighted key-hint badge in the command bar.
+	pub fn commandbar_key(&self) -> Style {
+		Style::default()
+			.fg(self.block_title_focused)
+			.add_modifier(Modifier::BOLD)
+	}
+
+	/// Style for non-blocking toast notifications.
+	pub fn toast(&self) -> Style {
+		Style::default()
+			.fg(self.diff_line_add)
+			.add_modifier(Modifier::BOLD)
+	}
+
+	/// Highlight style for matched characters inside fuzzy/content search lists.
+	pub fn search_match(&self, row_selected: bool) -> Style {
+		let base = Style::default()
+			.fg(self.branch_fg)
+			.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+		if row_selected {
+			base.bg(self.selection_bg)
+		} else {
+			base
+		}
 	}
 
 	pub fn commit_hash(&self, selected: bool) -> Style {
@@ -308,8 +336,47 @@ impl Theme {
 		self.syntax.clone()
 	}
 
+	/// Built-in high-contrast palette for light terminal backgrounds,
+	/// selected automatically when no custom `theme.ron` is present and
+	/// the OS color scheme is detected as Light.
+	pub fn default_light() -> Self {
+		Self {
+			selected_tab: Color::Blue,
+			command_fg: Color::White,
+			selection_bg: Color::Blue,
+			selection_fg: Color::White,
+			use_selection_fg: true,
+			cmdbar_bg: Color::Blue,
+			disabled_fg: Color::DarkGray,
+			diff_line_add: Color::Green,
+			diff_line_delete: Color::Red,
+			diff_file_added: Color::Green,
+			diff_file_removed: Color::Red,
+			diff_file_moved: Color::Magenta,
+			diff_file_modified: Color::Rgb(166, 108, 0),
+			commit_hash: Color::Magenta,
+			commit_time: Color::Cyan,
+			commit_author: Color::Green,
+			danger_fg: Color::Red,
+			push_gauge_bg: Color::Blue,
+			push_gauge_fg: Color::White,
+			tag_fg: Color::Magenta,
+			branch_fg: Color::Blue,
+			line_break: "¶".to_string(),
+			block_title_focused: Color::Blue,
+			block_border_focused: Color::Blue,
+			syntax: "InspiredGitHub".to_string(),
+		}
+	}
+
 	pub fn init(theme_path: &PathBuf) -> Self {
-		let mut theme = Self::default();
+		let mut theme = if crate::os_theme::get()
+			== crate::os_theme::ColorScheme::Light
+		{
+			Self::default_light()
+		} else {
+			Self::default()
+		};
 
 		if let Ok(patch) = Self::load_patch(theme_path).map_err(|e| {
 			log::error!("theme error [{theme_path:?}]: {e}");

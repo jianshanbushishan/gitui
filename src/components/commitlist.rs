@@ -2,8 +2,8 @@ use super::utils::logitems::{ItemBatch, LogEntry};
 use crate::{
 	app::Environment,
 	components::{
-		utils::string_width_align, CommandBlocking, CommandInfo,
-		Component, DrawableComponent, EventState, ScrollType,
+		CommandBlocking, CommandInfo, Component, DrawableComponent,
+		EventState, ScrollType,
 	},
 	keys::{key_match, SharedKeyConfig},
 	queue::{InternalEvent, Queue},
@@ -32,9 +32,6 @@ use std::{
 
 const ELEMENTS_PER_LINE: usize = 9;
 const SLICE_SIZE: usize = 1200;
-/// Fixed-width author column. Keeps the author→message gap stable
-/// regardless of pane width (e.g. before/after opening the details pane).
-const AUTHOR_WIDTH: usize = 18;
 
 ///
 pub struct CommitList {
@@ -55,6 +52,7 @@ pub struct CommitList {
 	tags: Option<Tags>,
 	local_branches: BTreeMap<CommitId, Vec<BranchInfo>>,
 	remote_branches: BTreeMap<CommitId, Vec<BranchInfo>>,
+	highlight_positions: Vec<usize>,
 	current_size: Cell<Option<(u16, u16)>>,
 	scroll_top: Cell<usize>,
 	/// When set, the next draw centers the selection in the viewport
@@ -83,6 +81,7 @@ impl CommitList {
 			tags: None,
 			local_branches: BTreeMap::default(),
 			remote_branches: BTreeMap::default(),
+			highlight_positions: Vec::new(),
 			current_size: Cell::new(None),
 			scroll_top: Cell::new(0),
 			center_next_scroll: Cell::new(false),
@@ -103,6 +102,7 @@ impl CommitList {
 		self.items.clear();
 		self.commits.clear();
 		self.all_commits.clear();
+		self.highlight_positions.clear();
 	}
 
 	/// Start browsing a different history with no previous selection or marks.
@@ -112,6 +112,7 @@ impl CommitList {
 		self.title = title.into_boxed_str();
 		self.selection = 0;
 		self.highlights = None;
+		self.highlight_positions.clear();
 		self.filter = None;
 		self.highlighted_selection = None;
 		self.clear_marked();
@@ -250,12 +251,28 @@ impl CommitList {
 				.as_ref()
 				.is_none_or(|filter| filter.contains(id))
 		}));
+		if new_commits && self.highlights.is_some() {
+			self.rebuild_highlight_positions();
+		}
 
 		let selection = self.selection();
 		let selection_max = self.selection_max();
 
 		if self.needs_data(selection, selection_max) || new_commits {
 			self.fetch_commits(false);
+		}
+	}
+
+	fn rebuild_highlight_positions(&mut self) {
+		self.highlight_positions.clear();
+		if let Some(highlights) = &self.highlights {
+			self.highlight_positions.reserve(highlights.len());
+			for id in highlights.iter() {
+				if let Some(pos) = self.commits.get_index_of(id) {
+					self.highlight_positions.push(pos);
+				}
+			}
+			self.highlight_positions.sort_unstable();
 		}
 	}
 
@@ -292,6 +309,7 @@ impl CommitList {
 			.and_then(|id| self.commits.get_index_of(&id))
 			.unwrap_or(0);
 		self.scroll_top.set(0);
+		self.rebuild_highlight_positions();
 		self.set_highlighted_selection_index();
 	}
 
@@ -310,6 +328,7 @@ impl CommitList {
 			highlighting
 		};
 
+		self.rebuild_highlight_positions();
 		self.select_next_highlight();
 		self.set_highlighted_selection_index();
 		self.fetch_commits(true);
@@ -343,17 +362,11 @@ impl CommitList {
 	/// the current selection. Ranges from 0 (before the first highlight)
 	/// to the total highlight count (on the last highlight).
 	pub fn highlighted_selection_display(&self) -> usize {
-		let Some(highlights) = self.highlights.as_ref() else {
+		if self.highlights.is_none() {
 			return 0;
-		};
-		highlights
-			.iter()
-			.filter(|id| {
-				self.commits
-					.get_index_of(*id)
-					.is_some_and(|p| p <= self.selection)
-			})
-			.count()
+		}
+		self.highlight_positions
+			.partition_point(|&p| p <= self.selection)
 	}
 
 	fn set_highlighted_selection_index(&mut self) {
@@ -361,7 +374,7 @@ impl CommitList {
 			self.highlights.as_ref().and_then(|highlights| {
 				let selected =
 					self.commits.get_index(self.selection)?;
-				highlights.iter().position(|entry| entry == selected)
+				highlights.get_index_of(selected)
 			});
 	}
 
@@ -384,6 +397,18 @@ impl CommitList {
 			.unwrap_or_default()
 	}
 
+	pub fn scroll_mouse(&mut self, down: bool) -> Result<bool> {
+		let mut changed = false;
+		for _ in 0..3 {
+			changed |= self.move_selection(if down {
+				ScrollType::Down
+			} else {
+				ScrollType::Up
+			})?;
+		}
+		Ok(changed)
+	}
+
 	fn move_selection(&mut self, scroll: ScrollType) -> Result<bool> {
 		let needs_update = if self.items.highlighting() {
 			self.move_selection_highlighting(scroll)?
@@ -404,43 +429,36 @@ impl CommitList {
 			return Ok(false);
 		}
 
-		let highlights = self
-			.highlights
-			.as_ref()
-			.expect("highlights exist when selection_max > 0");
-
-		let last = selection_max.saturating_sub(1);
+		let positions = &self.highlight_positions;
+		if positions.is_empty() {
+			return Ok(false);
+		}
+		let last = positions.len().saturating_sub(1);
 		let cur_pos = self.selection;
 
-		// Map each highlight to its position in the full commit list.
-		// Highlights are stored in commit order, so positions are
-		// monotonically non-decreasing.
-		let positions: Vec<usize> = highlights
-			.iter()
-			.filter_map(|id| self.commits.get_index_of(id))
-			.collect();
-
 		let new_index = match scroll {
-			ScrollType::Up => positions
-				.iter()
-				.rposition(|&p| p < cur_pos)
-				.unwrap_or(last),
-			ScrollType::Down => positions
-				.iter()
-				.position(|&p| p > cur_pos)
-				.unwrap_or(0),
+			ScrollType::Up => {
+				let p = positions.partition_point(|&pos| pos < cur_pos);
+				p.checked_sub(1).unwrap_or(last)
+			}
+			ScrollType::Down => {
+				let p =
+					positions.partition_point(|&pos| pos <= cur_pos);
+				if p < positions.len() { p } else { 0 }
+			}
 			ScrollType::Home => 0,
 			ScrollType::End => last,
 			_ => return Ok(false),
 		};
 
+		let target_pos = positions[new_index];
 		// Skip if the target is the highlight we're already on.
-		if positions.get(new_index) == Some(&cur_pos) {
+		if target_pos == cur_pos {
 			return Ok(false);
 		}
 
 		let new_selected_commit =
-			highlights.iter().nth(new_index).copied();
+			self.commits.get_index(target_pos).copied();
 
 		if let Some(c) = new_selected_commit {
 			self.select_commit(c)?;
@@ -624,17 +642,15 @@ impl CommitList {
 		txt.push(splitter.clone());
 
 		// commit timestamp
-		txt.push(Span::styled(
-			Cow::from(e.time_to_string(now)),
-			style_time,
-		));
+		txt.push(Span::styled(e.time_to_string(now), style_time));
 
 		txt.push(splitter.clone());
 
-		let author = string_width_align(&e.author, AUTHOR_WIDTH);
-
-		// commit author
-		txt.push(Span::styled(author, style_author));
+		// commit author (pre-aligned to AUTHOR_WIDTH in LogEntry)
+		txt.push(Span::styled(
+			Cow::Borrowed(&*e.author_aligned),
+			style_author,
+		));
 
 		txt.push(splitter.clone());
 
@@ -655,15 +671,21 @@ impl CommitList {
 
 		txt.push(splitter);
 
-		let message_width = width.saturating_sub(
-			txt.iter().map(|span| span.content.len()).sum(),
-		);
-
-		// commit msg
-		txt.push(Span::styled(
-			format!("{:message_width$}", e.msg),
-			style_msg,
-		));
+		// commit msg: only pad full row width when selected (to paint selection bg)
+		if selected {
+			let message_width = width.saturating_sub(
+				txt.iter().map(|span| span.content.len()).sum(),
+			);
+			txt.push(Span::styled(
+				format!("{:message_width$}", e.msg),
+				style_msg,
+			));
+		} else {
+			txt.push(Span::styled(
+				Cow::Borrowed(&*e.msg),
+				style_msg,
+			));
+		}
 
 		Line::from(txt)
 	}
@@ -726,34 +748,31 @@ impl CommitList {
 	}
 
 	fn remote_branches_string(&self, e: &LogEntry) -> Option<String> {
+		let local_branches = self.local_branches.get(&e.id);
 		self.remote_branches.get(&e.id).and_then(|remote_branches| {
 			let filtered_branches: Vec<_> = remote_branches
 				.iter()
 				.filter(|remote_branch| {
-					self.local_branches.get(&e.id).is_none_or(
-						|local_branch| {
-							local_branch.iter().any(|local_branch| {
-								let has_corresponding_local_branch =
-									match &local_branch.details {
-										BranchDetails::Local(
-											details,
-										) => details
+					local_branches.is_none_or(|local_branch| {
+						local_branch.iter().any(|local_branch| {
+							let has_corresponding_local_branch =
+								match &local_branch.details {
+									BranchDetails::Local(details) => {
+										details
 											.upstream
 											.as_ref()
-											.is_some_and(
-												|upstream| {
-													upstream.reference == remote_branch.reference
-												},
-											),
-										BranchDetails::Remote(_) => {
-											false
-										}
-									};
+											.is_some_and(|upstream| {
+												upstream.reference
+													== remote_branch
+														.reference
+											})
+									}
+									BranchDetails::Remote(_) => false,
+								};
 
-								!has_corresponding_local_branch
-							})
-						},
-					)
+							!has_corresponding_local_branch
+						})
+					})
 				})
 				.map(|remote_branch| {
 					format!("[{0}]", remote_branch.name)
@@ -1014,6 +1033,7 @@ impl Component for CommitList {
 
 #[cfg(test)]
 mod tests {
+	use crate::components::utils::string_width_align;
 	use asyncgit::sync::CommitInfo;
 
 	use super::*;
@@ -1035,6 +1055,7 @@ mod tests {
 				center_next_scroll: Cell::default(),
 				local_branches: BTreeMap::default(),
 				remote_branches: BTreeMap::default(),
+				highlight_positions: Vec::default(),
 				theme: SharedTheme::default(),
 				key_config: SharedKeyConfig::default(),
 				scroll_state: (Instant::now(), 0.0),

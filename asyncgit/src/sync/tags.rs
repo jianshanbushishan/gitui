@@ -1,10 +1,10 @@
-use super::{get_commits_info, CommitId, RepoPath};
+use super::{commits_info::gix_get_message, CommitId, RepoPath};
 use crate::{
 	error::Result,
 	sync::{gix_repo, repository::repo},
 };
 use scopetime::scope_time;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 ///
 #[derive(Clone, Hash, PartialEq, Eq, Debug)]
@@ -48,38 +48,53 @@ pub struct TagWithMetadata {
 
 static MAX_MESSAGE_WIDTH: usize = 100;
 
+fn peel_tag_reference(
+	mut reference: gix::Reference<'_>,
+) -> Option<(gix::Commit<'_>, String, Option<String>)> {
+	let target_id = reference.follow_to_object().ok()?;
+	let object = target_id.object().ok()?;
+	match object.kind {
+		gix::object::Kind::Tag => {
+			let (name, annotation) =
+				object.try_to_tag_ref().map_or_else(
+					|_| (reference.name().shorten().to_string(), None),
+					|decoded| {
+						(
+							decoded.name.to_string(),
+							Some(decoded.message.to_string()),
+						)
+					},
+				);
+			let commit = object
+				.peel_to_kind(gix::object::Kind::Commit)
+				.ok()?
+				.into_commit();
+			Some((commit, name, annotation))
+		}
+		gix::object::Kind::Commit => {
+			let name = reference.name().shorten().to_string();
+			Some((object.into_commit(), name, None))
+		}
+		_ => None,
+	}
+}
+
 /// returns `Tags` type filled with all tags found in repo
 pub fn get_tags(repo_path: &RepoPath) -> Result<Tags> {
 	scope_time!("get_tags");
 
 	let mut res = Tags::new();
-	let mut adder = |key, value: Tag| {
-		if let Some(key) = res.get_mut(&key) {
-			key.push(value);
-		} else {
-			res.insert(key, vec![value]);
-		}
-	};
 
-	let repo: gix::Repository = gix_repo(repo_path)?;
+	let mut repo: gix::Repository = gix_repo(repo_path)?;
+	repo.object_cache_size_if_unset(2_usize.pow(14));
 	let platform = repo.references()?;
-	for mut reference in (platform.tags()?).flatten() {
-		let commit = reference.peel_to_commit();
-		let tag = reference.peel_to_tag();
-
-		if let Ok(commit) = commit {
-			let tag_ref = tag.as_ref().map(gix::Tag::decode);
-
-			let name = match tag_ref {
-				Ok(Ok(tag)) => tag.name.to_string(),
-				_ => reference.name().shorten().to_string(),
-			};
-			let annotation = match tag_ref {
-				Ok(Ok(tag)) => Some(tag.message.to_string()),
-				_ => None,
-			};
-
-			adder(commit.into(), Tag { name, annotation });
+	for reference in (platform.tags()?).flatten() {
+		if let Some((commit, name, annotation)) =
+			peel_tag_reference(reference)
+		{
+			res.entry(commit.into())
+				.or_default()
+				.push(Tag { name, annotation });
 		}
 	}
 
@@ -92,54 +107,56 @@ pub fn get_tags_with_metadata(
 ) -> Result<Vec<TagWithMetadata>> {
 	scope_time!("get_tags_with_metadata");
 
-	let tags_grouped_by_commit_id = get_tags(repo_path)?;
+	let mut repo: gix::Repository = gix_repo(repo_path)?;
+	repo.object_cache_size_if_unset(2_usize.pow(14));
+	let mailmap = repo.open_mailmap();
+	let platform = repo.references()?;
 
-	let tags_with_commit_id: Vec<(&str, Option<&str>, &CommitId)> =
-		tags_grouped_by_commit_id
-			.iter()
-			.flat_map(|(commit_id, tags)| {
-				tags.iter()
-					.map(|tag| {
-						(
-							tag.name.as_ref(),
-							tag.annotation.as_deref(),
-							commit_id,
-						)
-					})
-					.collect::<Vec<_>>()
-			})
-			.collect();
+	let mut commit_cache: HashMap<CommitId, (String, i64, String)> =
+		HashMap::new();
+	let mut tags: Vec<TagWithMetadata> = Vec::new();
 
-	let unique_commit_ids: HashSet<_> = tags_with_commit_id
-		.iter()
-		.copied()
-		.map(|(_, _, &commit_id)| commit_id)
-		.collect();
-	let mut commit_ids = Vec::with_capacity(unique_commit_ids.len());
-	commit_ids.extend(unique_commit_ids);
+	for reference in (platform.tags()?).flatten() {
+		if let Some((commit, name, annotation)) =
+			peel_tag_reference(reference)
+		{
+			let commit_id: CommitId = commit.id.into();
+			let (author, time, message) =
+				if let Some(cached) = commit_cache.get(&commit_id) {
+					cached.clone()
+				} else if let Ok(commit_ref) = commit.decode() {
+					let author = commit_ref.author().map_or_else(
+						|_| String::from("<unknown>"),
+						|sig| {
+							mailmap
+								.resolve_cow(sig)
+								.name
+								.to_string()
+						},
+					);
+					let time =
+						commit_ref.time().map_or(0, |t| t.seconds);
+					let message = gix_get_message(
+						&commit_ref,
+						Some(MAX_MESSAGE_WIDTH),
+					);
+					let entry = (author, time, message);
+					commit_cache.insert(commit_id, entry.clone());
+					entry
+				} else {
+					continue;
+				};
 
-	let commit_infos =
-		get_commits_info(repo_path, &commit_ids, MAX_MESSAGE_WIDTH)?;
-	let unique_commit_infos: HashMap<_, _> = commit_infos
-		.iter()
-		.map(|commit_info| (commit_info.id, commit_info))
-		.collect();
-
-	let mut tags: Vec<TagWithMetadata> = tags_with_commit_id
-		.into_iter()
-		.filter_map(|(tag, annotation, commit_id)| {
-			unique_commit_infos.get(commit_id).map(|commit_info| {
-				TagWithMetadata {
-					name: String::from(tag),
-					author: commit_info.author.clone(),
-					time: commit_info.time,
-					message: commit_info.message.clone(),
-					commit_id: *commit_id,
-					annotation: annotation.map(String::from),
-				}
-			})
-		})
-		.collect();
+			tags.push(TagWithMetadata {
+				name,
+				author,
+				time,
+				message,
+				commit_id,
+				annotation,
+			});
+		}
+	}
 
 	tags.sort_unstable_by_key(|b| std::cmp::Reverse(b.time));
 

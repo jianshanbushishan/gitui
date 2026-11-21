@@ -54,6 +54,7 @@ pub struct TextInputComponent {
 	embed: bool,
 	textarea: Option<TextAreaComponent>,
 	select_state: SelectionState,
+	char_count: Cell<Option<usize>>,
 	/// Last-known cursor position. Updated while the textarea is alive
 	/// so it survives `hide()` — `cursor()` falls back to it when the
 	/// textarea is gone. Used to persist the commit draft cursor after
@@ -82,6 +83,7 @@ impl TextInputComponent {
 			embed: false,
 			textarea: None,
 			select_state: SelectionState::NotSelecting,
+			char_count: Cell::new(None),
 			last_cursor: Cell::new(None),
 		}
 	}
@@ -104,6 +106,7 @@ impl TextInputComponent {
 	/// Clear the `msg`.
 	pub fn clear(&mut self) {
 		self.msg.take();
+		self.char_count.set(None);
 		if self.is_visible() {
 			self.show_inner_textarea();
 		}
@@ -155,6 +158,16 @@ impl TextInputComponent {
 		}
 	}
 
+	fn make_block(&self) -> Block<'static> {
+		Block::default()
+			.borders(Borders::ALL)
+			.border_style(self.theme.block(true))
+			.title(ratatui::text::Span::styled(
+				self.title.clone(),
+				self.theme.title(true),
+			))
+	}
+
 	fn show_inner_textarea(&mut self) {
 		//	create the textarea and then load it with the text
 		//	from self.msg
@@ -184,17 +197,7 @@ impl TextInputComponent {
 			);
 
 			if !self.embed {
-				text_area.set_block(
-					Block::default()
-						.borders(Borders::ALL)
-						.border_style(
-							ratatui::style::Style::default()
-								.add_modifier(
-									ratatui::style::Modifier::BOLD,
-								),
-						)
-						.title(self.title.clone()),
-				);
+				text_area.set_block(self.make_block());
 			}
 			text_area
 		});
@@ -203,6 +206,7 @@ impl TextInputComponent {
 	/// Set the `msg`.
 	pub fn set_text(&mut self, msg: String) {
 		self.msg = msg.into();
+		self.char_count.set(None);
 		if self.is_visible() {
 			self.show_inner_textarea();
 		}
@@ -237,9 +241,17 @@ impl TextInputComponent {
 		}
 	}
 
-	/// Set the `title`.
+	/// Set the `title`. Updates the live textarea block immediately when
+	/// visible so dynamic title changes (e.g. AI generation status) appear
+	/// right away.
 	pub fn set_title(&mut self, t: String) {
 		self.title = t;
+		if !self.embed {
+			let block = self.make_block();
+			if let Some(ta) = &mut self.textarea {
+				ta.set_block(block);
+			}
+		}
 	}
 
 	///
@@ -251,7 +263,23 @@ impl TextInputComponent {
 	}
 
 	fn draw_char_count(&self, f: &mut Frame, r: Rect) {
-		let count = self.get_text().len();
+		let count = self.char_count.get().unwrap_or_else(|| {
+			let c = self.msg.get().map_or_else(
+				|| {
+					self.textarea.as_ref().map_or(0, |ta| {
+						let lines = ta.lines();
+						let chars: usize = lines
+							.iter()
+							.map(|l| l.chars().count())
+							.sum();
+						chars + lines.len().saturating_sub(1)
+					})
+				},
+				|msg| msg.chars().count(),
+			);
+			self.char_count.set(Some(c));
+			c
+		});
 		if count > 0 {
 			let w = Paragraph::new(format!("[{count} chars]"))
 				.alignment(Alignment::Right);
@@ -735,9 +763,19 @@ impl Component for TextInputComponent {
 	}
 
 	fn event(&mut self, ev: &Event) -> Result<EventState> {
+		if self.textarea.is_none() {
+			return Ok(EventState::NotConsumed);
+		}
 		let input = Input::from(ev.clone());
 		self.should_select(&input);
 		if let Some(ta) = &mut self.textarea {
+			let is_pure_nav = matches!(
+				input.key,
+				Key::Up
+					| Key::Down | Key::Left | Key::Right
+					| Key::Home | Key::End | Key::PageUp
+					| Key::PageDown
+			);
 			let modified = if let Event::Key(e) = ev {
 				if key_match(e, self.key_config.keys.exit_popup) {
 					self.hide();
@@ -766,7 +804,10 @@ impl Component for TextInputComponent {
 			}
 
 			if modified {
-				self.msg.take();
+				if !is_pure_nav {
+					self.msg.take();
+					self.char_count.set(None);
+				}
 				return Ok(EventState::Consumed);
 			}
 		}
@@ -865,6 +906,33 @@ mod tests {
 		let other =
 			KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty());
 		assert!(!is_newline_key(&other, &binding));
+	}
+
+	#[test]
+	fn set_title_updates_live_block_and_cjk_char_count() {
+		let env = Environment::test_env();
+		let mut comp =
+			TextInputComponent::new(&env, "Initial", "", true);
+		comp.show().unwrap();
+		comp.set_text("中文测试内容".to_owned());
+		comp.set_title("Commit · Generating…".to_owned());
+
+		let mut terminal = ratatui::Terminal::new(
+			ratatui::backend::TestBackend::new(60, 10),
+		)
+		.unwrap();
+		terminal
+			.draw(|f| comp.draw(f, f.area()).unwrap())
+			.unwrap();
+		let rendered = terminal.backend().to_string();
+		assert!(
+			rendered.contains("Commit · Generating…"),
+			"live title update should render immediately:\n{rendered}"
+		);
+		assert!(
+			rendered.contains("[6 chars]"),
+			"CJK character count should count chars, not UTF-8 bytes:\n{rendered}"
+		);
 	}
 
 	#[test]

@@ -2,7 +2,7 @@ use crate::{
 	components::FuzzyFinderTarget,
 	popups::{
 		AppOption, BlameFileOpen, FileRevOpen, FileTreeOpen,
-		InspectCommitOpen,
+		InspectCommitOpen, PaletteAction,
 	},
 	repo_operation::RepoOperation,
 	tabs::StashingOptions,
@@ -105,6 +105,12 @@ pub enum InternalEvent {
 	/// body. Used for copy-success popups so the "Copied Text:" label
 	/// stands out from the copied content.
 	ShowInfoLabeledMsg(String, String),
+	/// Non-blocking transient notification (auto-dismisses after ~2.5s).
+	ShowToast(String),
+	/// Non-blocking warning toast notification.
+	ShowWarningToast(String),
+	/// Execute an action picked from the Command Palette.
+	PaletteAction(PaletteAction),
 	///
 	Update(NeedsUpdate),
 	/// open commit msg input

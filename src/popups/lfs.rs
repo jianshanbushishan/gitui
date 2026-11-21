@@ -271,16 +271,18 @@ impl DrawableComponent for LfsPopup {
 		let down = self.keys.get_hint(keys.popup_down);
 		let enter = self.keys.get_hint(keys.enter);
 		let close = self.keys.get_hint(keys.exit_popup);
-		let mut footer = format!(
-			" {up}/{down} Move · {enter} Run · {close} Close "
-		);
-		if footer.width() + 2 > usize::from(area.width) {
-			footer = format!(" {up}/{down} · {enter} · {close} ");
+		let padding = u16::from(area.width >= 6);
+		let inset = 2 + 2 * padding;
+		let max_width = area.width.min(72);
+		let mut footer =
+			format!("{up}/{down} Move · {enter} Run · {close} Close");
+		if footer.width() + usize::from(inset)
+			> usize::from(max_width)
+		{
+			footer = format!("{up}/{down} · {enter} · {close}");
 		}
 
 		let choices = self.choices();
-		let padding = u16::from(area.width >= 6);
-		let inset = 2 + 2 * padding;
 		let width = choices
 			.iter()
 			.map(|choice| choice.description().width())
@@ -288,11 +290,13 @@ impl DrawableComponent for LfsPopup {
 			.max()
 			.unwrap_or(0)
 			.saturating_add(usize::from(inset))
-			.max(footer.width() + 2)
-			.min(72);
-		let width = u16::try_from(width)?.min(area.width);
+			.max(footer.width() + usize::from(inset))
+			.min(usize::from(max_width));
+		let width = u16::try_from(width)?;
 		let text_width = usize::from(width - inset);
-		let available = usize::from(area.height - 2);
+		let show_footer = area.height >= 4;
+		let available =
+			usize::from(area.height - 2) - usize::from(show_footer);
 		let choice_count = available.min(choices.len());
 		let first =
 			ui::calc_scroll_top(0, choice_count, self.selected);
@@ -340,14 +344,17 @@ impl DrawableComponent for LfsPopup {
 			lines.extend(section.lines().map(Line::from));
 		}
 
-		let height = u16::try_from(lines.len().min(available))? + 2;
+		lines.truncate(available);
+		if show_footer {
+			lines.push(Line::styled(
+				footer,
+				self.theme.text(false, false),
+			));
+		}
+		let height = u16::try_from(lines.len())? + 2;
 		let rect = ui::centered_rect_absolute(width, height, area);
 		let block = Block::default()
 			.title(Span::styled(" Git LFS ", self.theme.title(true)))
-			.title_bottom(Span::styled(
-				footer,
-				self.theme.text(false, false),
-			))
 			.borders(Borders::ALL)
 			.border_type(BorderType::Thick)
 			.border_style(self.theme.block(true))

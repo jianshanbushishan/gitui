@@ -36,13 +36,13 @@ pub struct DiffParams {
 #[derive(Clone)]
 struct LastResult {
 	params: DiffParams,
-	result: FileDiff,
+	result: Arc<FileDiff>,
 }
 
 #[derive(Default)]
 struct DiffState {
 	current: Option<DiffParams>,
-	result: Option<FileDiff>,
+	result: Option<Arc<FileDiff>>,
 	last: Option<LastResult>,
 	queued: Option<DiffParams>,
 	running: bool,
@@ -70,12 +70,19 @@ impl AsyncDiff {
 
 	///
 	pub fn last(&self) -> Result<Option<(DiffParams, FileDiff)>> {
+		Ok(self.last_arc()?.map(|(p, r)| (p, (*r).clone())))
+	}
+
+	/// Zero-copy shared access to the latest completed diff.
+	pub fn last_arc(
+		&self,
+	) -> Result<Option<(DiffParams, Arc<FileDiff>)>> {
 		Ok(self
 			.state
 			.lock()?
 			.last
-			.clone()
-			.map(|res| (res.params, res.result)))
+			.as_ref()
+			.map(|res| (res.params.clone(), Arc::clone(&res.result))))
 	}
 
 	/// Refresh the current selection, coalescing changes during a running diff.
@@ -94,6 +101,16 @@ impl AsyncDiff {
 		&self,
 		params: DiffParams,
 	) -> Result<Option<FileDiff>> {
+		Ok(self
+			.request_arc(params)?
+			.map(|diff| (*diff).clone()))
+	}
+
+	/// Zero-copy shared variant of [`Self::request`].
+	pub fn request_arc(
+		&self,
+		params: DiffParams,
+	) -> Result<Option<Arc<FileDiff>>> {
 		self.enqueue(Some(params), false, Self::get_diff)
 	}
 
@@ -104,7 +121,7 @@ impl AsyncDiff {
 		mut compute: impl FnMut(&RepoPath, &DiffParams) -> Result<FileDiff>
 			+ Send
 			+ 'static,
-	) -> Result<Option<FileDiff>> {
+	) -> Result<Option<Arc<FileDiff>>> {
 		{
 			let mut state = self.state.lock()?;
 			let Some(params) =
@@ -160,18 +177,29 @@ impl AsyncDiff {
 				};
 				params
 			};
-			let result = compute(repo, &params);
+			let result = compute(repo, &params).map(Arc::new);
 			let (notify, done) = {
 				let mut state = state.lock()?;
-				let notify = state.current.as_ref() == Some(&params);
+				let is_current =
+					state.current.as_ref() == Some(&params);
+				let mut notify = false;
 				match result {
-					Ok(result) if notify => {
-						state.result = Some(result.clone());
+					Ok(result) if is_current => {
+						let unchanged = state
+							.last
+							.as_ref()
+							.is_some_and(|prev| {
+								prev.params == params
+									&& prev.result == result
+							});
+						state.result = Some(Arc::clone(&result));
 						state.last =
 							Some(LastResult { params, result });
+						notify = !unchanged;
 					}
 					Err(error) => {
 						log::error!("get_diff error: {error}");
+						notify = is_current;
 					}
 					_ => (),
 				}
@@ -214,7 +242,7 @@ impl AsyncDiff {
 			DiffType::Commit(id) => sync::diff::get_diff_commit(
 				repo_path,
 				id,
-				params.path.clone(),
+				&params.path,
 				Some(params.options),
 			),
 			DiffType::Commits(ids) => sync::diff::get_diff_commits(

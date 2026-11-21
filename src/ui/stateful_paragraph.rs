@@ -116,36 +116,70 @@ impl<'a> StatefulParagraph<'a> {
 
 	fn measure_layout(&self, width: u16, state: &mut ParagraphState) {
 		state.line_offsets.clear();
-		state.line_offsets.reserve(self.text.lines.len());
+		let line_count = self.text.lines.len();
+		state.line_offsets.reserve(line_count);
 		let mut total_lines = 0_u16;
-		for line in &self.text.lines {
-			state.line_offsets.push(total_lines);
-			let mut styled = line
-				.spans
-				.iter()
-				.flat_map(|span| span.styled_graphemes(self.style))
-				.chain(iter::once(StyledGrapheme {
-					symbol: "\n",
-					style: self.style,
-				}));
-			let mut composer: Box<dyn LineComposer> =
-				if let Some(Wrap { trim }) = self.wrap {
-					Box::new(WordWrapper::new(
-						&mut styled,
-						width,
-						trim,
-					))
-				} else {
-					Box::new(LineTruncator::new(&mut styled, width))
-				};
-			while composer.next_line().is_some() {
+
+		if width == 0 {
+			state.line_offsets.resize(line_count, 0);
+		} else if let Some(Wrap { trim }) = self.wrap {
+			for line in &self.text.lines {
+				state.line_offsets.push(total_lines);
+				// Fast path: when the whole source line fits within `width`,
+				// wrapping produces exactly 1 visual row without building any
+				// WordWrapper buffers.
+				let mut total_w: usize = 0;
+				let mut fits = true;
+				for span in &line.spans {
+					total_w += span.content.width();
+					if total_w > usize::from(width) {
+						fits = false;
+						break;
+					}
+				}
+				if fits {
+					total_lines = total_lines.saturating_add(1);
+					continue;
+				}
+				let mut styled = line
+					.spans
+					.iter()
+					.flat_map(|span| span.styled_graphemes(self.style))
+					.chain(iter::once(StyledGrapheme {
+						symbol: "\n",
+						style: self.style,
+					}));
+				let mut composer =
+					WordWrapper::new(&mut styled, width, trim);
+				while composer.next_line().is_some() {
+					total_lines = total_lines.saturating_add(1);
+				}
+			}
+		} else {
+			for _ in 0..line_count {
+				state.line_offsets.push(total_lines);
 				total_lines = total_lines.saturating_add(1);
 			}
 		}
+
 		state.lines = total_lines;
 		state.layout_width = width;
 		state.layout_key = self.layout_key;
 		state.lines_valid = true;
+	}
+}
+
+enum Composer<'a, 'b> {
+	Wrap(WordWrapper<'a, 'b>),
+	Truncate(LineTruncator<'a, 'b>),
+}
+
+impl<'a> Composer<'a, '_> {
+	fn next_line(&mut self) -> Option<(&[StyledGrapheme<'a>], u16)> {
+		match self {
+			Self::Wrap(w) => w.next_line(),
+			Self::Truncate(t) => t.next_line(),
+		}
 	}
 }
 
@@ -202,23 +236,20 @@ impl StatefulWidget for StatefulParagraph<'_> {
 				},
 			);
 
-		let mut line_composer: Box<dyn LineComposer> =
+		let mut line_composer =
 			if let Some(Wrap { trim }) = self.wrap {
-				Box::new(WordWrapper::new(
+				Composer::Wrap(WordWrapper::new(
 					&mut styled,
 					text_area.width,
 					trim,
 				))
 			} else {
-				let mut line_composer = Box::new(LineTruncator::new(
-					&mut styled,
-					text_area.width,
-				));
+				let mut truncator =
+					LineTruncator::new(&mut styled, text_area.width);
 				if self.alignment == Alignment::Left {
-					line_composer
-						.set_horizontal_offset(state.scroll.x);
+					truncator.set_horizontal_offset(state.scroll.x);
 				}
-				line_composer
+				Composer::Truncate(truncator)
 			};
 		while let Some((current_line, current_line_width)) =
 			line_composer.next_line()

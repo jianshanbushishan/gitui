@@ -37,6 +37,12 @@ pub enum ReflogAction {
 	Unknown,
 }
 
+fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
+	s.as_bytes()
+		.get(..prefix.len())
+		.is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
+}
+
 impl ReflogAction {
 	/// Parse action from reflog message
 	pub fn from_message(message: &str) -> Self {
@@ -45,35 +51,36 @@ impl ReflogAction {
 			return Self::Unknown;
 		}
 
-		let message_lower = message.to_lowercase();
-
-		if message_lower.starts_with("commit:") {
+		if starts_with_ignore_ascii_case(message, "commit:") {
 			Self::Commit
-		} else if message_lower.starts_with("checkout:") {
+		} else if starts_with_ignore_ascii_case(message, "checkout:") {
 			// Parse "checkout: moving from X to Y"
 			let rest =
 				message.strip_prefix("checkout:").unwrap_or(message);
 			let rest = rest.trim();
 
-			let (from, to) = if rest.starts_with("moving from") {
-				let rest =
-					rest.strip_prefix("moving from").unwrap_or(rest);
-				let parts: Vec<&str> = rest.split(" to ").collect();
-				if parts.len() == 2 {
-					(
-						Some(parts[0].trim().to_string()),
-						Some(parts[1].trim().to_string()),
-					)
-				} else {
-					(None, None)
-				}
-			} else {
+			let (from, to) = rest.strip_prefix("moving from").map_or_else(
 				// Just "checkout: X" format
-				(None, Some(rest.to_string()))
-			};
+				|| (None, Some(rest.to_string())),
+				|rest| {
+					rest.split_once(" to ").map_or(
+						(None, None),
+						|(before, after)| {
+							if after.contains(" to ") {
+								(None, None)
+							} else {
+								(
+									Some(before.trim().to_string()),
+									Some(after.trim().to_string()),
+								)
+							}
+						},
+					)
+				},
+			);
 
 			Self::Checkout { from, to }
-		} else if message_lower.starts_with("reset:") {
+		} else if starts_with_ignore_ascii_case(message, "reset:") {
 			// Parse "reset: moving to X"
 			let rest =
 				message.strip_prefix("reset:").unwrap_or(message);
@@ -87,19 +94,22 @@ impl ReflogAction {
 			};
 
 			Self::Reset { to }
-		} else if message_lower.starts_with("rebase") {
+		} else if starts_with_ignore_ascii_case(message, "rebase") {
 			Self::Rebase
-		} else if message_lower.starts_with("merge:") {
+		} else if starts_with_ignore_ascii_case(message, "merge:") {
 			Self::Merge
-		} else if message_lower.starts_with("pull") {
+		} else if starts_with_ignore_ascii_case(message, "pull") {
 			Self::Pull
-		} else if message_lower.starts_with("clone:") {
+		} else if starts_with_ignore_ascii_case(message, "clone:") {
 			Self::Clone
-		} else if message_lower.starts_with("branch:") {
+		} else if starts_with_ignore_ascii_case(message, "branch:") {
 			Self::Branch
-		} else if message_lower.starts_with("amend:") {
+		} else if starts_with_ignore_ascii_case(message, "amend:") {
 			Self::Amend
-		} else if message_lower.starts_with("cherry-pick:") {
+		} else if starts_with_ignore_ascii_case(
+			message,
+			"cherry-pick:",
+		) {
 			Self::CherryPick
 		} else {
 			Self::Unknown
@@ -168,9 +178,16 @@ pub fn get_reflog(repo_path: &RepoPath) -> Result<Vec<ReflogEntry>> {
 
 	// Get HEAD reflog using git2 native API
 	if let Ok(reflog) = repo.reflog("HEAD") {
+		entries.reserve(reflog.len());
+		let mut subject_cache: std::collections::HashMap<
+			git2::Oid,
+			String,
+		> = std::collections::HashMap::new();
+
 		for idx in 0..reflog.len() {
 			if let Some(entry) = reflog.get(idx) {
-				let new_oid = CommitId::new(entry.id_new());
+				let raw_new_oid = entry.id_new();
+				let new_oid = CommitId::new(raw_new_oid);
 				let old_oid = if entry.id_old().is_zero() {
 					None
 				} else {
@@ -192,14 +209,21 @@ pub fn get_reflog(repo_path: &RepoPath) -> Result<Vec<ReflogEntry>> {
 					.ok()
 					.unwrap_or_default();
 
-				// Get commit subject by looking up the commit
-				let commit_subject = repo
-					.find_commit(entry.id_new())
-					.ok()
-					.and_then(|c| {
-						c.summary().ok().flatten().map(String::from)
+				// Get commit subject by looking up the commit (memoized by OID)
+				let commit_subject = subject_cache
+					.entry(raw_new_oid)
+					.or_insert_with(|| {
+						repo.find_commit(raw_new_oid)
+							.ok()
+							.and_then(|c| {
+								c.summary()
+									.ok()
+									.flatten()
+									.map(String::from)
+							})
+							.unwrap_or_default()
 					})
-					.unwrap_or_default();
+					.clone();
 
 				entries.push(ReflogEntry {
 					ref_name: "HEAD".to_string(),

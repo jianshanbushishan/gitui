@@ -442,6 +442,24 @@ impl InspectCommitPopup {
 		self.diff.sync_diff_mode();
 	}
 
+	pub fn content_search_selected(
+		&mut self,
+		query: &str,
+		line: usize,
+		matching_lines: &[usize],
+	) {
+		match self.right_pane {
+			RightPane::Diff => self.diff.content_search_selected(
+				query,
+				line,
+				matching_lines,
+			),
+			RightPane::File => self
+				.file_preview
+				.set_search_result(query, line, matching_lines),
+		}
+	}
+
 	fn update(&mut self) -> Result<()> {
 		if let Some(request) = &self.open_request {
 			self.details.set_commits(

@@ -34,6 +34,9 @@ pub enum DetailsFocus {
 	Message,
 }
 
+type WrappedMessageCache =
+	Option<(usize, Vec<String>, Vec<String>)>;
+
 pub struct DetailsComponent {
 	repo: RepoPathRef,
 	data: Option<CommitDetails>,
@@ -45,6 +48,7 @@ pub struct DetailsComponent {
 	details_focused: bool,
 	focus: DetailsFocus,
 	current_width: Cell<u16>,
+	wrapped_cache: std::cell::RefCell<WrappedMessageCache>,
 	scroll: VerticalScroll,
 	info_scroll: VerticalScroll,
 	scroll_to_bottom_next_draw: Cell<bool>,
@@ -67,6 +71,7 @@ impl DetailsComponent {
 			focus: DetailsFocus::Message,
 			scroll_to_bottom_next_draw: Cell::new(false),
 			current_width: Cell::new(0),
+			wrapped_cache: std::cell::RefCell::new(None),
 			scroll: VerticalScroll::new(),
 			info_scroll: VerticalScroll::new(),
 			key_config: env.key_config.clone(),
@@ -151,6 +156,7 @@ impl DetailsComponent {
 		self.data = id.and_then(|id| {
 			sync::get_commit_details(&self.repo.borrow(), id).ok()
 		});
+		*self.wrapped_cache.borrow_mut() = None;
 
 		self.scroll.reset();
 		self.info_scroll.reset();
@@ -198,6 +204,7 @@ impl DetailsComponent {
 		(vec![], vec![])
 	}
 
+	#[cfg(test)]
 	fn get_number_of_lines(
 		details: Option<&CommitDetails>,
 		width: usize,
@@ -206,6 +213,40 @@ impl DetailsComponent {
 			Self::get_wrapped_lines(details, width);
 
 		wrapped_title.len() + wrapped_message.len()
+	}
+
+	fn ensure_wrapped_cache(&self, width: usize) {
+		if self
+			.wrapped_cache
+			.borrow()
+			.as_ref()
+			.is_some_and(|(w, _, _)| *w == width)
+		{
+			return;
+		}
+		let (title, body) =
+			Self::get_wrapped_lines(self.data.as_ref(), width);
+		let title = title.into_iter().map(Cow::into_owned).collect();
+		let body = body.into_iter().map(Cow::into_owned).collect();
+		*self.wrapped_cache.borrow_mut() = Some((width, title, body));
+	}
+
+	fn cached_number_of_lines(&self, width: usize) -> usize {
+		self.ensure_wrapped_cache(width);
+		self.wrapped_cache
+			.borrow()
+			.as_ref()
+			.map_or(0, |(_, title, body)| title.len() + body.len())
+	}
+
+	fn has_message_lines(&self) -> bool {
+		self.data
+			.as_ref()
+			.and_then(|d| d.message.as_ref())
+			.is_some_and(|m| {
+				!m.subject.is_empty()
+					|| m.body.as_ref().is_some_and(|b| !b.is_empty())
+			})
 	}
 
 	fn get_theme_for_line(&self, bold: bool) -> Style {
@@ -220,20 +261,26 @@ impl DetailsComponent {
 		&self,
 		width: usize,
 		height: usize,
-	) -> Vec<Line<'_>> {
-		let (wrapped_title, wrapped_message) =
-			Self::get_wrapped_lines(self.data.as_ref(), width);
+	) -> Vec<Line<'static>> {
+		self.ensure_wrapped_cache(width);
+		let cache = self.wrapped_cache.borrow();
+		let Some((_, wrapped_title, wrapped_message)) =
+			cache.as_ref()
+		else {
+			return Vec::new();
+		};
+		let title_len = wrapped_title.len();
 
-		[&wrapped_title[..], &wrapped_message[..]]
-			.concat()
+		wrapped_title
 			.iter()
+			.chain(wrapped_message.iter())
 			.enumerate()
 			.skip(self.scroll.get_top())
 			.take(height)
 			.map(|(i, line)| {
 				Line::from(vec![Span::styled(
 					line.clone(),
-					self.get_theme_for_line(i < wrapped_title.len()),
+					self.get_theme_for_line(i < title_len),
 				)])
 			})
 			.collect()
@@ -372,10 +419,9 @@ impl DrawableComponent for DetailsComponent {
 		);
 
 		let info_visible: Vec<Line<'_>> = info_lines
-			.iter()
+			.into_iter()
 			.skip(self.info_scroll.get_top())
 			.take(usize::from(info_height))
-			.cloned()
 			.collect();
 
 		let info_can_scroll =
@@ -410,10 +456,8 @@ impl DrawableComponent for DetailsComponent {
 
 		self.current_width.set(width);
 
-		let number_of_lines = Self::get_number_of_lines(
-			self.data.as_ref(),
-			usize::from(width),
-		);
+		let number_of_lines =
+			self.cached_number_of_lines(usize::from(width));
 
 		self.scroll.update_no_selection(
 			number_of_lines,
@@ -465,9 +509,7 @@ impl Component for DetailsComponent {
 		out: &mut Vec<CommandInfo>,
 		force_all: bool,
 	) -> CommandBlocking {
-		let width = usize::from(self.current_width.get());
-		let number_of_lines =
-			Self::get_number_of_lines(self.data.as_ref(), width);
+		let number_of_lines = if self.has_message_lines() { 1 } else { 0 };
 
 		let active = self.details_focused || force_all;
 

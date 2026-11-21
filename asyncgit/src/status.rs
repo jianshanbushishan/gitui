@@ -258,11 +258,15 @@ fn store_status_pair_result(
 ) -> StatusPairCompletion {
 	match result {
 		Ok(result) => {
-			let changed = last.lock().is_ok_and(|mut last| {
-				let changed = last.as_ref() != Some(&result);
-				*last = Some(result);
-				changed
-			});
+			// Snapshot the previous pair via O(1) Arc clones, perform the
+			// O(N) equality comparison outside the mutex, then swap in the
+			// new result under a brief lock.
+			let previous =
+				last.lock().ok().and_then(|guard| guard.clone());
+			let changed = previous.as_ref() != Some(&result);
+			if let Ok(mut guard) = last.lock() {
+				*guard = Some(result);
+			}
 			if let Ok(mut failures) = failures.lock() {
 				failures.current = None;
 			}

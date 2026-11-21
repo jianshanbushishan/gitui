@@ -30,7 +30,7 @@ use ratatui::{
 		Alignment, Constraint, Direction, Layout, Margin, Rect,
 	},
 	text::{Line, Span, Text},
-	widgets::{Block, BorderType, Borders, Clear, Paragraph, Tabs},
+	widgets::{Block, BorderType, Borders, Paragraph, Tabs},
 	Frame,
 };
 use std::cell::Cell;
@@ -72,12 +72,16 @@ impl DrawableComponent for BranchListPopup {
 				ui::rect_inside(MIN_SIZE, f.area().into(), area);
 			let area = area.intersection(rect);
 
-			f.render_widget(Clear, area);
+			ui::clear_popup_area(f, area);
 
 			f.render_widget(
 				Block::default()
-					.title(strings::title_branches())
+					.title(Span::styled(
+						strings::title_branches(),
+						self.theme.title(true),
+					))
 					.border_type(BorderType::Thick)
+					.border_style(self.theme.block(true))
 					.borders(Borders::ALL),
 				area,
 			);
@@ -300,11 +304,9 @@ impl BranchListPopup {
 				.move_selection(ScrollType::End)
 				.map(Into::into);
 		} else if key_match(e, self.key_config.keys.tab_toggle)
-			|| key_match(e, self.key_config.keys.move_right)
-			|| key_match(e, self.key_config.keys.move_left)
+			|| key_match(e, self.key_config.keys.tab_toggle_reverse)
 		{
 			self.local = !self.local;
-			self.check_remotes();
 			self.update_branches()?;
 			return Ok(EventState::Consumed);
 		}
@@ -327,19 +329,24 @@ impl BranchListPopup {
 	fn check_remotes(&mut self) {
 		if self.visible {
 			self.has_remotes =
-				get_branches_info(&self.repo.borrow(), false)
-					.is_ok_and(|branches| !branches.is_empty());
+				asyncgit::sync::has_remote_branches(&self.repo.borrow())
+					.unwrap_or(false);
 		}
 	}
 
 	/// fetch list of branches
 	pub fn update_branches(&mut self) -> Result<()> {
 		if self.is_visible() {
-			self.check_remotes();
+			if self.local {
+				self.check_remotes();
+			}
 			let selected_branch =
 				self.branches.get(usize::from(self.selection));
 			let mut branches =
 				get_branches_info(&self.repo.borrow(), self.local)?;
+			if !self.local {
+				self.has_remotes = !branches.is_empty();
+			}
 			// Skip remote HEAD aliases while keeping branches ending in /HEAD.
 			branches.retain(|branch| {
 				!(branch.name.ends_with("/HEAD")
@@ -473,15 +480,9 @@ impl BranchListPopup {
 
 	fn selection_is_cur_branch(&self) -> bool {
 		self.branches
-			.iter()
-			.enumerate()
-			.filter(|(index, b)| {
-				b.local_details().is_some_and(|details| {
-					details.is_head
-						&& *index == self.selection as usize
-				})
-			})
-			.count() > 0
+			.get(usize::from(self.selection))
+			.and_then(BranchInfo::local_details)
+			.is_some_and(|details| details.is_head)
 	}
 
 	// top commit of selected branch

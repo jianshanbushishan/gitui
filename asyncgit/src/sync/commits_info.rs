@@ -8,7 +8,7 @@ use crate::{
 		repository::{gix_repo, repo},
 	},
 };
-use git2::{Commit, Error, Oid};
+use git2::{Oid, Repository};
 use scopetime::scope_time;
 use unicode_truncate::UnicodeTruncateStr;
 
@@ -133,32 +133,34 @@ pub fn get_commits_info(
 	scope_time!("get_commits_info");
 
 	let repo = repo(repo_path)?;
+	get_commits_info_repo(&repo, ids, message_length_limit)
+}
+
+pub(super) fn get_commits_info_repo(
+	repo: &Repository,
+	ids: &[CommitId],
+	message_length_limit: usize,
+) -> Result<Vec<CommitInfo>> {
 	let mailmap = repo.mailmap()?;
+	let mut res = Vec::with_capacity(ids.len());
 
-	let commits = ids
-		.iter()
-		.map(|id| repo.find_commit((*id).into()))
-		.collect::<std::result::Result<Vec<Commit>, Error>>()?
-		.into_iter();
-
-	let res = commits
-		.map(|c: Commit| {
-			let message = get_message(&c, Some(message_length_limit));
-			let author = get_author_of_commit(&c, &mailmap)
-				.name()
-				.ok()
-				.map_or_else(
-					|| String::from("<unknown>"),
-					String::from,
-				);
-			CommitInfo {
-				message,
-				author,
-				time: c.time().seconds(),
-				id: CommitId(c.id()),
-			}
-		})
-		.collect::<Vec<_>>();
+	for id in ids {
+		let c = repo.find_commit((*id).into())?;
+		let message = get_message(&c, Some(message_length_limit));
+		let author = get_author_of_commit(&c, &mailmap)
+			.name()
+			.ok()
+			.map_or_else(
+				|| String::from("<unknown>"),
+				String::from,
+			);
+		res.push(CommitInfo {
+			message,
+			author,
+			time: c.time().seconds(),
+			id: CommitId(c.id()),
+		});
+	}
 
 	Ok(res)
 }
@@ -248,7 +250,7 @@ pub fn gix_get_message(
 	commit_ref: &gix::objs::CommitRef,
 	message_limit: Option<usize>,
 ) -> String {
-	let message = commit_ref.message.to_string();
+	let message = String::from_utf8_lossy(commit_ref.message.as_ref());
 	let message = message.trim();
 
 	message_limit.map_or_else(

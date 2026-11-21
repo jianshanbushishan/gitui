@@ -1,6 +1,6 @@
 use rayon::{
-	prelude::{IndexedParallelIterator, ParallelIterator},
-	slice::{ParallelSlice, ParallelSliceMut},
+	prelude::ParallelIterator,
+	slice::ParallelSlice,
 };
 
 use crate::{
@@ -118,58 +118,98 @@ impl AsyncCommitFilterJob {
 		};
 
 		let idx = AtomicUsize::new(0);
+		let last_percent = std::sync::atomic::AtomicU8::new(0);
 
-		let mut result = pool.install(|| {
+		let chunk_results: Vec<Vec<CommitId>> = pool.install(|| {
 			commits
 				.par_chunks(1000)
-				.enumerate()
-				.filter_map(|(chunk_index, commits)| {
-					//TODO: error log repo open errors
-					sync::repo(repo_path).ok().map(|repo| {
-						commits
-							.iter()
-							.enumerate()
-							.filter_map(|(offset, commit)| {
-								let idx = idx.fetch_add(
-								1,
-								std::sync::atomic::Ordering::Relaxed,
-							);
+				.map_init(
+					|| sync::repo(repo_path).ok(),
+					|repo_opt, chunk| {
+						if self
+							.cancellation_flag
+							.load(Ordering::Relaxed)
+						{
+							return Vec::new();
+						}
+						let Some(repo) = repo_opt.as_ref() else {
+							return Vec::new();
+						};
 
-								if self
-									.cancellation_flag
-									.load(Ordering::Relaxed)
-								{
-									return None;
-								}
+						let mut matches = Vec::new();
+						let mut local_count = 0_usize;
 
-								Self::update_progress(
-									params,
-									ProgressPercent::new(
-										idx,
-										total_amount,
-									),
+						for commit in chunk {
+							if self
+								.cancellation_flag
+								.load(Ordering::Relaxed)
+							{
+								break;
+							}
+
+							local_count += 1;
+							if local_count >= 64 {
+								let done = idx.fetch_add(
+									local_count,
+									Ordering::Relaxed,
+								) + local_count;
+								local_count = 0;
+								let prog = ProgressPercent::new(
+									done,
+									total_amount,
 								);
+								if last_percent.fetch_max(
+									prog.progress,
+									Ordering::Relaxed,
+								) < prog.progress
+								{
+									Self::update_progress(
+										params, prog,
+									);
+								}
+							}
 
-								(*self.filter)(&repo, commit)
-									.ok()
-									.and_then(|res| {
-										res.then_some((
-											chunk_index * 1000
-												+ offset,
-											*commit,
-										))
-									})
-							})
-							.collect::<Vec<_>>()
-					})
-				})
-				.flatten()
-				.collect::<Vec<_>>()
+							if (*self.filter)(repo, commit)
+								.unwrap_or(false)
+							{
+								matches.push(*commit);
+							}
+						}
+
+						if local_count > 0
+							&& !self
+								.cancellation_flag
+								.load(Ordering::Relaxed)
+						{
+							let done = idx.fetch_add(
+								local_count,
+								Ordering::Relaxed,
+							) + local_count;
+							let prog = ProgressPercent::new(
+								done,
+								total_amount,
+							);
+							if last_percent.fetch_max(
+								prog.progress,
+								Ordering::Relaxed,
+							) < prog.progress
+							{
+								Self::update_progress(params, prog);
+							}
+						}
+
+						matches
+					},
+				)
+				.collect()
 		});
 
-		result.par_sort_unstable_by_key(|entry| entry.0);
-
-		let result = result.into_iter().map(|c| c.1).collect();
+		let total_matches: usize =
+			chunk_results.iter().map(Vec::len).sum();
+		let mut result = Vec::with_capacity(total_matches);
+		for chunk in chunk_results {
+			result.extend(chunk);
+		}
 
 		Ok((start, result))
 	}
@@ -200,15 +240,19 @@ impl AsyncJob for AsyncCommitFilterJob {
 		&mut self,
 		params: RunParams<Self::Notification, Self::Progress>,
 	) -> Result<Self::Notification> {
-		if let Ok(mut state) = self.state.lock() {
-			*state = state.take().map(|state| match state {
-				JobState::Request { commits, repo_path } => {
-					self.run_request(&repo_path, &commits, &params)
-				}
-				JobState::Response(result) => {
-					JobState::Response(result)
-				}
-			});
+		let state = self
+			.state
+			.lock()
+			.ok()
+			.and_then(|mut guard| guard.take());
+		let next_state = state.map(|state| match state {
+			JobState::Request { commits, repo_path } => {
+				self.run_request(&repo_path, &commits, &params)
+			}
+			JobState::Response(result) => JobState::Response(result),
+		});
+		if let Ok(mut guard) = self.state.lock() {
+			*guard = next_state;
 		}
 
 		Ok(AsyncGitNotification::CommitFilter)

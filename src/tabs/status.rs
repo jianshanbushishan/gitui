@@ -25,13 +25,17 @@ use asyncgit::{
 	AsyncLineStats, AsyncStatusPair, DiffParams, DiffType, LineStats,
 	StatusItem, StatusItemType, StatusPair,
 };
-use crossterm::event::Event;
+use crossterm::event::{
+	Event, KeyCode, MouseButton, MouseEventKind,
+};
 use itertools::Itertools;
 use ratatui::{
-	layout::{Alignment, Constraint, Direction, Layout},
-	style::{Color, Style},
+	layout::{Alignment, Constraint, Direction, Layout, Rect},
+	text::{Line, Span},
 	widgets::{Block, BorderType, Borders, Paragraph},
 };
+use std::cell::Cell;
+use unicode_width::UnicodeWidthStr;
 
 mod file_preview;
 mod lfs;
@@ -119,6 +123,7 @@ pub struct Status {
 	remotes: RemoteStatus,
 	git_diff: AsyncDiff,
 	git_state: RepoState,
+	repo_state_text: String,
 	changes_fetcher: AsyncStatusPair,
 	/// background `(+.. -..)` line-count computation; never blocks
 	/// the UI thread. See [`AsyncLineStats`].
@@ -143,6 +148,10 @@ pub struct Status {
 	git_action_executed: bool,
 	options: SharedOptions,
 	key_config: SharedKeyConfig,
+	theme: crate::ui::style::SharedTheme,
+	wd_area: Cell<Rect>,
+	stage_area: Cell<Rect>,
+	right_area: Cell<Rect>,
 }
 
 impl DrawableComponent for Status {
@@ -199,6 +208,10 @@ impl DrawableComponent for Status {
 			)
 			.split(chunks[0]);
 
+		self.wd_area.set(left_chunks[0]);
+		self.stage_area.set(left_chunks[1]);
+		self.right_area.set(chunks[1]);
+
 		self.index_wd.draw(f, left_chunks[0])?;
 		self.index.draw(f, left_chunks[1])?;
 		match self.right_pane {
@@ -222,7 +235,11 @@ impl DrawableComponent for Status {
 						.block(
 							Block::default()
 								.borders(Borders::ALL)
-								.title("Git LFS"),
+								.border_style(self.theme.block(false))
+								.title(Span::styled(
+									"Git LFS",
+									self.theme.title(false),
+								)),
 						)
 						.wrap(ratatui::widgets::Wrap { trim: false }),
 					chunks[1],
@@ -269,6 +286,25 @@ impl Status {
 	///
 	pub fn new(env: &Environment) -> Self {
 		let repo_clone = env.repo.borrow().clone();
+		let mut index_wd = ChangesComponent::new(
+			env,
+			&strings::title_status(&env.key_config),
+			true,
+			true,
+		);
+		index_wd.set_empty_hint(format!(
+			"Working tree clean · [{}] branches  [{}] pull  [{}] push",
+			env.key_config.get_hint(env.key_config.keys.select_branch),
+			env.key_config.get_hint(env.key_config.keys.pull),
+			env.key_config.get_hint(env.key_config.keys.push),
+		));
+		let mut index = ChangesComponent::new(
+			env,
+			&strings::title_index(&env.key_config),
+			false,
+			false,
+		);
+		index.set_empty_hint("No staged changes");
 		Self {
 			queue: env.queue.clone(),
 			visible: true,
@@ -277,20 +313,11 @@ impl Status {
 				has_remote_for_push: false,
 			},
 			git_state: RepoState::Clean,
+			repo_state_text: String::new(),
 			focus: Focus::WorkDir,
 			diff_target: DiffTarget::WorkingDir,
-			index_wd: ChangesComponent::new(
-				env,
-				&strings::title_status(&env.key_config),
-				true,
-				true,
-			),
-			index: ChangesComponent::new(
-				env,
-				&strings::title_index(&env.key_config),
-				false,
-				false,
-			),
+			index_wd,
+			index,
 			diff: DiffComponent::new(env, false),
 			file_preview: SyntaxTextComponent::new(env),
 			right_pane: RightPane::Diff,
@@ -344,81 +371,226 @@ impl Status {
 			key_config: env.key_config.clone(),
 			options: env.options.clone(),
 			repo: env.repo.clone(),
+			theme: env.theme.clone(),
+			wd_area: Cell::new(Rect::default()),
+			stage_area: Cell::new(Rect::default()),
+			right_area: Cell::new(Rect::default()),
 		}
 	}
 
+	pub fn staged_summary(&self) -> Option<String> {
+		let files = self.index.file_count();
+		if files == 0 {
+			return None;
+		}
+		let (added, deleted) = self.staged_line_stats;
+		let plural = if files == 1 { "" } else { "s" };
+		if added > 0 || deleted > 0 {
+			Some(format!(
+				"{files} staged file{plural} (+{added} -{deleted})"
+			))
+		} else {
+			Some(format!("{files} staged file{plural}"))
+		}
+	}
+
+	pub fn has_lfs_paths(&self) -> bool {
+		!self.lfs.paths.is_empty()
+	}
+
+	pub fn current_branch(&mut self) -> Option<String> {
+		self.git_branch_name.lookup().ok()
+	}
+
+	pub fn content_search_selected(
+		&mut self,
+		query: &str,
+		line: usize,
+		matching_lines: &[usize],
+	) {
+		match self.right_pane {
+			RightPane::File => self
+				.file_preview
+				.set_search_result(query, line, matching_lines),
+			RightPane::Diff => self.diff.content_search_selected(
+				query,
+				line,
+				matching_lines,
+			),
+			RightPane::Lfs => {}
+		}
+	}
+
+	fn truncate_to_width(text: &str, max_width: usize) -> String {
+		if text.width() <= max_width {
+			return text.to_owned();
+		}
+		if max_width <= 1 {
+			return "…".to_owned();
+		}
+		let budget = max_width - 1;
+		let mut out = String::new();
+		let mut used = 0;
+		for ch in text.chars() {
+			let w = unicode_width::UnicodeWidthChar::width(ch)
+				.unwrap_or(0);
+			if used + w > budget {
+				break;
+			}
+			out.push(ch);
+			used += w;
+		}
+		out.push('…');
+		out
+	}
+
+	fn styled_line_stats(&self, added: usize, deleted: usize) -> Vec<Span<'static>> {
+		if added == 0 && deleted == 0 {
+			return Vec::new();
+		}
+		vec![
+			Span::styled("(", self.theme.text(false, false)),
+			Span::styled(
+				format!("+{added}"),
+				self.theme.diff_line(asyncgit::DiffLineType::Add, false),
+			),
+			Span::raw(" "),
+			Span::styled(
+				format!("-{deleted}"),
+				self.theme
+					.diff_line(asyncgit::DiffLineType::Delete, false),
+			),
+			Span::styled(")", self.theme.text(false, false)),
+		]
+	}
+
+	#[allow(clippy::too_many_lines)]
 	fn draw_branch_state(
 		&self,
 		f: &mut ratatui::Frame,
 		chunks: &[ratatui::layout::Rect],
 	) {
-		// Unstaged pane top row: unstaged line stats followed by
-		// branch info, combined into one right-aligned widget so they
-		// don't overlap. e.g. "(+194 -13) (mymaster ↑3 ↓0)"
+		// Unstaged pane top row: keep at least 1 border cell gap after
+		// the left title ("Unstaged Changes") so narrow panes never
+		// overwrite the title.
+		let wd_rect = chunks[0];
+		let wd_title_w =
+			strings::title_status(&self.key_config).width() + 2;
+		let wd_avail = usize::from(wd_rect.width)
+			.saturating_sub(2)
+			.saturating_sub(wd_title_w);
+
 		let (unstage_added, unstage_deleted) =
 			self.unstaged_line_stats;
-		let unstage_stats =
-			if unstage_added > 0 || unstage_deleted > 0 {
-				format!("(+{unstage_added} -{unstage_deleted})")
-			} else {
-				String::new()
-			};
+		let stats_spans =
+			self.styled_line_stats(unstage_added, unstage_deleted);
+		let stats_w: usize =
+			stats_spans.iter().map(Span::width).sum();
 
-		let branch_part = self.git_branch_name.last().map_or_else(
-			String::new,
-			|branch_name| {
-				let ahead_behind = self
-					.git_branch_state
-					.as_ref()
-					.map_or_else(String::new, |state| {
-						format!(
-							" \u{2191}{} \u{2193}{}",
-							state.ahead, state.behind,
-						)
-					});
-				format!("({branch_name}{ahead_behind})")
-			},
-		);
+		let branch_spans: Vec<Span<'static>> =
+			self.git_branch_name.last().map_or_else(
+				Vec::new,
+				|branch_name| {
+					let ab = self
+						.git_branch_state
+						.as_ref()
+						.map(|state| (state.ahead, state.behind));
+					let ab_text = ab.map_or_else(
+						String::new,
+						|(ahead, behind)| {
+							format!(" \u{2191}{ahead} \u{2193}{behind}")
+						},
+					);
+					let sep_w = usize::from(stats_w > 0);
+					let budget = wd_avail
+						.saturating_sub(stats_w + sep_w);
+					let overhead = 2 + ab_text.width();
+					if budget <= overhead + 1 {
+						return Vec::new();
+					}
+					let display_name = Self::truncate_to_width(
+						&branch_name,
+						budget - overhead,
+					);
+					let mut spans = vec![
+						Span::styled("(", self.theme.text(false, false)),
+						Span::styled(
+							display_name,
+							self.theme.branch(false, false),
+						),
+					];
+					if let Some((ahead, behind)) = ab {
+						spans.push(Span::styled(
+							format!(" \u{2191}{ahead}"),
+							self.theme.diff_line(
+								asyncgit::DiffLineType::Add,
+								false,
+							),
+						));
+						spans.push(Span::styled(
+							format!(" \u{2193}{behind}"),
+							self.theme.diff_line(
+								asyncgit::DiffLineType::Delete,
+								false,
+							),
+						));
+					}
+					spans.push(Span::styled(
+						")",
+						self.theme.text(false, false),
+					));
+					spans
+				},
+			);
 
-		let combined = match (
-			unstage_stats.is_empty(),
-			branch_part.is_empty(),
-		) {
-			(false, false) => {
-				format!("{unstage_stats} {branch_part}")
+		let mut wd_spans = Vec::new();
+		if stats_w > 0 && stats_w <= wd_avail {
+			wd_spans.extend(stats_spans);
+		}
+		if !branch_spans.is_empty() {
+			if !wd_spans.is_empty() {
+				wd_spans.push(Span::raw(" "));
 			}
-			(false, true) => unstage_stats,
-			(true, false) => branch_part,
-			(true, true) => String::new(),
-		};
+			wd_spans.extend(branch_spans);
+		}
 
-		if !combined.is_empty() {
-			let w =
-				Paragraph::new(combined).alignment(Alignment::Right);
-
-			let mut rect = chunks[0];
-			rect.x += 1;
-			rect.width = rect.width.saturating_sub(2);
-			rect.height = rect
-				.height
-				.saturating_sub(rect.height.saturating_sub(1));
-
+		if !wd_spans.is_empty() && wd_rect.width > 2 && wd_rect.height > 0
+		{
+			let w = Paragraph::new(Line::from(wd_spans))
+				.alignment(Alignment::Right);
+			let rect = Rect::new(
+				wd_rect.x + 1,
+				wd_rect.y,
+				wd_rect.width.saturating_sub(2),
+				1,
+			);
 			f.render_widget(w, rect);
 		}
 
-		// Staged line stats: always on the Staged pane's top row.
+		// Staged line stats: always on the Staged pane's top row if it fits.
+		let st_rect = chunks[1];
+		let st_title_w =
+			strings::title_index(&self.key_config).width() + 2;
+		let st_avail = usize::from(st_rect.width)
+			.saturating_sub(2)
+			.saturating_sub(st_title_w);
 		let (added, deleted) = self.staged_line_stats;
-		if added > 0 || deleted > 0 {
-			let w = Paragraph::new(format!("(+{added} -{deleted})"))
+		let staged_spans = self.styled_line_stats(added, deleted);
+		let staged_w: usize =
+			staged_spans.iter().map(Span::width).sum();
+		if staged_w > 0
+			&& staged_w <= st_avail
+			&& st_rect.width > 2
+			&& st_rect.height > 0
+		{
+			let w = Paragraph::new(Line::from(staged_spans))
 				.alignment(Alignment::Right);
-
-			let mut rect = chunks[1];
-			rect.x += 1;
-			rect.width = rect.width.saturating_sub(2);
-			rect.height = rect
-				.height
-				.saturating_sub(rect.height.saturating_sub(1));
-
+			let rect = Rect::new(
+				st_rect.x + 1,
+				st_rect.y,
+				st_rect.width.saturating_sub(2),
+				1,
+			);
 			f.render_widget(w, rect);
 		}
 	}
@@ -471,23 +643,43 @@ impl Status {
 		r: ratatui::layout::Rect,
 	) {
 		if self.git_state != RepoState::Clean {
-			let txt = Self::repo_state_text(
-				&self.repo.borrow(),
-				&self.git_state,
-			);
+			let txt = self.repo_state_text.as_str();
+			let action_hint = match self.git_state {
+				RepoState::Rebase => format!(
+					"  [{}] Continue  [{}] Abort",
+					self.key_config
+						.get_hint(self.key_config.keys.rebase_branch),
+					self.key_config
+						.get_hint(self.key_config.keys.abort_merge),
+				),
+				RepoState::Merge | RepoState::Revert => format!(
+					"  [{}] Commit  [{}] Abort",
+					self.key_config
+						.get_hint(self.key_config.keys.open_commit),
+					self.key_config
+						.get_hint(self.key_config.keys.abort_merge),
+				),
+				_ => String::new(),
+			};
 
-			let w = Paragraph::new(txt)
+			let line = Line::from(vec![
+				Span::styled(txt, self.theme.text_danger()),
+				Span::styled(
+					action_hint,
+					self.theme.commandbar_key(),
+				),
+			]);
+			let w = Paragraph::new(line)
 				.block(
 					Block::default()
 						.border_type(BorderType::Plain)
 						.borders(Borders::all())
 						.border_style(Theme::attention_block())
-						.title(format!(
-							"Pending {:?}",
-							self.git_state
+						.title(Span::styled(
+							format!("Pending {:?}", self.git_state),
+							Theme::attention_block(),
 						)),
 				)
-				.style(Style::default().fg(Color::Red))
 				.alignment(Alignment::Left);
 
 			f.render_widget(w, r);
@@ -601,8 +793,15 @@ impl Status {
 				self.request_line_stats()?;
 			}
 
-			self.git_state = sync::repo_state(&self.repo.borrow())
-				.unwrap_or(RepoState::Clean);
+			let repo = self.repo.borrow();
+			self.git_state =
+				sync::repo_state(&repo).unwrap_or(RepoState::Clean);
+			if self.git_state == RepoState::Clean {
+				self.repo_state_text.clear();
+			} else {
+				self.repo_state_text =
+					Self::repo_state_text(&repo, &self.git_state);
+			}
 		}
 
 		Ok(())
@@ -956,6 +1155,11 @@ impl Status {
 
 	///
 	pub fn update_diff(&mut self) -> Result<()> {
+		let file_pos = match self.diff_target {
+			DiffTarget::Stage => self.index.file_position(),
+			DiffTarget::WorkingDir => self.index_wd.file_position(),
+		};
+		self.diff.set_file_position(file_pos);
 		let selection = self.selected_status_item();
 		if self.present_lfs_selection(selection.as_ref())? {
 			return Ok(());
@@ -1918,6 +2122,7 @@ mod tests {
 }
 
 impl Component for Status {
+	#[allow(clippy::too_many_lines)]
 	fn commands(
 		&self,
 		out: &mut Vec<CommandInfo>,
@@ -1938,6 +2143,25 @@ impl Component for Status {
 					self.preview.key.is_some(),
 					self.focus == Focus::Diff || force_all,
 				));
+				out.push(CommandInfo::new(
+					strings::commands::find_file(&self.key_config),
+					self.preview.key.is_some(),
+					self.focus == Focus::Diff || force_all,
+				));
+			}
+			if self.focus == Focus::Diff {
+				out.push(
+					CommandInfo::new(
+						crate::components::CommandText::new(
+							"Files [[] / []]".to_owned(),
+							"switch previous/next file while zoomed in diff",
+							"-- Diff --",
+						),
+						true,
+						true,
+					)
+					.order(strings::order::NAV),
+				);
 			}
 
 			out.push(
@@ -2048,7 +2272,90 @@ impl Component for Status {
 				return Ok(EventState::Consumed);
 			}
 
+			if let Event::Mouse(mouse) = ev {
+				let pos =
+					ratatui::layout::Position::new(mouse.column, mouse.row);
+				match mouse.kind {
+					MouseEventKind::Down(MouseButton::Left) => {
+						if self.focus != Focus::Diff
+							&& self.wd_area.get().contains(pos)
+						{
+							self.switch_focus(Focus::WorkDir)?;
+							return Ok(EventState::Consumed);
+						} else if self.focus != Focus::Diff
+							&& self.stage_area.get().contains(pos)
+						{
+							self.switch_focus(Focus::Stage)?;
+							return Ok(EventState::Consumed);
+						} else if self.right_area.get().contains(pos)
+							&& self.can_focus_diff()
+						{
+							self.switch_focus(Focus::Diff)?;
+							return Ok(EventState::Consumed);
+						}
+					}
+					MouseEventKind::ScrollDown
+					| MouseEventKind::ScrollUp => {
+						let down = matches!(
+							mouse.kind,
+							MouseEventKind::ScrollDown
+						);
+						if self.right_area.get().contains(pos) {
+							match self.right_pane {
+								RightPane::Diff => {
+									self.diff.scroll_mouse(down);
+									return Ok(EventState::Consumed);
+								}
+								RightPane::File => {
+									self.file_preview
+										.scroll_mouse(down);
+									return Ok(EventState::Consumed);
+								}
+								RightPane::Lfs => {}
+							}
+						} else if self.wd_area.get().contains(pos) {
+							self.index_wd.scroll_mouse(down);
+							return Ok(EventState::Consumed);
+						} else if self.stage_area.get().contains(pos)
+						{
+							self.index.scroll_mouse(down);
+							return Ok(EventState::Consumed);
+						}
+					}
+					_ => {}
+				}
+			}
+
 			if let Event::Key(k) = ev {
+				if self.focus == Focus::Diff
+					&& k.modifiers.is_empty()
+					&& matches!(
+						k.code,
+						KeyCode::Char('[' | ']')
+					) {
+					let forward = k.code == KeyCode::Char(']');
+					let moved = match self.diff_target {
+						DiffTarget::WorkingDir => {
+							self.index_wd.select_adjacent_file(forward)
+						}
+						DiffTarget::Stage => {
+							self.index.select_adjacent_file(forward)
+						}
+					};
+					if moved {
+						self.update_diff()?;
+					}
+					return Ok(EventState::Consumed);
+				}
+				if self.focus == Focus::Diff
+					&& self.right_pane == RightPane::File
+					&& (key_match(k, self.key_config.keys.file_find)
+						|| (k.code == KeyCode::Char('/')
+							&& k.modifiers.is_empty()))
+				{
+					self.file_preview.start_search();
+					return Ok(EventState::Consumed);
+				}
 				if self.can_focus_diff()
 					&& key_match(
 						k,

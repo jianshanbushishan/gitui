@@ -95,6 +95,7 @@ use asyncgit::{sync::RepoPath, AsyncGitNotification};
 use backtrace::Backtrace;
 use crossbeam_channel::{Receiver, Select};
 use crossterm::{
+	event::{DisableMouseCapture, EnableMouseCapture},
 	terminal::{
 		disable_raw_mode, enable_raw_mode, EnterAlternateScreen,
 		LeaveAlternateScreen,
@@ -139,6 +140,8 @@ pub enum SyntaxHighlightProgress {
 pub enum AsyncAppNotification {
 	/// An external AI commit-message command finished.
 	AiCommitMessage,
+	/// A background commit (including git hooks) finished.
+	CommitDone,
 	///
 	SyntaxHighlighting(SyntaxHighlightProgress),
 	/// A fuzzy file/path search completed.
@@ -151,6 +154,8 @@ pub enum AsyncAppNotification {
 	StatusFilePreview,
 	/// A repository write or LFS transfer finished.
 	RepoOperation,
+	/// The active LFS download's progress changed.
+	LfsDownloadProgress,
 	/// The LFS menu diagnostics are ready.
 	LfsDiagnostics,
 	/// The status view's LFS information is ready.
@@ -275,7 +280,20 @@ fn setup_terminal() -> Result<()> {
 	Ok(())
 }
 
+pub(crate) fn set_mouse_capture(enabled: bool) {
+	let result = if enabled {
+		io::stdout().execute(EnableMouseCapture).map(|_| ())
+	} else {
+		io::stdout().execute(DisableMouseCapture).map(|_| ())
+	};
+	if let Err(e) = result {
+		log::error!("set_mouse_capture({enabled}) failed:\n{e}");
+	}
+}
+
 fn shutdown_terminal() {
+	set_mouse_capture(false);
+
 	let leave_screen =
 		io::stdout().execute(LeaveAlternateScreen).map(|_f| ());
 

@@ -1,3 +1,4 @@
+use super::content_search::push_highlighted_graphemes;
 use crate::components::{
 	visibility_blocking, CommandBlocking, CommandInfo, Component,
 	DrawableComponent, EventState, FuzzyFinderTarget, InputType,
@@ -13,16 +14,16 @@ use crate::{
 	AsyncAppNotification, AsyncNotification,
 };
 use anyhow::Result;
-use crossterm::event::Event;
+use crossterm::event::{Event, KeyCode, KeyModifiers};
 use fuzzy_matcher::FuzzyMatcher;
 use ratatui::{
 	layout::{Constraint, Direction, Layout, Margin, Rect},
 	text::{Line, Span},
-	widgets::{Block, Borders, Clear},
+	widgets::{Block, Borders},
 	Frame,
 };
 use std::{
-	borrow::Cow,
+	cell::Cell,
 	sync::{
 		atomic::{AtomicU64, Ordering},
 		Arc, Mutex,
@@ -30,7 +31,7 @@ use std::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-type FilteredEntries = Vec<(usize, Vec<usize>)>;
+type FilteredEntries = Vec<usize>;
 type SearchResult =
 	Arc<Mutex<Option<(u64, String, FilteredEntries)>>>;
 
@@ -55,6 +56,9 @@ pub struct FuzzyFindPopup {
 	target: Option<FuzzyFinderTarget>,
 	search_generation: Arc<AtomicU64>,
 	search_result: SearchResult,
+	searching: bool,
+	list_height: Cell<usize>,
+	matcher: fuzzy_matcher::skim::SkimMatcherV2,
 	app_sender: crossbeam_channel::Sender<AsyncAppNotification>,
 }
 
@@ -81,6 +85,9 @@ impl FuzzyFindPopup {
 			target: None,
 			search_generation: Arc::new(AtomicU64::new(0)),
 			search_result: Arc::new(Mutex::new(None)),
+			searching: false,
+			list_height: Cell::new(15),
+			matcher: fuzzy_matcher::skim::SkimMatcherV2::default(),
 			app_sender: env.sender_app.clone(),
 		}
 	}
@@ -102,6 +109,7 @@ impl FuzzyFindPopup {
 			{
 				self.filtered = filtered;
 				self.filtered_query = Some(query);
+				self.searching = false;
 				self.selection = 0;
 				self.refresh_selection();
 			}
@@ -130,26 +138,25 @@ impl FuzzyFindPopup {
 				.as_ref()
 				.zip(query.as_ref())
 				.is_some_and(|(old, new)| new.starts_with(old));
-		let candidates = narrowing.then(|| {
-			self.filtered
-				.iter()
-				.map(|(index, _)| *index)
-				.collect::<Vec<_>>()
-		});
+		let candidates = narrowing.then(|| self.filtered.clone());
 		self.query = query;
 
-		self.filtered.clear();
-		self.filtered_query = None;
-		self.selection = 0;
-		self.refresh_selection();
 		let generation = self
 			.search_generation
 			.fetch_add(1, Ordering::Relaxed)
 			.wrapping_add(1);
 
 		let Some(query) = self.query.clone() else {
+			self.searching = false;
+			self.filtered_query = None;
+			self.filtered = (0..self.contents.len()).collect();
+			self.selection = 0;
+			self.refresh_selection();
 			return;
 		};
+		// Keep previous results visible while the background search runs
+		// so the list doesn't flicker to "Hits: 0" on every keystroke.
+		self.searching = true;
 		let contents = Arc::clone(&self.contents);
 		let search_generation = Arc::clone(&self.search_generation);
 		let search_result = Arc::clone(&self.search_result);
@@ -159,34 +166,41 @@ impl FuzzyFindPopup {
 		rayon_core::spawn(move || {
 			let matcher =
 				fuzzy_matcher::skim::SkimMatcherV2::default();
-			let indices = candidates
-				.unwrap_or_else(|| (0..contents.len()).collect());
 			let mut scored = Vec::new();
-			for index in indices {
-				if search_generation.load(Ordering::Relaxed)
-					!= generation
-				{
-					return;
-				}
-				if let Some((score, matched)) =
-					matcher.fuzzy_indices(&contents[index], &query)
+			let mut eval = |index: usize| {
+				if let Some(score) =
+					matcher.fuzzy_match(&contents[index], &query)
 				{
 					let exact_directory = search_files
 						&& is_exact_directory_match(
 							&contents[index],
 							&query,
 						);
-					scored.push((
-						exact_directory,
-						score,
-						index,
-						matched,
-					));
+					scored.push((exact_directory, score, index));
+				}
+			};
+			if let Some(indices) = candidates {
+				for index in indices {
+					if search_generation.load(Ordering::Relaxed)
+						!= generation
+					{
+						return;
+					}
+					eval(index);
+				}
+			} else {
+				for index in 0..contents.len() {
+					if search_generation.load(Ordering::Relaxed)
+						!= generation
+					{
+						return;
+					}
+					eval(index);
 				}
 			}
 			scored.sort_unstable_by(
-				|(exact1, score1, index1, _),
-				 (exact2, score2, index2, _)| {
+				|(exact1, score1, index1),
+				 (exact2, score2, index2)| {
 					exact2
 						.cmp(exact1)
 						.then_with(|| score2.cmp(score1))
@@ -195,7 +209,7 @@ impl FuzzyFindPopup {
 			);
 			let filtered = scored
 				.into_iter()
-				.map(|(_, _, index, matched)| (index, matched))
+				.map(|(_, _, index)| index)
 				.collect();
 			if let Ok(mut result) = search_result.lock() {
 				if search_generation.load(Ordering::Relaxed)
@@ -210,8 +224,7 @@ impl FuzzyFindPopup {
 	}
 
 	fn refresh_selection(&mut self) {
-		let selection =
-			self.filtered.get(self.selection).map(|a| a.0);
+		let selection = self.filtered.get(self.selection).copied();
 
 		if self.selected_index != selection {
 			self.selected_index = selection;
@@ -250,14 +263,20 @@ impl FuzzyFindPopup {
 	}
 
 	fn move_selection(&mut self, move_type: ScrollType) -> bool {
+		let page = self.list_height.get().max(1);
+		let max = self.filtered.len().saturating_sub(1);
 		let new_selection = match move_type {
 			ScrollType::Up => self.selection.saturating_sub(1),
 			ScrollType::Down => self.selection.saturating_add(1),
-			_ => self.selection,
+			ScrollType::PageUp => self.selection.saturating_sub(page),
+			ScrollType::PageDown => {
+				self.selection.saturating_add(page)
+			}
+			ScrollType::Home => 0,
+			ScrollType::End => max,
 		};
 
-		let new_selection = new_selection
-			.clamp(0, self.filtered.len().saturating_sub(1));
+		let new_selection = new_selection.clamp(0, max);
 
 		if new_selection != self.selection {
 			self.selection = new_selection;
@@ -274,48 +293,76 @@ impl FuzzyFindPopup {
 			// Block has two lines up and down which need to be considered
 			const HEIGHT_BLOCK_MARGIN: usize = 2;
 
-			let title = format!("Hits: {}", self.filtered.len());
+			let title = if self.searching {
+				format!("Hits: {} (searching…)", self.filtered.len())
+			} else {
+				format!("Hits: {}", self.filtered.len())
+			};
 
 			let height = usize::from(area.height);
 			let width = usize::from(area.width);
+			let text_width = width.saturating_sub(2);
 
 			let list_height =
 				height.saturating_sub(HEIGHT_BLOCK_MARGIN);
+			self.list_height.set(list_height.max(1));
 
 			let scroll_skip =
 				self.selection.saturating_sub(list_height);
 
+			let active_query = self.filtered_query.as_deref();
 			let items = self
 				.filtered
 				.iter()
 				.skip(scroll_skip)
 				.take(height)
-				.map(|(idx, indices)| {
+				.map(|&idx| {
 					let selected = self
 						.selected_index
-						.is_some_and(|index| index == *idx);
+						.is_some_and(|index| index == idx);
+					let entry = &self.contents[idx];
 					let full_text =
-						trim_length_left(&self.contents[*idx], width);
-					let trim_length =
-						self.contents[*idx].graphemes(true).count()
-							- full_text.graphemes(true).count();
-					Line::from(
-						full_text
-							.graphemes(true)
-							.enumerate()
-							.map(|(c_idx, c)| {
-								Span::styled(
-									Cow::from(c.to_string()),
-									self.theme.text(
-										selected,
-										indices.contains(
-											&(c_idx + trim_length),
-										),
-									),
-								)
-							})
-							.collect::<Vec<_>>(),
-					)
+						trim_length_left(entry, text_width);
+					let trim_length = if full_text.len() == entry.len()
+					{
+						0
+					} else {
+						entry.graphemes(true).count()
+							- full_text.graphemes(true).count()
+					};
+					let indices = active_query.and_then(|q| {
+						self.matcher
+							.fuzzy_indices(entry, q)
+							.map(|(_, matched)| matched)
+					});
+					let row_style = self.theme.text(true, selected);
+					let match_style =
+						self.theme.search_match(selected);
+					let mut spans = Vec::with_capacity(8);
+					spans.push(Span::styled(
+						if selected { "> " } else { "  " },
+						row_style,
+					));
+					push_highlighted_graphemes(
+						&mut spans,
+						full_text,
+						trim_length,
+						indices.as_deref().unwrap_or(&[]),
+						row_style,
+						match_style,
+					);
+					if selected {
+						let used = 2 + unicode_width::UnicodeWidthStr::width(
+							full_text,
+						);
+						if width > used {
+							spans.push(Span::styled(
+								" ".repeat(width - used),
+								row_style,
+							));
+						}
+					}
+					Line::from(spans)
 				});
 
 			ui::draw_list_block(
@@ -326,7 +373,8 @@ impl FuzzyFindPopup {
 						title,
 						self.theme.title(true),
 					))
-					.borders(Borders::TOP),
+					.borders(Borders::TOP)
+					.border_style(self.theme.block(false)),
 				items,
 			);
 
@@ -352,9 +400,9 @@ impl FuzzyFindPopup {
 impl DrawableComponent for FuzzyFindPopup {
 	fn draw(&self, f: &mut Frame, area: Rect) -> Result<()> {
 		if self.is_visible() {
-			const MAX_SIZE: (u16, u16) = (50, 20);
+			const MAX_SIZE: (u16, u16) = (60, 22);
 
-			let any_hits = !self.filtered.is_empty();
+			let any_hits = !self.filtered.is_empty() || self.searching;
 
 			let area = ui::centered_rect_absolute(
 				MAX_SIZE.0, MAX_SIZE.1, area,
@@ -372,11 +420,11 @@ impl DrawableComponent for FuzzyFindPopup {
 					.split(area)[0]
 			};
 
-			f.render_widget(Clear, area);
+			ui::clear_popup_area(f, area);
 			f.render_widget(
 				Block::default()
 					.borders(Borders::all())
-					.style(self.theme.title(true))
+					.border_style(self.theme.block(true))
 					.title(Span::styled(
 						strings::POPUP_TITLE_FUZZY_FIND,
 						self.theme.title(true),
@@ -440,18 +488,35 @@ impl Component for FuzzyFindPopup {
 					|| key_match(key, self.key_config.keys.enter)
 				{
 					self.hide();
+					return Ok(EventState::Consumed);
 				} else if key_match(
 					key,
 					self.key_config.keys.move_down,
 				) || key_match(
 					key,
 					self.key_config.keys.popup_down,
-				) {
+				) || (key.code == KeyCode::Char('n')
+					&& key.modifiers == KeyModifiers::CONTROL)
+				{
 					self.move_selection(ScrollType::Down);
+					return Ok(EventState::Consumed);
 				} else if key_match(key, self.key_config.keys.move_up)
 					|| key_match(key, self.key_config.keys.popup_up)
+					|| (key.code == KeyCode::Char('p')
+						&& key.modifiers == KeyModifiers::CONTROL)
 				{
 					self.move_selection(ScrollType::Up);
+					return Ok(EventState::Consumed);
+				} else if key_match(
+					key,
+					self.key_config.keys.page_down,
+				) {
+					self.move_selection(ScrollType::PageDown);
+					return Ok(EventState::Consumed);
+				} else if key_match(key, self.key_config.keys.page_up)
+				{
+					self.move_selection(ScrollType::PageUp);
+					return Ok(EventState::Consumed);
 				}
 			}
 

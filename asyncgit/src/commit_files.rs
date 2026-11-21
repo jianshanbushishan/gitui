@@ -9,7 +9,7 @@ use std::sync::{
 	Arc, Mutex,
 };
 
-type ResultType = Vec<StatusItem>;
+type ResultType = Arc<[StatusItem]>;
 struct Request<R, A>(R, A);
 
 ///
@@ -74,11 +74,20 @@ impl AsyncCommitFiles {
 	///
 	pub fn current(
 		&self,
-	) -> Result<Option<(CommitFilesParams, ResultType)>> {
+	) -> Result<Option<(CommitFilesParams, Vec<StatusItem>)>> {
+		Ok(self
+			.current_arc()?
+			.map(|(params, items)| (params, items.to_vec())))
+	}
+
+	/// Zero-copy shared access to the latest fetched commit files.
+	pub fn current_arc(
+		&self,
+	) -> Result<Option<(CommitFilesParams, Arc<[StatusItem]>)>> {
 		let c = self.current.lock()?;
 
 		c.as_ref()
-			.map_or(Ok(None), |c| Ok(Some((c.0, c.1.clone()))))
+			.map_or(Ok(None), |c| Ok(Some((c.0, Arc::clone(&c.1)))))
 	}
 
 	///
@@ -109,8 +118,18 @@ impl AsyncCommitFiles {
 			}
 		}
 
-		// If pending, the spawn will pick up desired after current fetch completes
-		if self.is_pending() {
+		// Atomically claim the single worker slot so concurrent fetches
+		// cannot spawn duplicate workers.
+		if self
+			.pending
+			.compare_exchange(
+				0,
+				1,
+				Ordering::AcqRel,
+				Ordering::Acquire,
+			)
+			.is_err()
+		{
 			return Ok(());
 		}
 
@@ -120,55 +139,57 @@ impl AsyncCommitFiles {
 		let arc_desired = Arc::clone(&self.desired);
 		let repo = self.repo.clone();
 
-		self.pending.fetch_add(1, Ordering::Relaxed);
-
 		rayon_core::spawn(move || {
-			Self::fetch_helper(&repo, params, &arc_current)
-				.expect("failed to fetch");
-
-			arc_pending.fetch_sub(1, Ordering::Relaxed);
-
-			// Check if there's a new desired request to fetch
-			let next_params = {
-				let mut desired = arc_desired.lock().expect("lock");
-				desired.take()
-			};
-
-			if let Some(next_params) = next_params {
-				// Check if we already have this data
-				let need_fetch = {
-					let current = arc_current.lock().expect("lock");
-					(*current)
-						.as_ref()
-						.is_none_or(|c| c.0 != next_params)
+			loop {
+				let next_params = {
+					let mut desired =
+						arc_desired.lock().expect("lock");
+					desired.take()
 				};
 
-				if need_fetch {
-					// Spawn a new thread for the follow-up fetch to avoid blocking
-					arc_pending.fetch_add(1, Ordering::Relaxed);
-					let arc_current_clone = arc_current.clone();
-					let arc_pending_clone = arc_pending.clone();
-					let sender_clone = sender.clone();
-					rayon_core::spawn(move || {
-						Self::fetch_helper(
-							&repo,
-							next_params,
-							&arc_current_clone,
-						)
-						.expect("failed to fetch");
-						arc_pending_clone
-							.fetch_sub(1, Ordering::Relaxed);
-						let _ = sender_clone
-							.send(AsyncGitNotification::CommitFiles);
-					});
-					// Return early, the spawned thread will send notification
+				let Some(target) = next_params else {
+					arc_pending.store(0, Ordering::Release);
+					// Re-check desired in case a new request arrived just
+					// before clearing pending.
+					let has_more = arc_desired
+						.lock()
+						.is_ok_and(|d| d.is_some());
+					if has_more
+						&& arc_pending
+							.compare_exchange(
+								0,
+								1,
+								Ordering::AcqRel,
+								Ordering::Acquire,
+							)
+							.is_ok()
+					{
+						continue;
+					}
 					return;
+				};
+
+				let already_loaded = arc_current.lock().is_ok_and(
+					|c| c.as_ref().is_some_and(|r| r.0 == target),
+				);
+				if already_loaded {
+					continue;
+				}
+
+				if let Err(error) =
+					Self::fetch_helper(&repo, target, &arc_current)
+				{
+					log::error!("get_commit_files error: {error}");
+				}
+
+				let has_newer = arc_desired
+					.lock()
+					.is_ok_and(|d| d.is_some());
+				if !has_newer {
+					let _ = sender
+						.send(AsyncGitNotification::CommitFiles);
 				}
 			}
-
-			sender
-				.send(AsyncGitNotification::CommitFiles)
-				.expect("error sending");
 		});
 
 		Ok(())
@@ -181,11 +202,12 @@ impl AsyncCommitFiles {
 			Mutex<Option<Request<CommitFilesParams, ResultType>>>,
 		>,
 	) -> Result<()> {
-		let res = sync::get_commit_files(
+		let res: Arc<[StatusItem]> = sync::get_commit_files(
 			repo_path,
 			params.id,
 			params.other,
-		)?;
+		)?
+		.into();
 
 		log::trace!("get_commit_files: {:?} ({})", params, res.len());
 

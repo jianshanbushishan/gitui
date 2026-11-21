@@ -51,6 +51,7 @@ pub struct StatusTreeComponent {
 	lfs_paths: Rc<HashSet<String>>,
 	repo: RepoPathRef,
 	copy_path_popup: CopyPathPopup,
+	empty_hint: Option<String>,
 	/// Flattened/folded rows, invalidated only when tree layout changes.
 	draw_cache: RefCell<Option<Vec<TextDrawInfo>>>,
 }
@@ -78,8 +79,88 @@ impl StatusTreeComponent {
 				env.theme.clone(),
 				env.key_config.clone(),
 			),
+			empty_hint: None,
 			draw_cache: RefCell::new(None),
 		}
+	}
+
+	pub fn set_empty_hint(&mut self, hint: impl Into<String>) {
+		self.empty_hint = Some(hint.into());
+	}
+
+	/// Advance or retreat selection to the next/previous file item,
+	/// skipping directory rows (used for quick file switching while
+	/// zoomed into the full-screen Diff view).
+	pub fn select_adjacent_file(&mut self, forward: bool) -> bool {
+		let items = self.tree.tree.items();
+		if items.is_empty() {
+			return false;
+		}
+		let start = self.tree.selection.unwrap_or(0);
+		let mut idx = start;
+		loop {
+			if forward {
+				if idx + 1 >= items.len() {
+					return false;
+				}
+				idx += 1;
+			} else {
+				if idx == 0 {
+					return false;
+				}
+				idx -= 1;
+			}
+			if items[idx].info.visible
+				&& matches!(items[idx].kind, FileTreeItemKind::File(_))
+			{
+				self.tree.selection = Some(idx);
+				self.queue
+					.push(InternalEvent::Update(NeedsUpdate::DIFF));
+				return true;
+			}
+		}
+	}
+
+	/// 1-based position of the currently selected file among all files in
+	/// this tree (e.g. `(3, 12)`).
+	pub fn file_position(&self) -> Option<(usize, usize)> {
+		let selected = self.tree.selection?;
+		let items = self.tree.tree.items();
+		if !matches!(
+			items.get(selected)?.kind,
+			FileTreeItemKind::File(_)
+		) {
+			return None;
+		}
+		let pos = items[..=selected]
+			.iter()
+			.filter(|item| {
+				matches!(item.kind, FileTreeItemKind::File(_))
+			})
+			.count();
+		Some((pos, self.tree.tree.file_count()))
+	}
+
+	pub fn selection_ref(&self) -> Option<&FileTreeItem> {
+		self.tree.selected_item_ref()
+	}
+
+	pub fn selection_file_ref(&self) -> Option<&StatusItem> {
+		self.tree.selected_item_ref().and_then(|f| {
+			if let FileTreeItemKind::File(f) = &f.kind {
+				Some(f)
+			} else {
+				None
+			}
+		})
+	}
+
+	pub fn scroll_mouse(&mut self, down: bool) -> bool {
+		self.move_selection(if down {
+			MoveSelection::Down
+		} else {
+			MoveSelection::Up
+		})
 	}
 
 	pub const fn set_commit(&mut self, revision: Option<CommitId>) {
@@ -311,22 +392,15 @@ impl StatusTreeComponent {
 		&self,
 	) -> Vec<TextDrawInfo> {
 		let mut should_skip_over: usize = 0;
-		let mut vec_draw_text_info: Vec<TextDrawInfo> = vec![];
 		let tree_items = self.tree.tree.items();
+		let mut vec_draw_text_info: Vec<TextDrawInfo> =
+			Vec::with_capacity(tree_items.len());
 
 		for (index, item) in tree_items.iter().enumerate() {
 			if should_skip_over > 0 {
 				should_skip_over -= 1;
 				continue;
 			}
-
-			vec_draw_text_info.push(TextDrawInfo {
-				name: item.info.path.clone(),
-				indent: item.info.indent,
-				visible: item.info.visible,
-				item_kind: item.kind.clone(),
-				source_index: index,
-			});
 
 			let mut idx_temp = index;
 
@@ -354,17 +428,28 @@ impl StatusTreeComponent {
 					should_skip_over -= 1;
 					break;
 				}
-
-				// There is only one item at this level (i.e only one folder in the folder),
-				// so do fold up
-
-				let vec_draw_text_info_len = vec_draw_text_info.len();
-				vec_draw_text_info[vec_draw_text_info_len - 1]
-					.name += &(String::from("/")
-					+ &tree_items[idx_temp].info.path);
 			}
+
+			if !item.info.visible {
+				continue;
+			}
+
+			let mut name = item.info.path.clone();
+			for folded in
+				&tree_items[(index + 1)..=(index + should_skip_over)]
+			{
+				name.push('/');
+				name.push_str(&folded.info.path);
+			}
+
+			vec_draw_text_info.push(TextDrawInfo {
+				name,
+				indent: item.info.indent,
+				visible: true,
+				item_kind: item.kind.clone(),
+				source_index: index,
+			});
 		}
-		vec_draw_text_info.retain(|info| info.visible);
 		vec_draw_text_info
 	}
 
@@ -478,27 +563,40 @@ impl DrawableComponent for StatusTreeComponent {
 				select,
 			));
 
-			let items = vec_draw_text_info
-				.iter()
-				.enumerate()
-				.skip(self.scroll_top.get())
-				.take(tree_height)
-				.filter_map(|(index, draw_text_info)| {
-					self.item_to_text(
-						&draw_text_info.name,
-						draw_text_info.indent as usize,
-						draw_text_info.visible,
-						&draw_text_info.item_kind,
-						r.width,
-						self.show_selection && select == index,
-					)
-				});
+			let items: Vec<Span<'_>> = if visible_count == 0 {
+				self.empty_hint
+					.as_ref()
+					.map(|hint| {
+						vec![Span::styled(
+							Cow::Borrowed(hint.as_str()),
+							self.theme.text(false, false),
+						)]
+					})
+					.unwrap_or_default()
+			} else {
+				vec_draw_text_info
+					.iter()
+					.enumerate()
+					.skip(self.scroll_top.get())
+					.take(tree_height)
+					.filter_map(|(index, draw_text_info)| {
+						self.item_to_text(
+							&draw_text_info.name,
+							draw_text_info.indent as usize,
+							draw_text_info.visible,
+							&draw_text_info.item_kind,
+							r.width,
+							self.show_selection && select == index,
+						)
+					})
+					.collect()
+			};
 
 			ui::draw_list(
 				f,
 				r,
 				self.title.as_str(),
-				items,
+				items.into_iter(),
 				self.focused,
 				&self.theme,
 			);
@@ -526,7 +624,7 @@ impl Component for StatusTreeComponent {
 		force_all: bool,
 	) -> CommandBlocking {
 		let available = self.focused || force_all;
-		let selection = self.selection_file();
+		let selection = self.selection_file_ref();
 		let selected_is_file = selection.is_some();
 		let tracked = selection.is_some_and(|s| {
 			!matches!(s.status, StatusItemType::New)

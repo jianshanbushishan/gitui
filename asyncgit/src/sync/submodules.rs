@@ -76,12 +76,12 @@ pub fn get_submodules(
 ) -> Result<Vec<SubmoduleInfo>> {
 	scope_time!("get_submodules");
 
-	let (r, repo2) = (repo(repo_path)?, repo(repo_path)?);
+	let r = repo(repo_path)?;
 
 	let res = r
 		.submodules()?
 		.iter()
-		.map(|s| submodule_to_info(s, &repo2))
+		.map(|s| submodule_to_info(s, &r))
 		.collect();
 
 	Ok(res)

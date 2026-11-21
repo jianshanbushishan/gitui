@@ -76,13 +76,22 @@ pub fn reword(
 fn get_current_branch(
 	repo: &Repository,
 ) -> Result<Option<git2::Branch<'_>>> {
-	for b in repo.branches(None)? {
-		let branch = b?.0;
-		if branch.is_head() {
-			return Ok(Some(branch));
+	match repo.head() {
+		Ok(head) if head.is_branch() => {
+			Ok(Some(git2::Branch::wrap(head)))
 		}
+		Ok(_) => Ok(None),
+		Err(e)
+			if matches!(
+				e.code(),
+				git2::ErrorCode::UnbornBranch
+					| git2::ErrorCode::NotFound
+			) =>
+		{
+			Ok(None)
+		}
+		Err(e) => Err(e.into()),
 	}
-	Ok(None)
 }
 
 /// Changes the commit message of a commit with a specified oid

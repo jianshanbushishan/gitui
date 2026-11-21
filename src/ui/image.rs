@@ -305,6 +305,8 @@ fn worker(
 ) {
 	let picker = IMAGE_PICKER.get_or_init(Picker::halfblocks);
 	let mut cache: VecDeque<(Key, Encoded)> = VecDeque::new();
+	let mut decoded_cache: VecDeque<(u64, Result<DynamicImage, String>)> =
+		VecDeque::new();
 	while receiver.recv().is_ok() {
 		let request = shared
 			.mailbox
@@ -329,7 +331,25 @@ fn worker(
 			cache.push_back(entry);
 			encoded
 		} else {
-			let image = decode(&request.bytes).map(thumbnail);
+			let image = if let Some(index) = decoded_cache
+				.iter()
+				.position(|(h, _)| *h == request.key.content)
+			{
+				let entry = decoded_cache
+					.remove(index)
+					.expect("decoded cache index exists");
+				let img = entry.1.clone();
+				decoded_cache.push_back(entry);
+				img
+			} else {
+				let img = decode(&request.bytes).map(thumbnail);
+				if decoded_cache.len() == 2 {
+					decoded_cache.pop_front();
+				}
+				decoded_cache
+					.push_back((request.key.content, img.clone()));
+				img
+			};
 			// Switching files or resizing while decoding skips the expensive encoder.
 			if request.generation
 				!= shared.generation.load(Ordering::Relaxed)

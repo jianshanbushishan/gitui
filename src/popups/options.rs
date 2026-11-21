@@ -13,12 +13,12 @@ use crate::{
 };
 use anyhow::Result;
 use asyncgit::sync::ShowUntrackedFilesConfig;
-use crossterm::event::Event;
+use crossterm::event::{Event, KeyCode};
 use ratatui::{
 	layout::Rect,
-	style::{Modifier, Style},
+	style::Modifier,
 	text::{Line, Span},
-	widgets::{Block, Borders, Clear},
+	widgets::{Block, Borders, Padding},
 	Frame,
 };
 
@@ -31,6 +31,59 @@ pub enum AppOption {
 	DiffInterhunkLines,
 	ExternalDiffTool,
 	AiCommitBackend,
+	MouseSupport,
+	StatusLeftRatio,
+	LogLeftRatio,
+}
+
+impl AppOption {
+	const ORDER: [Self; 10] = [
+		Self::StatusShowUntracked,
+		Self::DiffMode,
+		Self::DiffIgnoreWhitespaces,
+		Self::DiffContextLines,
+		Self::DiffInterhunkLines,
+		Self::ExternalDiffTool,
+		Self::AiCommitBackend,
+		Self::MouseSupport,
+		Self::StatusLeftRatio,
+		Self::LogLeftRatio,
+	];
+
+	const fn description(self) -> &'static str {
+		match self {
+			Self::StatusShowUntracked => {
+				"Untracked files in Status: Gitconfig, No, Normal, or All."
+			}
+			Self::DiffMode => {
+				"Switch between built-in Unified diff and delta Side-by-side."
+			}
+			Self::DiffIgnoreWhitespaces => {
+				"Ignore whitespace-only changes in diffs."
+			}
+			Self::DiffContextLines => {
+				"Unchanged context lines shown around each diff hunk."
+			}
+			Self::DiffInterhunkLines => {
+				"Merge adjacent hunks separated by at most N unchanged lines."
+			}
+			Self::ExternalDiffTool => {
+				"External viewer launched by [d] for full-file comparison."
+			}
+			Self::AiCommitBackend => {
+				"Backend used by [Ctrl+g] in Commit popup to draft messages."
+			}
+			Self::MouseSupport => {
+				"Enable mouse wheel scrolling and click-to-focus (disables terminal drag-select)."
+			}
+			Self::StatusLeftRatio => {
+				"Left file-tree width (%) in the Status tab. Also adjustable live with [<]/[>]."
+			}
+			Self::LogLeftRatio => {
+				"Left commit-list width (%) in Log & Stashes tabs. Also adjustable with [<]/[>]."
+			}
+		}
+	}
 }
 
 pub struct OptionsPopup {
@@ -55,17 +108,48 @@ impl OptionsPopup {
 		}
 	}
 
+	fn is_pi_available() -> bool {
+		static PI_AVAILABLE: std::sync::OnceLock<bool> =
+			std::sync::OnceLock::new();
+		*PI_AVAILABLE.get_or_init(|| which::which("pi").is_ok())
+	}
+
+	fn tool_status_line(&self) -> Line<'static> {
+		let delta = if DiffComponent::is_delta_available() {
+			"✓ delta"
+		} else {
+			"✗ delta"
+		};
+		let bat = if ui::bat_available() {
+			"✓ bat"
+		} else {
+			"✗ bat"
+		};
+		let pi = if Self::is_pi_available() {
+			"✓ pi"
+		} else {
+			"✗ pi"
+		};
+		Line::from(vec![
+			Span::styled("Tools: ", self.theme.text(false, false)),
+			Span::styled(
+				format!("{delta}  {bat}  {pi}"),
+				self.theme.text(false, false),
+			),
+		])
+	}
+
 	fn get_text(&self, width: u16) -> Vec<Line<'_>> {
-		let mut txt: Vec<Line> = Vec::with_capacity(16);
+		let mut txt: Vec<Line> = Vec::with_capacity(22);
 
 		self.add_status(&mut txt, width);
 
 		txt
 	}
 
+	#[allow(clippy::too_many_lines)]
 	fn add_status(&self, txt: &mut Vec<Line>, width: u16) {
-		Self::add_header(txt, "Status");
-
+		self.add_header(txt, "Status");
 		self.add_entry(
 			txt,
 			width,
@@ -78,10 +162,10 @@ impl OptionsPopup {
 			},
 			self.is_select(AppOption::StatusShowUntracked),
 		);
-		Self::add_header(txt, "");
+		txt.push(Line::default());
 
 		let diff = self.options.borrow().diff_options();
-		Self::add_header(txt, "Diff");
+		self.add_header(txt, "Diff");
 		self.add_entry(
 			txt,
 			width,
@@ -96,7 +180,7 @@ impl OptionsPopup {
 			txt,
 			width,
 			"Ignore whitespaces",
-			&diff.ignore_whitespace.to_string(),
+			if diff.ignore_whitespace { "On" } else { "Off" },
 			self.is_select(AppOption::DiffIgnoreWhitespaces),
 		);
 		self.add_entry(
@@ -120,6 +204,9 @@ impl OptionsPopup {
 			self.options.borrow().external_diff_tool().label(),
 			self.is_select(AppOption::ExternalDiffTool),
 		);
+		txt.push(Line::default());
+
+		self.add_header(txt, "Commit / AI");
 		self.add_entry(
 			txt,
 			width,
@@ -127,17 +214,61 @@ impl OptionsPopup {
 			self.options.borrow().ai_commit_backend().label(),
 			self.is_select(AppOption::AiCommitBackend),
 		);
+		txt.push(Line::default());
+
+		self.add_header(txt, "Interface");
+		self.add_entry(
+			txt,
+			width,
+			"Mouse support",
+			if self.options.borrow().mouse_support() {
+				"On"
+			} else {
+				"Off"
+			},
+			self.is_select(AppOption::MouseSupport),
+		);
+		let status_ratio =
+			format!("{}%", self.options.borrow().status_left_ratio());
+		self.add_entry(
+			txt,
+			width,
+			"Status split",
+			&status_ratio,
+			self.is_select(AppOption::StatusLeftRatio),
+		);
+		let log_ratio =
+			format!("{}%", self.options.borrow().log_left_ratio());
+		self.add_entry(
+			txt,
+			width,
+			"Log split",
+			&log_ratio,
+			self.is_select(AppOption::LogLeftRatio),
+		);
+
+		txt.push(Line::default());
+		let desc = self.selection.description();
+		let wrap_w = usize::from(width).max(10);
+		for line in bwrap::wrap_maybrk!(desc, wrap_w).lines() {
+			txt.push(Line::from(Span::styled(
+				line.to_owned(),
+				self.theme.text(false, false),
+			)));
+		}
+		txt.push(self.tool_status_line());
 	}
 
 	fn is_select(&self, kind: AppOption) -> bool {
 		self.selection == kind
 	}
 
-	fn add_header(txt: &mut Vec<Line>, header: &'static str) {
+	fn add_header(&self, txt: &mut Vec<Line>, header: &'static str) {
 		txt.push(Line::from(vec![Span::styled(
 			header,
-			//TODO: use style
-			Style::default().add_modifier(Modifier::UNDERLINED),
+			self.theme
+				.title(true)
+				.add_modifier(Modifier::UNDERLINED),
 		)]));
 	}
 
@@ -150,64 +281,44 @@ impl OptionsPopup {
 		selected: bool,
 	) {
 		let half = usize::from(width / 2);
+		let right_width = usize::from(width).saturating_sub(half);
+		let formatted_value = if selected {
+			format!("◀ {value} ▶")
+		} else {
+			value.to_owned()
+		};
+		let label_prefix = if selected { "> " } else { "  " };
+		let label = format!("{label_prefix}{entry}");
 		txt.push(Line::from(vec![
 			Span::styled(
-				string_width_align(entry, half),
-				self.theme.text(true, false),
+				string_width_align(&label, half),
+				if selected {
+					self.theme
+						.text(true, false)
+						.add_modifier(Modifier::BOLD)
+				} else {
+					self.theme.text(true, false)
+				},
 			),
 			Span::styled(
-				format!("{value:^half$}"),
+				format!("{formatted_value:^right_width$}"),
 				self.theme.text(true, selected),
 			),
 		]));
 	}
 
-	const fn move_selection(&mut self, up: bool) {
-		if up {
-			self.selection = match self.selection {
-				AppOption::StatusShowUntracked => {
-					AppOption::AiCommitBackend
-				}
-				AppOption::AiCommitBackend => {
-					AppOption::ExternalDiffTool
-				}
-				AppOption::ExternalDiffTool => {
-					AppOption::DiffInterhunkLines
-				}
-				AppOption::DiffMode => AppOption::StatusShowUntracked,
-				AppOption::DiffIgnoreWhitespaces => {
-					AppOption::DiffMode
-				}
-				AppOption::DiffContextLines => {
-					AppOption::DiffIgnoreWhitespaces
-				}
-				AppOption::DiffInterhunkLines => {
-					AppOption::DiffContextLines
-				}
-			};
+	fn move_selection(&mut self, up: bool) {
+		let idx = AppOption::ORDER
+			.iter()
+			.position(|opt| *opt == self.selection)
+			.unwrap_or(0);
+		let len = AppOption::ORDER.len();
+		let next = if up {
+			(idx + len - 1) % len
 		} else {
-			self.selection = match self.selection {
-				AppOption::StatusShowUntracked => AppOption::DiffMode,
-				AppOption::DiffMode => {
-					AppOption::DiffIgnoreWhitespaces
-				}
-				AppOption::DiffIgnoreWhitespaces => {
-					AppOption::DiffContextLines
-				}
-				AppOption::DiffContextLines => {
-					AppOption::DiffInterhunkLines
-				}
-				AppOption::ExternalDiffTool => {
-					AppOption::AiCommitBackend
-				}
-				AppOption::AiCommitBackend => {
-					AppOption::StatusShowUntracked
-				}
-				AppOption::DiffInterhunkLines => {
-					AppOption::ExternalDiffTool
-				}
-			};
-		}
+			(idx + 1) % len
+		};
+		self.selection = AppOption::ORDER[next];
 	}
 
 	fn switch_option(&self, right: bool) {
@@ -281,6 +392,19 @@ impl OptionsPopup {
 					AiCommitBackend::ALL[(index + step) % count],
 				);
 			}
+			AppOption::MouseSupport => {
+				self.options.borrow_mut().toggle_mouse_support();
+			}
+			AppOption::StatusLeftRatio => {
+				let delta = if right { 5 } else { -5 };
+				self.options
+					.borrow_mut()
+					.adjust_status_left_ratio(delta);
+			}
+			AppOption::LogLeftRatio => {
+				let delta = if right { 5 } else { -5 };
+				self.options.borrow_mut().adjust_log_left_ratio(delta);
+			}
 		}
 
 		self.queue
@@ -311,23 +435,30 @@ impl OptionsPopup {
 impl DrawableComponent for OptionsPopup {
 	fn draw(&self, f: &mut Frame, area: Rect) -> Result<()> {
 		if self.is_visible() {
-			let area = ui::centered_rect_absolute(54, 14, area);
+			let width = 62_u16.min(area.width.saturating_sub(2));
+			let inner_width = width.saturating_sub(4);
+			let lines = self.get_text(inner_width);
+			let height = u16::try_from(lines.len())
+				.unwrap_or(u16::MAX)
+				.saturating_add(2)
+				.min(area.height);
+			let popup_area =
+				ui::centered_rect_absolute(width, height, area);
 
-			let width = area.width.saturating_sub(2);
-
-			f.render_widget(Clear, area);
+			ui::clear_popup_area(f, popup_area);
 			let block = Block::default()
 				.borders(Borders::ALL)
+				.padding(Padding::horizontal(1))
 				.title(Span::styled(
-					"Global Options",
+					" Global Options ",
 					self.theme.title(true),
 				))
 				.border_style(self.theme.block(true));
 			ui::render_block_text(
 				f.buffer_mut(),
-				area,
+				popup_area,
 				block,
-				&self.get_text(width),
+				&lines,
 			);
 		}
 
@@ -352,13 +483,34 @@ impl Component for OptionsPopup {
 			);
 			out.push(
 				CommandInfo::new(
-					strings::commands::navigate_tree(
-						&self.key_config,
+					strings::commands::scroll(&self.key_config),
+					true,
+					true,
+				)
+				.order(2),
+			);
+			out.push(
+				CommandInfo::new(
+					crate::components::CommandText::new(
+						format!(
+							"Change [{}{}/{}/{}]",
+							self.key_config.get_hint(
+								self.key_config.keys.move_left
+							),
+							self.key_config.get_hint(
+								self.key_config.keys.move_right
+							),
+							self.key_config
+								.get_hint(self.key_config.keys.enter),
+							strings::symbol::SPACE,
+						),
+						"change selected option value",
+						"-- General --",
 					),
 					true,
 					true,
 				)
-				.order(1),
+				.order(3),
 			);
 		}
 
@@ -388,7 +540,10 @@ impl Component for OptionsPopup {
 				} else if key_match(
 					key,
 					self.key_config.keys.move_right,
-				) {
+				) || key_match(key, self.key_config.keys.enter)
+					|| (key.code == KeyCode::Char(' ')
+						&& key.modifiers.is_empty())
+				{
 					self.switch_option(true);
 				} else if key_match(
 					key,
@@ -424,7 +579,7 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn external_diff_tool_cycles_with_left_and_right() {
+	fn external_diff_tool_cycles_with_left_right_and_enter() {
 		use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 		let env = Environment::test_env();
 		env.options
@@ -432,9 +587,7 @@ mod tests {
 			.set_external_diff_tool(ExternalDiffTool::BeyondCompare);
 		let mut popup = OptionsPopup::new(&env);
 		popup.show().unwrap();
-		popup.move_selection(true);
-		popup.move_selection(true);
-		assert_eq!(popup.selection, AppOption::ExternalDiffTool);
+		popup.selection = AppOption::ExternalDiffTool;
 		let press = |popup: &mut OptionsPopup, code| {
 			popup
 				.event(&Event::Key(KeyEvent::new(
@@ -443,10 +596,9 @@ mod tests {
 				)))
 				.unwrap();
 		};
-		press(&mut popup, KeyCode::Enter);
 		for (key, expected) in [
-			(KeyCode::Right, ExternalDiffTool::Nvim),
-			(KeyCode::Right, ExternalDiffTool::Vscode),
+			(KeyCode::Enter, ExternalDiffTool::Nvim),
+			(KeyCode::Char(' '), ExternalDiffTool::Vscode),
 			(KeyCode::Right, ExternalDiffTool::BeyondCompare),
 			(KeyCode::Left, ExternalDiffTool::Vscode),
 			(KeyCode::Left, ExternalDiffTool::Nvim),
@@ -467,7 +619,7 @@ mod tests {
 	}
 
 	#[test]
-	fn ai_commit_backend_cycles_with_left_and_right() {
+	fn ai_commit_backend_is_under_commit_ai_section_and_cycles() {
 		use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 		let env = Environment::test_env();
 		env.options
@@ -475,8 +627,7 @@ mod tests {
 			.set_ai_commit_backend(AiCommitBackend::Disabled);
 		let mut popup = OptionsPopup::new(&env);
 		popup.show().unwrap();
-		popup.move_selection(true);
-		assert_eq!(popup.selection, AppOption::AiCommitBackend);
+		popup.selection = AppOption::AiCommitBackend;
 		let press = |popup: &mut OptionsPopup, code| {
 			popup
 				.event(&Event::Key(KeyEvent::new(
@@ -485,7 +636,6 @@ mod tests {
 				)))
 				.unwrap();
 		};
-		press(&mut popup, KeyCode::Enter);
 		for (key, expected) in [
 			(KeyCode::Right, AiCommitBackend::Pi),
 			(KeyCode::Right, AiCommitBackend::Command),
@@ -500,17 +650,16 @@ mod tests {
 				expected
 			);
 		}
-		let text = popup.get_text(52);
-		assert_eq!(text.len(), 10);
-		assert!(text
-			.last()
-			.expect("AI backend should be the last option")
-			.to_string()
-			.starts_with("AI Backend"));
-		press(&mut popup, KeyCode::Down);
-		assert_eq!(popup.selection, AppOption::StatusShowUntracked);
-		press(&mut popup, KeyCode::Up);
-		assert_eq!(popup.selection, AppOption::AiCommitBackend);
+		let text: Vec<String> = popup
+			.get_text(58)
+			.into_iter()
+			.map(|l| l.to_string())
+			.collect();
+		let ai_header_idx = text
+			.iter()
+			.position(|line| line.trim() == "Commit / AI")
+			.expect("Commit / AI header should exist");
+		assert!(text[ai_header_idx + 1].contains("AI Backend"));
 		press(&mut popup, KeyCode::Esc);
 		assert!(!popup.is_visible());
 	}

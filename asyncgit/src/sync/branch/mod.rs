@@ -20,6 +20,7 @@ use std::collections::HashSet;
 
 /// returns the branch-name head is currently pointing to
 /// this might be expensive, see `cached::BranchName`
+#[cfg(test)]
 pub(crate) fn get_branch_name(
 	repo_path: &RepoPath,
 ) -> Result<String> {
@@ -129,8 +130,20 @@ pub fn validate_branch_name(name: &str) -> Result<bool> {
 	Ok(valid)
 }
 
+/// Fast check whether the repository has any remote-tracking branches
+/// without peeling every branch tip commit.
+pub fn has_remote_branches(repo_path: &RepoPath) -> Result<bool> {
+	let repo = repo(repo_path)?;
+	let has_remote = repo
+		.branches(Some(BranchType::Remote))?
+		.next()
+		.is_some();
+	Ok(has_remote)
+}
+
 /// returns a list of `BranchInfo` with a simple summary on each branch
 /// `local` filters for local branches otherwise remote branches will be returned
+#[allow(clippy::too_many_lines)]
 pub fn get_branches_info(
 	repo_path: &RepoPath,
 	local: bool,
@@ -157,31 +170,38 @@ pub fn get_branches_info(
 		(BranchType::Remote, remotes)
 	};
 
+	let mut remote_url_cache: std::collections::HashMap<
+		String,
+		Option<String>,
+	> = std::collections::HashMap::new();
+
 	let mut branches_for_display: Vec<BranchInfo> = repo
 		.branches(Some(filter))?
 		.map(|b| {
 			let branch = b?.0;
 			let top_commit = branch.get().peel_to_commit()?;
 			let reference = bytes2string(branch.get().name_bytes())?;
-			let upstream = branch.upstream();
-
-			let remote = repo
-				.branch_upstream_remote(&reference)
-				.ok()
-				.as_ref()
-				.and_then(|buf| buf.as_str().ok())
-				.map(String::from);
-
 			let name_bytes = branch.name_bytes()?;
 
-			let upstream_branch =
-				upstream.ok().and_then(|upstream| {
-					bytes2string(upstream.get().name_bytes())
-						.ok()
-						.map(|reference| UpstreamBranch { reference })
-				});
-
 			let details = if local {
+				let upstream = branch.upstream();
+
+				let remote = repo
+					.branch_upstream_remote(&reference)
+					.ok()
+					.as_ref()
+					.and_then(|buf| buf.as_str().ok())
+					.map(String::from);
+
+				let upstream_branch =
+					upstream.ok().and_then(|upstream| {
+						bytes2string(upstream.get().name_bytes())
+							.ok()
+							.map(|reference| UpstreamBranch {
+								reference,
+							})
+					});
+
 				let remote_branch_name = remote
 					.as_deref()
 					.filter(|name| *name != ".")
@@ -208,8 +228,16 @@ pub fn get_branches_info(
 					.ok()
 					.and_then(|name| {
 						let name = name.as_str().ok()?;
-						let remote = repo.find_remote(name).ok()?;
-						remote.url().ok().map(String::from)
+						if let Some(url) = remote_url_cache.get(name) {
+							return url.clone();
+						}
+						let url = repo
+							.find_remote(name)
+							.ok()
+							.and_then(|r| r.url().ok().map(String::from));
+						remote_url_cache
+							.insert(name.to_owned(), url.clone());
+						url
 					});
 				BranchDetails::Remote(RemoteBranch {
 					has_tracking: remotes_with_tracking

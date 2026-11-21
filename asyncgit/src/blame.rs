@@ -30,10 +30,13 @@ struct LastResult<P, R> {
 	result: R,
 }
 
+type LastBlame =
+	Arc<Mutex<Option<LastResult<BlameParams, Arc<FileBlame>>>>>;
+
 ///
 pub struct AsyncBlame {
-	current: Arc<Mutex<Request<u64, FileBlame>>>,
-	last: Arc<Mutex<Option<LastResult<BlameParams, FileBlame>>>>,
+	current: Arc<Mutex<Request<u64, Arc<FileBlame>>>>,
+	last: LastBlame,
 	sender: Sender<AsyncGitNotification>,
 	pending: Arc<AtomicUsize>,
 	repo: RepoPath,
@@ -58,8 +61,11 @@ impl AsyncBlame {
 	pub fn last(&self) -> Result<Option<(BlameParams, FileBlame)>> {
 		let last = self.last.lock()?;
 
-		Ok(last.clone().map(|last_result| {
-			(last_result.params, last_result.result)
+		Ok(last.as_ref().map(|last_result| {
+			(
+				last_result.params.clone(),
+				(*last_result.result).clone(),
+			)
 		}))
 	}
 
@@ -101,7 +107,10 @@ impl AsyncBlame {
 			let mut current = self.current.lock()?;
 
 			if current.0 == hash {
-				return Ok(current.1.clone());
+				return Ok(current
+					.1
+					.as_ref()
+					.map(|blame| (**blame).clone()));
 			}
 
 			current.0 = hash;
@@ -150,28 +159,26 @@ impl AsyncBlame {
 	fn get_blame_helper(
 		repo_path: &RepoPath,
 		params: BlameParams,
-		arc_last: &Arc<
-			Mutex<Option<LastResult<BlameParams, FileBlame>>>,
-		>,
-		arc_current: &Arc<Mutex<Request<u64, FileBlame>>>,
+		arc_last: &LastBlame,
+		arc_current: &Arc<Mutex<Request<u64, Arc<FileBlame>>>>,
 		hash: u64,
 	) -> Result<bool> {
-		let file_blame = sync::blame::blame_file(
+		let file_blame = Arc::new(sync::blame::blame_file(
 			repo_path,
 			&params.file_path,
 			params.commit_id,
-		)?;
+		)?);
 
 		let mut notify = false;
 		{
 			let mut current = arc_current.lock()?;
 			if current.0 == hash {
-				current.1 = Some(file_blame.clone());
+				current.1 = Some(Arc::clone(&file_blame));
 				notify = true;
 			}
 		}
 
-		{
+		if notify {
 			let mut last = arc_last.lock()?;
 			*last = Some(LastResult {
 				result: file_blame,
@@ -186,8 +193,8 @@ impl AsyncBlame {
 		Ok(self
 			.last
 			.lock()?
-			.clone()
-			.map(|last_result| last_result.params))
+			.as_ref()
+			.map(|last_result| last_result.params.clone()))
 	}
 
 	fn clear_current(&self) -> Result<()> {

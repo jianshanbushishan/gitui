@@ -151,17 +151,24 @@ impl Revlog {
 
 			self.git_tags.request(Duration::from_secs(3), false)?;
 
-			if self.commit_details.is_visible() {
-				let commit = self.selected_commit();
-				let tags = self.selected_commit_tags(commit.as_ref());
-
-				self.commit_details.set_commits(
-					commit.map(CommitFilesParams::from),
-					tags.as_ref(),
-				)?;
-			}
+			self.update_selection()?;
 		}
 
+		Ok(())
+	}
+
+	/// Lightweight selection refresh used on list/mouse navigation so scrolling
+	/// never re-opens git2 to resolve HEAD or re-polls `AsyncTags` on every keypress.
+	fn update_selection(&mut self) -> Result<()> {
+		if self.is_visible() && self.commit_details.is_visible() {
+			let commit = self.selected_commit();
+			let tags = self.selected_commit_tags(commit.as_ref());
+
+			self.commit_details.set_commits(
+				commit.map(CommitFilesParams::from),
+				tags.as_ref(),
+			)?;
+		}
 		Ok(())
 	}
 
@@ -558,6 +565,24 @@ impl Component for Revlog {
 	fn event(&mut self, ev: &Event) -> Result<EventState> {
 		if self.visible {
 			// CommitList handles checkout directly; intercept it before routing.
+			if let Event::Mouse(mouse) = ev {
+				match mouse.kind {
+					crossterm::event::MouseEventKind::ScrollDown => {
+						if self.list.scroll_mouse(true)? {
+							self.update_selection()?;
+						}
+						return Ok(EventState::Consumed);
+					}
+					crossterm::event::MouseEventKind::ScrollUp => {
+						if self.list.scroll_mouse(false)? {
+							self.update_selection()?;
+						}
+						return Ok(EventState::Consumed);
+					}
+					_ => {}
+				}
+			}
+
 			if let Event::Key(k) = ev {
 				if self.viewing_branch.is_some()
 					&& key_match(
@@ -570,7 +595,7 @@ impl Component for Revlog {
 			let event_used = self.list.event(ev)?;
 
 			if event_used.is_consumed() {
-				self.update()?;
+				self.update_selection()?;
 				return Ok(EventState::Consumed);
 			}
 
@@ -582,7 +607,7 @@ impl Component for Revlog {
 			if self.commit_details.is_visible() {
 				let details_used = self.commit_details.event(ev)?;
 				if details_used.is_consumed() {
-					self.update()?;
+					self.update_selection()?;
 					return Ok(EventState::Consumed);
 				}
 			}

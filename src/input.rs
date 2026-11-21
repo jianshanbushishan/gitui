@@ -115,9 +115,13 @@ impl Input {
 				arc_current.store(true, Ordering::Relaxed);
 
 				if let Some(e) = Self::poll(poll_duration)? {
-					// windows send key release too, only process key press
+					// windows sends key release too; ignore release while
+					// preserving key repeat for terminals that emit it
 					if let Key(key) = e {
-						if key.kind != KeyEventKind::Press {
+						if !matches!(
+							key.kind,
+							KeyEventKind::Press | KeyEventKind::Repeat
+						) {
 							continue;
 						}
 					}

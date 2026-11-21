@@ -2,7 +2,8 @@
 
 use super::{
 	commit_files::{
-		get_commit_diff, get_compare_commits_diff, OldNew,
+		get_commit_diff_checking_stash, get_compare_commits_diff,
+		OldNew,
 	},
 	utils::{get_head_repo, work_dir},
 	CommitId, RepoPath,
@@ -11,7 +12,7 @@ use crate::{
 	error::Error,
 	error::Result,
 	hash,
-	sync::{get_stashes, repository::repo},
+	sync::repository::repo,
 };
 use easy_cast::Conv;
 use git2::{
@@ -19,7 +20,7 @@ use git2::{
 };
 use scopetime::scope_time;
 use serde::{Deserialize, Serialize};
-use std::{cell::RefCell, fs, path::Path, rc::Rc};
+use std::{fs, path::Path};
 
 /// type of diff of a single line
 #[derive(Copy, Clone, Default, PartialEq, Eq, Hash, Debug)]
@@ -49,7 +50,7 @@ impl From<git2::DiffLineType> for DiffLineType {
 }
 
 ///
-#[derive(Default, Clone, Hash, Debug)]
+#[derive(Default, Clone, Hash, PartialEq, Eq, Debug)]
 pub struct DiffLine {
 	///
 	pub content: Box<str>,
@@ -104,7 +105,7 @@ impl From<DiffHunk<'_>> for HunkHeader {
 }
 
 /// single diff hunk
-#[derive(Default, Clone, Hash, Debug)]
+#[derive(Default, Clone, Hash, PartialEq, Eq, Debug)]
 pub struct Hunk {
 	/// hash of the hunk header
 	pub header_hash: u64,
@@ -113,7 +114,7 @@ pub struct Hunk {
 }
 
 /// collection of hunks, sum of all diff lines
-#[derive(Default, Clone, Hash, Debug)]
+#[derive(Default, Clone, Hash, PartialEq, Eq, Debug)]
 pub struct FileDiff {
 	/// list of hunks
 	pub hunks: Vec<Hunk>,
@@ -248,7 +249,7 @@ pub fn get_staged_diff_for_ai(
 			"no staged changes to summarize",
 		)));
 	}
-	let mut output = Vec::new();
+	let mut output = String::new();
 
 	for (idx, delta) in diff.deltas().enumerate() {
 		let path = delta
@@ -256,38 +257,33 @@ pub fn get_staged_diff_for_ai(
 			.path_bytes()
 			.or_else(|| delta.old_file().path_bytes())
 			.unwrap_or(b"<unknown>");
-		let file_label = || {
-			format!(
-				"Changed file: {}\n",
-				String::from_utf8_lossy(path)
-			)
+		let push_label = |out: &mut String| {
+			out.push_str("Changed file: ");
+			out.push_str(&String::from_utf8_lossy(path));
+			out.push('\n');
 		};
 
-		let chunk = if let Some(mut patch) =
-			Patch::from_diff(&diff, idx)?
-		{
+		if let Some(mut patch) = Patch::from_diff(&diff, idx)? {
 			if patch.delta().flags().contains(git2::DiffFlags::BINARY)
 			{
-				file_label().into_bytes()
+				push_label(&mut output);
 			} else {
 				// A patch can be classified as text by libgit2 while its
 				// encoding is not UTF-8. Do not pass lossy code lines to the AI.
 				let buf = patch.to_buf()?;
 				match std::str::from_utf8(&buf) {
-					Ok(_) => buf.to_vec(),
-					Err(_) => file_label().into_bytes(),
+					Ok(text) => output.push_str(text),
+					Err(_) => push_label(&mut output),
 				}
 			}
 		} else {
 			// libgit2 returns no text patch for binary files (and
 			// occasionally for metadata-only changes).
-			file_label().into_bytes()
-		};
-
-		output.extend_from_slice(&chunk);
+			push_label(&mut output);
+		}
 	}
 
-	Ok(String::from_utf8(output)?)
+	Ok(output)
 }
 
 /// total (added, deleted) lines across unstaged tracked files.
@@ -417,20 +413,15 @@ fn diff_options(options: Option<DiffOptions>) -> git2::DiffOptions {
 pub fn get_diff_commit(
 	repo_path: &RepoPath,
 	id: CommitId,
-	p: String,
+	p: &str,
 	options: Option<DiffOptions>,
 ) -> Result<FileDiff> {
 	scope_time!("get_diff_commit");
 
 	let repo = repo(repo_path)?;
 	let work_dir = work_dir(&repo)?;
-	let diff = get_commit_diff(
-		&repo,
-		id,
-		Some(p),
-		options,
-		Some(&get_stashes(repo_path)?.into_iter().collect()),
-	)?;
+	let diff =
+		get_commit_diff_checking_stash(&repo, id, Some(p), options)?;
 
 	raw_diff_to_file_diff(&diff, work_dir)
 }
@@ -453,106 +444,98 @@ pub fn get_diff_commits(
 }
 
 ///
-//TODO: refactor into helper type with the inline closures as dedicated functions
 #[allow(clippy::too_many_lines)]
 fn raw_diff_to_file_diff(
 	diff: &Diff,
 	work_dir: &Path,
 ) -> Result<FileDiff> {
-	let res = Rc::new(RefCell::new(FileDiff::default()));
-	{
-		let mut current_lines = Vec::new();
-		let mut current_hunk: Option<HunkHeader> = None;
+	let mut res = FileDiff::default();
+	let mut current_lines = Vec::new();
+	let mut current_hunk: Option<HunkHeader> = None;
 
-		let res_cell = Rc::clone(&res);
-		let adder = move |header: &HunkHeader,
-		                  lines: &Vec<DiffLine>| {
-			let mut res = res_cell.borrow_mut();
+	let flush_hunk =
+		|res: &mut FileDiff,
+		 header: &HunkHeader,
+		 lines: &mut Vec<DiffLine>| {
+			let moved = std::mem::take(lines);
+			res.lines += moved.len();
 			res.hunks.push(Hunk {
 				header_hash: hash(header),
-				lines: lines.clone(),
+				lines: moved,
 			});
-			res.lines += lines.len();
 		};
 
-		let res_cell = Rc::clone(&res);
-		let mut put = |delta: DiffDelta,
-		               hunk: Option<DiffHunk>,
-		               line: git2::DiffLine| {
-			{
-				let mut res = res_cell.borrow_mut();
-				res.sizes = (
-					delta.old_file().size(),
-					delta.new_file().size(),
-				);
-				//TODO: use try_conv
-				res.size_delta = (i64::conv(res.sizes.1))
-					.saturating_sub(i64::conv(res.sizes.0));
-			}
-			if let Some(hunk) = hunk {
-				let hunk_header = HunkHeader::from(hunk);
+	let mut put = |delta: DiffDelta,
+	               hunk: Option<DiffHunk>,
+	               line: git2::DiffLine| {
+		let sizes =
+			(delta.old_file().size(), delta.new_file().size());
+		if res.sizes != sizes {
+			res.sizes = sizes;
+			//TODO: use try_conv
+			res.size_delta = (i64::conv(sizes.1))
+				.saturating_sub(i64::conv(sizes.0));
+		}
+		if let Some(hunk) = hunk {
+			let hunk_header = HunkHeader::from(hunk);
 
-				match current_hunk {
-					None => current_hunk = Some(hunk_header),
-					Some(h) => {
-						if h != hunk_header {
-							adder(&h, &current_lines);
-							current_lines.clear();
-							current_hunk = Some(hunk_header);
-						}
+			match current_hunk {
+				None => current_hunk = Some(hunk_header),
+				Some(h) => {
+					if h != hunk_header {
+						flush_hunk(&mut res, &h, &mut current_lines);
+						current_hunk = Some(hunk_header);
 					}
 				}
-
-				let diff_line = DiffLine {
-					position: DiffLinePosition::from(&line),
-					content: String::from_utf8_lossy(line.content())
-						//Note: trim await trailing newline characters
-						.trim_matches(is_newline)
-						.into(),
-					line_type: line.origin_value().into(),
-				};
-
-				current_lines.push(diff_line);
 			}
-		};
 
-		let new_file_diff = if diff.deltas().len() == 1 {
-			if let Some(delta) = diff.deltas().next() {
-				if delta.status() == Delta::Untracked {
-					let relative_path =
-						delta.new_file().path().ok_or_else(|| {
-							Error::Generic(
-								"new file path is unspecified."
-									.to_string(),
-							)
-						})?;
+			let diff_line = DiffLine {
+				position: DiffLinePosition::from(&line),
+				content: String::from_utf8_lossy(line.content())
+					//Note: trim await trailing newline characters
+					.trim_matches(is_newline)
+					.into(),
+				line_type: line.origin_value().into(),
+			};
 
-					let newfile_path = work_dir.join(relative_path);
+			current_lines.push(diff_line);
+		}
+	};
 
-					if let Some(newfile_content) =
-						new_file_content(&newfile_path)
-					{
-						let mut patch = Patch::from_buffers(
-							&[],
-							None,
-							newfile_content.as_slice(),
-							Some(&newfile_path),
-							None,
-						)?;
+	let new_file_diff = if diff.deltas().len() == 1 {
+		if let Some(delta) = diff.deltas().next() {
+			if delta.status() == Delta::Untracked {
+				let relative_path =
+					delta.new_file().path().ok_or_else(|| {
+						Error::Generic(
+							"new file path is unspecified."
+								.to_string(),
+						)
+					})?;
 
-						patch.print(
-							&mut |delta,
-							      hunk: Option<DiffHunk>,
-							      line: git2::DiffLine| {
-								put(delta, hunk, line);
-								true
-							},
-						)?;
+				let newfile_path = work_dir.join(relative_path);
 
-						true
-					} else {
-						false
-					}
+				if let Some(newfile_content) =
+					new_file_content(&newfile_path)
+				{
+					let mut patch = Patch::from_buffers(
+						&[],
+						None,
+						newfile_content.as_slice(),
+						Some(&newfile_path),
+						None,
+					)?;
+
+					patch.print(
+						&mut |delta,
+						      hunk: Option<DiffHunk>,
+						      line: git2::DiffLine| {
+							put(delta, hunk, line);
+							true
+						},
+					)?;
+
+					true
 				} else {
 					false
 				}
@@ -561,35 +544,33 @@ fn raw_diff_to_file_diff(
 			}
 		} else {
 			false
-		};
-
-		if !new_file_diff {
-			diff.print(
-				DiffFormat::Patch,
-				move |delta, hunk, line: git2::DiffLine| {
-					put(delta, hunk, line);
-					true
-				},
-			)?;
 		}
+	} else {
+		false
+	};
 
-		if !current_lines.is_empty() {
-			adder(
-				&current_hunk.map_or_else(
-					|| Err(Error::Generic("invalid hunk".to_owned())),
-					Ok,
-				)?,
-				&current_lines,
-			);
-		}
-
-		if new_file_diff {
-			res.borrow_mut().untracked = true;
-		}
+	if !new_file_diff {
+		diff.print(
+			DiffFormat::Patch,
+			|delta, hunk, line: git2::DiffLine| {
+				put(delta, hunk, line);
+				true
+			},
+		)?;
 	}
-	let res = Rc::try_unwrap(res)
-		.map_err(|_| Error::Generic("rc unwrap error".to_owned()))?;
-	Ok(res.into_inner())
+
+	if !current_lines.is_empty() {
+		let header = current_hunk.ok_or_else(|| {
+			Error::Generic("invalid hunk".to_owned())
+		})?;
+		flush_hunk(&mut res, &header, &mut current_lines);
+	}
+
+	if new_file_diff {
+		res.untracked = true;
+	}
+
+	Ok(res)
 }
 
 const fn is_newline(c: char) -> bool {
@@ -1270,8 +1251,7 @@ mod tests {
 		let id = commit(repo_path, "").unwrap();
 
 		let diff =
-			get_diff_commit(repo_path, id, String::new(), None)
-				.unwrap();
+			get_diff_commit(repo_path, id, "", None).unwrap();
 
 		dbg!(&diff);
 		assert_eq!(diff.sizes, (1, 2));

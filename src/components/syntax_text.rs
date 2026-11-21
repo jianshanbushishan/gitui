@@ -223,7 +223,11 @@ impl SyntaxTextComponent {
 				PreviewContent::Image => Text::default(),
 			},
 		);
-		let styles = highlight_search(&mut text, &self.search_query);
+		let styles = highlight_search(
+			&mut text,
+			&self.search_query,
+			&self.search_matches,
+		);
 		set_active_match_line(
 			&mut text,
 			&styles,
@@ -593,6 +597,18 @@ impl SyntaxTextComponent {
 		self.set_scroll(new_scroll_pos)
 	}
 
+	pub fn scroll_mouse(&self, down: bool) -> bool {
+		let mut changed = false;
+		for _ in 0..3 {
+			changed |= self.scroll(if down {
+				MoveSelection::Down
+			} else {
+				MoveSelection::Up
+			});
+		}
+		changed
+	}
+
 	fn set_scroll(&self, pos: u16) -> bool {
 		let mut state = self.paragraph_state.borrow_mut();
 
@@ -696,31 +712,47 @@ impl DrawableComponent for SyntaxTextComponent {
 /// with a highlight style. Retain each matched span's base style so moving
 /// the active match never rebuilds text or discards syntax-provided bold.
 fn highlight_search(
-	text: &mut Text<'_>,
+	text: &mut Text<'static>,
 	query: &str,
+	matches: &[SearchMatch],
 ) -> Vec<Vec<(usize, Style)>> {
 	let needle = query.to_lowercase();
 	if needle.is_empty() {
 		return Vec::new();
 	}
 
-	let mut styles = Vec::with_capacity(text.lines.len());
-	for line in &mut text.lines {
-		let mut matched = Vec::new();
+	let line_count = text.lines.len();
+	let mut styles = vec![Vec::new(); line_count];
+
+	let highlight_line =
+		|line: &mut ratatui::text::Line<'static>| -> Vec<(usize, Style)> {
+		let mut line_hits = Vec::new();
 		let mut new_spans: Vec<Span<'static>> =
 			Vec::with_capacity(line.spans.len());
 		for span in line.spans.drain(..) {
-			let content_owned: String = span.content.into_owned();
 			split_and_highlight(
-				&content_owned,
+				span,
 				&needle,
-				span.style,
 				&mut new_spans,
-				&mut matched,
+				&mut line_hits,
 			);
 		}
 		line.spans = new_spans;
-		styles.push(matched);
+		line_hits
+	};
+
+	if matches.is_empty() {
+		for (idx, line) in text.lines.iter_mut().enumerate() {
+			styles[idx] = highlight_line(line);
+		}
+	} else {
+		for m in matches {
+			if let Some(line) = text.lines.get_mut(m.line) {
+				if styles[m.line].is_empty() {
+					styles[m.line] = highlight_line(line);
+				}
+			}
+		}
 	}
 	styles
 }
@@ -749,21 +781,26 @@ fn set_active_match_line(
 	}
 }
 
-/// Split `content` into spans, patching the style of every (case-insensitive)
-/// occurrence of `needle`. Non-matching fragments keep the original style.
-///
-/// `needle` is normalized once by the caller. Matching lowercases each span
-/// once, then maps matches back to original UTF-8 boundaries.
+/// Split `span` into spans, patching the style of every (case-insensitive)
+/// occurrence of `needle`. Non-matching spans are moved unchanged with zero
+/// allocations.
 fn split_and_highlight(
-	content: &str,
+	span: Span<'static>,
 	needle: &str,
-	base_style: Style,
 	out: &mut Vec<Span<'static>>,
 	matched: &mut Vec<(usize, Style)>,
 ) {
+	let ranges =
+		case_insensitive_ranges(span.content.as_ref(), needle);
+	if ranges.is_empty() {
+		out.push(span);
+		return;
+	}
+	let base_style = span.style;
+	let content = span.content.as_ref();
 	let hl = Style::default().add_modifier(Modifier::REVERSED);
 	let mut last_pushed = 0;
-	for range in case_insensitive_ranges(content, needle) {
+	for range in ranges {
 		if range.start > last_pushed {
 			out.push(Span::styled(
 				content[last_pushed..range.start].to_owned(),
@@ -779,7 +816,7 @@ fn split_and_highlight(
 	}
 
 	// trailing fragment
-	if last_pushed < content.len() || content.is_empty() {
+	if last_pushed < content.len() {
 		out.push(Span::styled(
 			content[last_pushed..].to_owned(),
 			base_style,
@@ -791,10 +828,13 @@ fn case_insensitive_ranges(
 	content: &str,
 	needle: &str,
 ) -> Vec<std::ops::Range<usize>> {
-	if needle.is_empty() {
+	if needle.is_empty() || content.is_empty() {
 		return Vec::new();
 	}
 	let lower = content.to_lowercase();
+	if !lower.contains(needle) {
+		return Vec::new();
+	}
 	if content.is_ascii() {
 		return lower
 			.match_indices(needle)
@@ -977,7 +1017,7 @@ mod tests {
 			assert_eq!(&content[ranges[0].clone()], expected);
 		}
 		let mut text = ratatui::text::Text::from(content);
-		highlight_search(&mut text, "i");
+		highlight_search(&mut text, "i", &[]);
 		assert_eq!(
 			text.lines[0]
 				.spans
@@ -995,7 +1035,7 @@ mod tests {
 		assert!(super::case_insensitive_ranges(&content, &query)
 			.is_empty());
 		let mut text = ratatui::text::Text::from(content.clone());
-		let matches = highlight_search(&mut text, &query);
+		let matches = highlight_search(&mut text, &query, &[]);
 		assert!(matches[0].is_empty());
 		assert_eq!(text.lines[0].spans.len(), 1);
 		assert_eq!(text.lines[0].spans[0].content, content);
@@ -1074,7 +1114,7 @@ mod tests {
 			"hit",
 			Style::default().add_modifier(Modifier::BOLD),
 		));
-		let styles = highlight_search(&mut text, "hit");
+		let styles = highlight_search(&mut text, "hit", &[]);
 		set_active_match_line(&mut text, &styles, Some(0), true);
 		set_active_match_line(&mut text, &styles, Some(0), false);
 		assert!(text.lines[0].spans[0]

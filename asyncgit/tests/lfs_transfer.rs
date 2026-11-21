@@ -132,7 +132,22 @@ fn push_and_download_lfs_assets() {
 			.unwrap();
 	assert_eq!(before.local_object, Some(false));
 
-	lfs::download(&destination, Some("origin"), Some(name)).unwrap();
+	let mut progress = Vec::new();
+	lfs::download_with_progress(
+		&destination,
+		Some("origin"),
+		Some(name),
+		|update| progress.push(update),
+	)
+	.unwrap();
+	assert_eq!(
+		progress.first(),
+		Some(&lfs::DownloadProgress::Fetching)
+	);
+	assert_eq!(
+		progress.last(),
+		Some(&lfs::DownloadProgress::Restoring)
+	);
 	assert_eq!(fs::read(receiver.join(name)).unwrap(), content);
 	let other_info =
 		lfs::file_info(&destination, other, lfs::LfsSource::Index)

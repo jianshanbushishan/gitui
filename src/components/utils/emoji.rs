@@ -8,6 +8,10 @@ static EMOJI_REPLACER: Lazy<gh_emoji::Replacer> =
 // :hammer: --> 🔨
 #[inline]
 pub fn emojifi_string(s: String) -> String {
+	if s.as_bytes().iter().filter(|&&b| b == b':').take(2).count() < 2
+	{
+		return s;
+	}
 	if let Cow::Owned(altered_s) = EMOJI_REPLACER.replace_all(&s) {
 		altered_s
 	} else {

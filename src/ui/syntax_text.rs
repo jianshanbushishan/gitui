@@ -122,14 +122,14 @@ impl SyntaxText {
 		})?;
 
 		let highlighter = Highlighter::new(theme);
-		let mut syntax_lines: Vec<SyntaxLine> = Vec::new();
+		let total_count = text.lines().count();
+		let mut syntax_lines: Vec<SyntaxLine> =
+			Vec::with_capacity(total_count);
 
 		let mut highlight_state =
 			HighlightState::new(&highlighter, ScopeStack::new());
 
 		{
-			let total_count = text.lines().count();
-
 			let mut buffer = AsyncProgressBuffer::new(
 				total_count,
 				Duration::from_millis(200),
@@ -378,34 +378,40 @@ impl AsyncJob for AsyncSyntaxJob {
 		&mut self,
 		params: RunParams<Self::Notification, Self::Progress>,
 	) -> asyncgit::Result<Self::Notification> {
-		let mut state_mutex = self.state.lock()?;
+		let state = self.state.lock()?.take();
 
-		if let Some(state) = state_mutex.take() {
-			*state_mutex = Some(match state {
-				JobState::Request((content, path)) => {
-					let syntax =
-						try_bat(&content, &path, self.line_numbers)
-							.unwrap_or_else(|| {
-								SyntaxText::new(
-									content,
-									Path::new(&path),
-									&params,
-									&self.syntax,
-								)
-								.unwrap_or_else(|e| {
-									log::error!(
-									"syntect highlight failed: {e}"
-								);
-									SyntaxText::from_ansi(
-										Vec::new(),
-										PathBuf::from(&path),
-									)
-								})
-							});
-					JobState::Response(syntax)
-				}
-				JobState::Response(res) => JobState::Response(res),
-			});
+		let next_state = state.map(|state| match state {
+			JobState::Request((content, path)) => {
+				let content = Arc::new(content);
+				let syntax = try_bat(
+					Arc::clone(&content),
+					&path,
+					self.line_numbers,
+				)
+				.unwrap_or_else(|| {
+					let content = Arc::try_unwrap(content)
+						.unwrap_or_else(|shared| (*shared).clone());
+					SyntaxText::new(
+						content,
+						Path::new(&path),
+						&params,
+						&self.syntax,
+					)
+					.unwrap_or_else(|e| {
+						log::error!("syntect highlight failed: {e}");
+						SyntaxText::from_ansi(
+							Vec::new(),
+							PathBuf::from(&path),
+						)
+					})
+				});
+				JobState::Response(syntax)
+			}
+			JobState::Response(res) => JobState::Response(res),
+		});
+
+		if let Some(next_state) = next_state {
+			*self.state.lock()? = Some(next_state);
 		}
 
 		Ok(AsyncAppNotification::SyntaxHighlighting(
@@ -413,6 +419,13 @@ impl AsyncJob for AsyncSyntaxJob {
 		))
 	}
 }
+
+static BAT_PATH: Lazy<Option<PathBuf>> =
+	Lazy::new(|| find_in_path(&["bat", "batcat"]));
+static EZA_PATH: Lazy<Option<PathBuf>> =
+	Lazy::new(|| find_in_path(&["eza", "exa"]));
+static LS_PATH: Lazy<Option<PathBuf>> =
+	Lazy::new(|| find_in_path(&["ls"]));
 
 /// Try to highlight `content` via `bat` (looks for `bat` then `batcat` on
 /// PATH). Returns `None` on any failure so the caller falls back to the
@@ -424,11 +437,11 @@ impl AsyncJob for AsyncSyntaxJob {
 /// value. This reproduces `--theme=auto` even though bat's stdout is a pipe
 /// and it cannot query the terminal itself.
 fn try_bat(
-	content: &str,
+	content: Arc<String>,
 	path: &str,
 	line_numbers: bool,
 ) -> Option<SyntaxText> {
-	let Some(bat) = find_in_path(&["bat", "batcat"]) else {
+	let Some(bat) = BAT_PATH.as_ref() else {
 		log::debug!(
 			"bat preview unavailable: bat/batcat not found on PATH"
 		);
@@ -464,10 +477,9 @@ fn try_bat(
 		.ok()?;
 
 	let stdin_handle = child.stdin.take();
-	let content_owned = content.to_string();
 	let stdin_thread = thread::spawn(move || {
 		if let Some(mut stdin) = stdin_handle {
-			let _ = stdin.write_all(content_owned.as_bytes());
+			let _ = stdin.write_all(content.as_bytes());
 		}
 	});
 
@@ -520,10 +532,10 @@ pub fn try_dir_listing(
 	// `eza`/`ls` reject an empty path arg, so normalize to `.`.
 	let dir = if dir.is_empty() { "." } else { dir };
 
-	if let Some(eza) = find_in_path(&["eza", "exa"]) {
+	if let Some(eza) = EZA_PATH.as_ref() {
 		let level = format!("--level={depth}");
 		if let Some(out) = run_lister(
-			&eza,
+			eza,
 			&["--tree", "--color=always", level.as_str(), dir],
 			work_dir,
 			None,
@@ -533,10 +545,10 @@ pub fn try_dir_listing(
 		}
 	}
 
-	if let Some(ls) = find_in_path(&["ls"]) {
+	if let Some(ls) = LS_PATH.as_ref() {
 		// GNU ls
 		if let Some(out) = run_lister(
-			&ls,
+			ls,
 			&["-l", "--color=always", dir],
 			work_dir,
 			None,
@@ -547,7 +559,7 @@ pub fn try_dir_listing(
 		// BSD ls (macOS): -G enables color, CLICOLOR_FORCE forces it
 		// when stdout is not a tty.
 		if let Some(out) = run_lister(
-			&ls,
+			ls,
 			&["-l", "-G", dir],
 			work_dir,
 			Some(("CLICOLOR_FORCE", "1")),
@@ -601,7 +613,7 @@ fn run_lister(
 /// preview can defer to a highlighted `bat` result; when true, the plain
 /// placeholder is suppressed to avoid a plain→highlighted flash.
 pub fn bat_available() -> bool {
-	find_in_path(&["bat", "batcat"]).is_some()
+	BAT_PATH.is_some()
 }
 
 /// Return the first matching binary found on `PATH`, or `None`. On Windows,
@@ -714,7 +726,9 @@ mod tests {
 		}
 
 		let result = try_bat(
-			"[package]\nname = \"preview-test\"\n",
+			std::sync::Arc::new(
+				"[package]\nname = \"preview-test\"\n".to_string(),
+			),
 			"Cargo.toml",
 			false,
 		)

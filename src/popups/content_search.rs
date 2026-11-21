@@ -13,15 +13,16 @@ use crate::{
 	AsyncAppNotification, AsyncNotification,
 };
 use anyhow::Result;
-use crossterm::event::Event;
+use crossterm::event::{Event, KeyCode, KeyModifiers};
 use ratatui::{
 	layout::{Constraint, Direction, Layout, Margin, Rect},
+	style::Style,
 	text::{Line, Span},
-	widgets::{Block, Borders, Clear},
+	widgets::{Block, Borders},
 	Frame,
 };
 use std::{
-	borrow::Cow,
+	cell::Cell,
 	sync::{
 		atomic::{AtomicU64, Ordering},
 		Arc, Mutex,
@@ -29,7 +30,7 @@ use std::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-type FilteredEntries = Vec<(usize, Vec<usize>)>;
+type FilteredEntries = Vec<usize>;
 type SearchResult =
 	Arc<Mutex<Option<(u64, String, FilteredEntries)>>>;
 
@@ -45,17 +46,20 @@ pub struct ContentSearchPopup {
 	find_text: TextInputComponent,
 	query: Option<String>,
 	filtered_query: Option<String>,
+	filtered_needle: Option<String>,
 	theme: SharedTheme,
 	/// all lines of the file being searched
 	contents: Arc<[String]>,
 	/// Lowercased contents, computed once when the popup opens.
 	contents_lower: Arc<[String]>,
 	selection: usize,
-	/// `(line_index, char_indices_of_matches)` for each line currently shown
+	/// Matching line indices into `contents`
 	filtered: FilteredEntries,
 	key_config: SharedKeyConfig,
 	search_generation: Arc<AtomicU64>,
 	search_result: SearchResult,
+	searching: bool,
+	list_height: Cell<usize>,
 	app_sender: crossbeam_channel::Sender<AsyncAppNotification>,
 }
 
@@ -76,6 +80,7 @@ impl ContentSearchPopup {
 			visible: false,
 			query: None,
 			filtered_query: None,
+			filtered_needle: None,
 			find_text,
 			theme: env.theme.clone(),
 			contents: Arc::default(),
@@ -85,6 +90,8 @@ impl ContentSearchPopup {
 			selection: 0,
 			search_generation: Arc::new(AtomicU64::new(0)),
 			search_result: Arc::new(Mutex::new(None)),
+			searching: false,
+			list_height: Cell::new(18),
 			app_sender: env.sender_app.clone(),
 		}
 	}
@@ -106,7 +113,9 @@ impl ContentSearchPopup {
 				== self.search_generation.load(Ordering::Relaxed)
 			{
 				self.filtered = filtered;
+				self.filtered_needle = Some(query.to_lowercase());
 				self.filtered_query = Some(query);
+				self.searching = false;
 				self.selection = 0;
 			}
 		}
@@ -132,25 +141,24 @@ impl ContentSearchPopup {
 				.as_ref()
 				.zip(query.as_ref())
 				.is_some_and(|(old, new)| new.starts_with(old));
-		let candidates = narrowing.then(|| {
-			self.filtered
-				.iter()
-				.map(|(index, _)| *index)
-				.collect::<Vec<_>>()
-		});
+		let candidates = narrowing.then(|| self.filtered.clone());
 		self.query = query;
 
-		self.filtered.clear();
-		self.filtered_query = None;
-		self.selection = 0;
 		let generation = self
 			.search_generation
 			.fetch_add(1, Ordering::Relaxed)
 			.wrapping_add(1);
 
 		let Some(query) = self.query.clone() else {
+			self.searching = false;
+			self.filtered.clear();
+			self.filtered_query = None;
+			self.filtered_needle = None;
+			self.selection = 0;
 			return;
 		};
+		// Keep previous matches visible while background search runs to avoid flicker.
+		self.searching = true;
 		let needle = query.to_lowercase();
 		let contents = Arc::clone(&self.contents);
 		let contents_lower = Arc::clone(&self.contents_lower);
@@ -158,21 +166,45 @@ impl ContentSearchPopup {
 		let search_result = Arc::clone(&self.search_result);
 		let app_sender = self.app_sender.clone();
 		rayon_core::spawn(move || {
-			let indices = candidates
-				.unwrap_or_else(|| (0..contents.len()).collect());
 			let mut filtered = Vec::new();
-			for index in indices {
-				if search_generation.load(Ordering::Relaxed)
-					!= generation
-				{
-					return;
+			let needle_ascii = needle.is_ascii();
+			let needle_g: Vec<&str> = if needle_ascii {
+				Vec::new()
+			} else {
+				needle.graphemes(true).collect()
+			};
+			let check_index = |index: usize| -> bool {
+				let line = &contents[index];
+				let line_lower = &contents_lower[index];
+				if !line_lower.contains(&needle) {
+					return false;
 				}
-				if let Some(matches) = substring_match_indices(
-					&contents[index],
-					&contents_lower[index],
-					&needle,
-				) {
-					filtered.push((index, matches));
+				if line.is_ascii() && needle_ascii {
+					return true;
+				}
+				substring_matches_non_ascii(line, &needle_g, &needle)
+			};
+			if let Some(indices) = candidates {
+				for index in indices {
+					if search_generation.load(Ordering::Relaxed)
+						!= generation
+					{
+						return;
+					}
+					if check_index(index) {
+						filtered.push(index);
+					}
+				}
+			} else {
+				for index in 0..contents.len() {
+					if search_generation.load(Ordering::Relaxed)
+						!= generation
+					{
+						return;
+					}
+					if check_index(index) {
+						filtered.push(index);
+					}
 				}
 			}
 			if let Ok(mut result) = search_result.lock() {
@@ -188,14 +220,20 @@ impl ContentSearchPopup {
 	}
 
 	fn move_selection(&mut self, move_type: ScrollType) -> bool {
+		let page = self.list_height.get().max(1);
+		let max = self.filtered.len().saturating_sub(1);
 		let new_selection = match move_type {
 			ScrollType::Up => self.selection.saturating_sub(1),
 			ScrollType::Down => self.selection.saturating_add(1),
-			_ => self.selection,
+			ScrollType::PageUp => self.selection.saturating_sub(page),
+			ScrollType::PageDown => {
+				self.selection.saturating_add(page)
+			}
+			ScrollType::Home => 0,
+			ScrollType::End => max,
 		};
 
-		let new_selection = new_selection
-			.clamp(0, self.filtered.len().saturating_sub(1));
+		let new_selection = new_selection.clamp(0, max);
 
 		if new_selection != self.selection {
 			self.selection = new_selection;
@@ -211,7 +249,9 @@ impl ContentSearchPopup {
 		self.find_text.set_text(String::new());
 		self.query = None;
 		self.filtered_query = None;
+		self.filtered_needle = None;
 		self.filtered.clear();
+		self.searching = false;
 		self.selection = 0;
 		if self.contents.as_ref() != lines.as_slice() {
 			self.contents = lines.into();
@@ -233,49 +273,75 @@ impl ContentSearchPopup {
 			// Block has two lines up and down which need to be considered
 			const HEIGHT_BLOCK_MARGIN: usize = 2;
 
-			let title = format!("Hits: {}", self.filtered.len());
+			let title = if self.searching {
+				format!("Hits: {} (searching…)", self.filtered.len())
+			} else {
+				format!("Hits: {}", self.filtered.len())
+			};
 
 			let height = usize::from(area.height);
 			let width = usize::from(area.width);
+			let text_width = width.saturating_sub(2);
 
 			let list_height =
 				height.saturating_sub(HEIGHT_BLOCK_MARGIN);
+			self.list_height.set(list_height.max(1));
 
 			let scroll_skip =
 				self.selection.saturating_sub(list_height);
 
+			let needle = self.filtered_needle.as_deref().unwrap_or("");
 			let items = self
 				.filtered
 				.iter()
 				.skip(scroll_skip)
 				.take(height)
-				.map(|(idx, indices)| {
-					let selected = self.selection
-						< self.filtered.len()
-						&& self
-							.filtered
-							.get(self.selection)
-							.is_some_and(|s| s.0 == *idx);
-					let full_text =
-						trim_length_left(&self.contents[*idx], width);
-					let trim_length =
-						self.contents[*idx].graphemes(true).count()
-							- full_text.graphemes(true).count();
-					Line::from(
-						full_text
-							.graphemes(true)
-							.enumerate()
-							.map(|(c_idx, c)| {
-								let highlighted = indices
-									.contains(&(c_idx + trim_length));
-								Span::styled(
-									Cow::from(c.to_string()),
-									self.theme
-										.text(selected, highlighted),
-								)
-							})
-							.collect::<Vec<_>>(),
-					)
+				.enumerate()
+				.map(|(row_idx, &idx)| {
+					let selected =
+						self.selection == scroll_skip + row_idx;
+					let line = &self.contents[idx];
+					let full_text = trim_length_left(line, text_width);
+					let trim_length = if full_text.len() == line.len()
+					{
+						0
+					} else {
+						line.graphemes(true).count()
+							- full_text.graphemes(true).count()
+					};
+					let indices = substring_match_indices(
+						line,
+						&self.contents_lower[idx],
+						needle,
+					);
+					let row_style = self.theme.text(true, selected);
+					let match_style =
+						self.theme.search_match(selected);
+					let mut spans = Vec::with_capacity(8);
+					spans.push(Span::styled(
+						if selected { "> " } else { "  " },
+						row_style,
+					));
+					push_highlighted_graphemes(
+						&mut spans,
+						full_text,
+						trim_length,
+						indices.as_deref().unwrap_or(&[]),
+						row_style,
+						match_style,
+					);
+					if selected {
+						let used = 2 + unicode_width::UnicodeWidthStr::width(
+							full_text,
+						);
+						if width > used {
+							spans.push(Span::styled(
+								" ".repeat(width - used),
+								row_style,
+							));
+						}
+					}
+					Line::from(spans)
 				});
 
 			ui::draw_list_block(
@@ -286,7 +352,8 @@ impl ContentSearchPopup {
 						title,
 						self.theme.title(true),
 					))
-					.borders(Borders::TOP),
+					.borders(Borders::TOP)
+					.border_style(self.theme.block(false)),
 				items,
 			);
 
@@ -314,7 +381,7 @@ impl DrawableComponent for ContentSearchPopup {
 		if self.is_visible() {
 			const MAX_SIZE: (u16, u16) = (80, 24);
 
-			let any_hits = !self.filtered.is_empty();
+			let any_hits = !self.filtered.is_empty() || self.searching;
 
 			let area = ui::centered_rect_absolute(
 				MAX_SIZE.0, MAX_SIZE.1, area,
@@ -332,11 +399,11 @@ impl DrawableComponent for ContentSearchPopup {
 					.split(area)[0]
 			};
 
-			f.render_widget(Clear, area);
+			ui::clear_popup_area(f, area);
 			f.render_widget(
 				Block::default()
 					.borders(Borders::all())
-					.style(self.theme.title(true))
+					.border_style(self.theme.block(true))
 					.title(Span::styled(
 						strings::POPUP_TITLE_CONTENT_SEARCH,
 						self.theme.title(true),
@@ -396,39 +463,52 @@ impl Component for ContentSearchPopup {
 			if let Event::Key(key) = event {
 				if key_match(key, self.key_config.keys.exit_popup) {
 					self.hide();
+					return Ok(EventState::Consumed);
 				} else if key_match(
 					key,
 					self.key_config.keys.move_down,
 				) || key_match(
 					key,
 					self.key_config.keys.popup_down,
-				) {
+				) || (key.code == KeyCode::Char('n')
+					&& key.modifiers == KeyModifiers::CONTROL)
+				{
 					self.move_selection(ScrollType::Down);
+					return Ok(EventState::Consumed);
 				} else if key_match(key, self.key_config.keys.move_up)
 					|| key_match(key, self.key_config.keys.popup_up)
+					|| (key.code == KeyCode::Char('p')
+						&& key.modifiers == KeyModifiers::CONTROL)
 				{
 					self.move_selection(ScrollType::Up);
+					return Ok(EventState::Consumed);
+				} else if key_match(
+					key,
+					self.key_config.keys.page_down,
+				) {
+					self.move_selection(ScrollType::PageDown);
+					return Ok(EventState::Consumed);
+				} else if key_match(key, self.key_config.keys.page_up)
+				{
+					self.move_selection(ScrollType::PageUp);
+					return Ok(EventState::Consumed);
 				} else if key_match(key, self.key_config.keys.enter) {
 					// confirm: jump to the selected line in the preview
-					if let Some((line_idx, _)) =
+					if let Some(&line_idx) =
 						self.filtered.get(self.selection)
 					{
 						if let Some(q) = &self.query {
-							let matching_lines = self
-								.filtered
-								.iter()
-								.map(|(index, _)| *index)
-								.collect();
 							self.queue.push(
 								InternalEvent::ContentSearchSelected(
 									q.clone(),
-									*line_idx,
-									matching_lines,
+									line_idx,
+									self.filtered.clone(),
 								),
 							);
 						}
 					}
 					self.hide();
+					return Ok(EventState::Consumed);
 				}
 			}
 
@@ -461,6 +541,96 @@ impl Component for ContentSearchPopup {
 	}
 }
 
+/// Append `full_text` to `spans`, coalescing contiguous highlighted and
+/// unhighlighted grapheme runs into borrowed `&str` slices.
+/// `indices` must be sorted in ascending order.
+pub(super) fn push_highlighted_graphemes<'a>(
+	spans: &mut Vec<Span<'a>>,
+	full_text: &'a str,
+	trim_length: usize,
+	indices: &[usize],
+	row_style: Style,
+	match_style: Style,
+) {
+	if indices.is_empty() {
+		if !full_text.is_empty() {
+			spans.push(Span::styled(full_text, row_style));
+		}
+		return;
+	}
+
+	let mut match_pos = indices.partition_point(|&i| i < trim_length);
+	let mut run_start = 0usize;
+	let mut run_highlighted = false;
+	let mut has_run = false;
+
+	for (c_idx, (byte_idx, _)) in
+		full_text.grapheme_indices(true).enumerate()
+	{
+		let abs_idx = c_idx + trim_length;
+		while match_pos < indices.len()
+			&& indices[match_pos] < abs_idx
+		{
+			match_pos += 1;
+		}
+		let highlighted = match_pos < indices.len()
+			&& indices[match_pos] == abs_idx;
+
+		if !has_run {
+			run_start = byte_idx;
+			run_highlighted = highlighted;
+			has_run = true;
+		} else if highlighted != run_highlighted {
+			spans.push(Span::styled(
+				&full_text[run_start..byte_idx],
+				if run_highlighted {
+					match_style
+				} else {
+					row_style
+				},
+			));
+			run_start = byte_idx;
+			run_highlighted = highlighted;
+		}
+	}
+
+	if has_run && run_start < full_text.len() {
+		spans.push(Span::styled(
+			&full_text[run_start..],
+			if run_highlighted {
+				match_style
+			} else {
+				row_style
+			},
+		));
+	}
+}
+
+fn substring_matches_non_ascii(
+	line: &str,
+	needle_g: &[&str],
+	needle: &str,
+) -> bool {
+	let needle_len = if needle_g.is_empty() {
+		needle.graphemes(true).count()
+	} else {
+		needle_g.len()
+	};
+	if needle_len == 0 {
+		return false;
+	}
+	let line_graphemes: Vec<&str> = line.graphemes(true).collect();
+	let line_lower = line_graphmes_lower(&line_graphemes);
+	let line_g_lower: Vec<&str> =
+		line_lower.graphemes(true).collect();
+	if needle_g.is_empty() {
+		let ng: Vec<&str> = needle.graphemes(true).collect();
+		line_g_lower.windows(ng.len()).any(|w| w == ng.as_slice())
+	} else {
+		line_g_lower.windows(needle_len).any(|w| w == needle_g)
+	}
+}
+
 /// Case-insensitive substring match: returns the grapheme cluster indices
 /// (within `line`) of every grapheme that is part of a match of `needle`.
 ///
@@ -473,7 +643,7 @@ fn substring_match_indices(
 	line_lower: &str,
 	needle: &str,
 ) -> Option<Vec<usize>> {
-	if needle.is_empty() {
+	if needle.is_empty() || !line_lower.contains(needle) {
 		return None;
 	}
 

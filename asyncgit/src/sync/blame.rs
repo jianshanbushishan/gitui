@@ -3,12 +3,12 @@
 use super::{utils, CommitId, RepoPath};
 use crate::{
 	error::{Error, Result},
-	sync::{get_commits_info, repository::repo},
+	sync::repository::repo,
 };
 use git2::BlameOptions;
 use scopetime::scope_time;
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader};
+use std::io::BufRead;
 use std::path::Path;
 
 /// A `BlameHunk` contains all the information that will be shown to the user.
@@ -85,8 +85,6 @@ pub fn blame_file(
 	let blame =
 		repo.blame_file(Path::new(file_path), Some(&mut opts))?;
 
-	let reader = BufReader::new(blob.content());
-
 	let unique_commit_ids: HashSet<_> = blame
 		.iter()
 		.map(|hunk| CommitId::new(hunk.final_commit_id()))
@@ -94,48 +92,59 @@ pub fn blame_file(
 	let mut commit_ids = Vec::with_capacity(unique_commit_ids.len());
 	commit_ids.extend(unique_commit_ids);
 
-	let commit_infos = get_commits_info(repo_path, &commit_ids, 0)?;
+	let commit_infos =
+		super::commits_info::get_commits_info_repo(&repo, &commit_ids, 0)?;
 	let unique_commit_infos: HashMap<_, _> = commit_infos
 		.iter()
 		.map(|commit_info| (commit_info.id, commit_info))
 		.collect();
 
-	let lines: Vec<(Option<BlameHunk>, String)> = reader
-		.lines()
-		.enumerate()
-		.map(|(i, line)| {
-			// Line indices in a `FileBlame` are 1-based.
-			let corresponding_hunk = blame.get_line(i + 1);
-
-			if let Some(hunk) = corresponding_hunk {
-				let commit_id = CommitId::new(hunk.final_commit_id());
-				// Line indices in a `BlameHunk` are 1-based.
-				let start_line =
-					hunk.final_start_line().saturating_sub(1);
-				let end_line =
-					start_line.saturating_add(hunk.lines_in_hunk());
-
-				if let Some(commit_info) =
-					unique_commit_infos.get(&commit_id)
-				{
-					let hunk = BlameHunk {
-						commit_id,
-						author: commit_info.author.clone(),
-						time: commit_info.time,
-						start_line,
-						end_line,
-					};
-
-					return (
-						Some(hunk),
-						line.unwrap_or_else(|_| String::new()),
-					);
+	// Resolve hunk metadata once per hunk instead of per line, and walk
+	// hunks linearly in lockstep with lines instead of binary-searching per line.
+	let resolved_hunks: Vec<Option<BlameHunk>> = blame
+		.iter()
+		.map(|hunk| {
+			let commit_id = CommitId::new(hunk.final_commit_id());
+			let start_line =
+				hunk.final_start_line().saturating_sub(1);
+			let end_line =
+				start_line.saturating_add(hunk.lines_in_hunk());
+			unique_commit_infos.get(&commit_id).map(|commit_info| {
+				BlameHunk {
+					commit_id,
+					author: commit_info.author.clone(),
+					time: commit_info.time,
+					start_line,
+					end_line,
 				}
-			}
-
-			(None, line.unwrap_or_else(|_| String::new()))
+			})
 		})
 		.collect();
+
+	let estimated_lines: usize = resolved_hunks
+		.last()
+		.and_then(|h| h.as_ref().map(|h| h.end_line))
+		.unwrap_or(0);
+	let mut lines: Vec<(Option<BlameHunk>, String)> =
+		Vec::with_capacity(estimated_lines);
+	let mut hunk_idx = 0_usize;
+
+	for (i, line) in blob.content().lines().enumerate() {
+		while let Some(Some(h)) = resolved_hunks.get(hunk_idx) {
+			if i < h.end_line {
+				break;
+			}
+			hunk_idx += 1;
+		}
+
+		let line_hunk = resolved_hunks
+			.get(hunk_idx)
+			.and_then(|opt| opt.as_ref())
+			.filter(|h| i >= h.start_line && i < h.end_line)
+			.cloned();
+
+		lines.push((line_hunk, line.unwrap_or_default()));
+	}
 
 	let file_blame = FileBlame {
 		commit_id,

@@ -141,17 +141,26 @@ impl FileTree {
 		direction: Direction,
 	) -> Option<usize> {
 		let page_size = self.window_height.get().unwrap_or(0);
+		let visible = self.items.visible_indices();
+		if page_size == 0 || visible.is_empty() {
+			return None;
+		}
 
 		if direction == Direction::Up {
-			self.get_new_selection(
-				(0..=current_index).rev(),
-				page_size,
-			)
+			let pos = visible.partition_point(|&i| i <= current_index);
+			if pos == 0 {
+				None
+			} else {
+				Some(visible[pos.saturating_sub(page_size)])
+			}
 		} else {
-			self.get_new_selection(
-				current_index..(self.items.len()),
-				page_size,
-			)
+			let pos = visible.partition_point(|&i| i < current_index);
+			if pos >= visible.len() {
+				None
+			} else {
+				let target = (pos + page_size - 1).min(visible.len() - 1);
+				Some(visible[target])
+			}
 		}
 	}
 
@@ -216,54 +225,25 @@ impl FileTree {
 		&self,
 		visual_index: usize,
 	) -> Option<usize> {
-		self.items
-			.iterate(0, self.items.len())
-			.enumerate()
-			.find_map(|(i, (abs, _))| {
-				if i == visual_index {
-					Some(abs)
-				} else {
-					None
-				}
-			})
+		self.items.visible_indices().get(visual_index).copied()
 	}
 
 	fn calc_visual_selection(&self) -> Option<VisualSelection> {
 		self.selection.map(|selection_absolute| {
-			let mut count = 0;
-			let mut visual_index = 0;
-			for (index, _item) in
-				self.items.iterate(0, self.items.len())
-			{
-				if selection_absolute == index {
-					visual_index = count;
-				}
-
-				count += 1;
-			}
+			let visible = self.items.visible_indices();
+			let visual_index = visible
+				.binary_search(&selection_absolute)
+				.unwrap_or(0);
 
 			VisualSelection {
 				index: visual_index,
-				count,
+				count: visible.len(),
 			}
 		})
 	}
 
 	fn selection_end(&self) -> Option<usize> {
-		let items_max = self.items.len().saturating_sub(1);
-
-		self.get_new_selection((0..=items_max).rev(), 1)
-	}
-
-	fn get_new_selection(
-		&self,
-		range: impl Iterator<Item = usize>,
-		take: usize,
-	) -> Option<usize> {
-		range
-			.filter(|index| self.is_visible_index(*index))
-			.take(take)
-			.last()
+		self.items.visible_indices().last().copied()
 	}
 
 	fn selection_updown(
@@ -271,16 +251,14 @@ impl FileTree {
 		current_index: usize,
 		direction: Direction,
 	) -> Option<usize> {
+		let visible = self.items.visible_indices();
 		if direction == Direction::Up {
-			self.get_new_selection(
-				(0..=current_index.saturating_sub(1)).rev(),
-				1,
-			)
+			let upper = current_index.saturating_sub(1);
+			let pos = visible.partition_point(|&i| i <= upper);
+			pos.checked_sub(1).map(|p| visible[p])
 		} else {
-			self.get_new_selection(
-				(current_index + 1)..(self.items.len()),
-				1,
-			)
+			let pos = visible.partition_point(|&i| i <= current_index);
+			visible.get(pos).copied()
 		}
 	}
 
@@ -288,14 +266,13 @@ impl FileTree {
 		let current_indent =
 			self.items.tree_items[current_index].info().indent();
 
-		let range = (0..=current_index).rev();
+		let visible = self.items.visible_indices();
+		let pos = visible.partition_point(|&i| i <= current_index);
 
-		range.filter(|index| self.is_visible_index(*index)).find(
-			|index| {
-				self.items.tree_items[*index].info().indent()
-					< current_indent
-			},
-		)
+		visible[..pos].iter().rev().copied().find(|&index| {
+			self.items.tree_items[index].info().indent()
+				< current_indent
+		})
 	}
 
 	fn selection_left(

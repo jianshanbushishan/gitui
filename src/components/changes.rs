@@ -76,6 +76,26 @@ impl ChangesComponent {
 		self.files.is_empty()
 	}
 
+	pub const fn file_count(&self) -> usize {
+		self.files.file_count()
+	}
+
+	pub fn set_empty_hint(&mut self, hint: impl Into<String>) {
+		self.files.set_empty_hint(hint);
+	}
+
+	pub fn select_adjacent_file(&mut self, forward: bool) -> bool {
+		self.files.select_adjacent_file(forward)
+	}
+
+	pub fn file_position(&self) -> Option<(usize, usize)> {
+		self.files.file_position()
+	}
+
+	pub fn scroll_mouse(&mut self, down: bool) -> bool {
+		self.files.scroll_mouse(down)
+	}
+
 	#[cfg(test)]
 	pub(crate) const fn is_pending(&self) -> bool {
 		self.files.is_pending()
@@ -192,7 +212,7 @@ impl Component for ChangesComponent {
 	) -> CommandBlocking {
 		self.files.commands(out, force_all);
 
-		let some_selection = self.selection().is_some();
+		let some_selection = self.files.selection_ref().is_some();
 
 		if self.is_working_dir {
 			out.push(CommandInfo::new(

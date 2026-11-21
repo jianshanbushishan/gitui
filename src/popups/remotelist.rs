@@ -27,6 +27,7 @@ use crossterm::event::{Event, KeyEvent};
 
 pub struct RemoteListPopup {
 	remote_names: Vec<String>,
+	remote_urls: Vec<Option<String>>,
 	repo: RepoPathRef,
 	visible: bool,
 	current_height: Cell<u16>,
@@ -178,6 +179,7 @@ impl RemoteListPopup {
 	pub fn new(env: &Environment) -> Self {
 		Self {
 			remote_names: Vec::new(),
+			remote_urls: Vec::new(),
 			repo: env.repo.clone(),
 			visible: false,
 			scroll: VerticalScroll::new(),
@@ -360,9 +362,11 @@ impl RemoteListPopup {
 				),
 				self.theme.text(true, false),
 			)));
-			let remote_url =
-				get_remote_url(&self.repo.borrow(), remote);
-			if let Ok(Some(mut remote_url)) = remote_url {
+			let remote_url = self
+				.remote_urls
+				.get(usize::from(self.selection))
+				.and_then(Clone::clone);
+			if let Some(mut remote_url) = remote_url {
 				if remote_url.len()
 					> url_length.saturating_sub(THREE_DOTS_LENGTH)
 				{
@@ -439,7 +443,17 @@ impl RemoteListPopup {
 
 	pub fn update_remotes(&mut self) -> Result<()> {
 		if self.is_visible() {
-			self.remote_names = get_remotes(&self.repo.borrow())?;
+			{
+				let repo = self.repo.borrow();
+				self.remote_names = get_remotes(&repo)?;
+				self.remote_urls = self
+					.remote_names
+					.iter()
+					.map(|name| {
+						get_remote_url(&repo, name).ok().flatten()
+					})
+					.collect();
+			}
 			self.set_selection(self.selection)?;
 		}
 		Ok(())
@@ -462,11 +476,18 @@ impl RemoteListPopup {
 	}
 
 	fn update_remote_url(&self) {
-		let remote_name =
-			self.remote_names[self.selection as usize].clone();
-		let remote_url =
-			get_remote_url(&self.repo.borrow(), &remote_name);
-		if let Ok(Some(url)) = remote_url {
+		let idx = self.selection as usize;
+		let remote_name = self.remote_names[idx].clone();
+		let remote_url = self
+			.remote_urls
+			.get(idx)
+			.and_then(Clone::clone)
+			.or_else(|| {
+				get_remote_url(&self.repo.borrow(), &remote_name)
+					.ok()
+					.flatten()
+			});
+		if let Some(url) = remote_url {
 			self.queue.push(InternalEvent::UpdateRemoteUrl(
 				remote_name,
 				url,

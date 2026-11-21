@@ -63,24 +63,28 @@ impl AsyncJob for AsyncRemoteTagsJob {
 		&mut self,
 		_params: RunParams<Self::Notification, Self::Progress>,
 	) -> Result<Self::Notification> {
-		if let Ok(mut state) = self.state.lock() {
-			*state = state.take().map(|state| match state {
-				JobState::Request(basic_credential) => {
-					let result = get_default_remote(&self.repo)
-						.and_then(|remote| {
-							tags_missing_remote(
-								&self.repo,
-								&remote,
-								basic_credential,
-							)
-						});
+		let state = self
+			.state
+			.lock()
+			.ok()
+			.and_then(|mut guard| guard.take());
+		let next_state = state.map(|state| match state {
+			JobState::Request(basic_credential) => {
+				let result = get_default_remote(&self.repo)
+					.and_then(|remote| {
+						tags_missing_remote(
+							&self.repo,
+							&remote,
+							basic_credential,
+						)
+					});
 
-					JobState::Response(result)
-				}
-				JobState::Response(result) => {
-					JobState::Response(result)
-				}
-			});
+				JobState::Response(result)
+			}
+			JobState::Response(result) => JobState::Response(result),
+		});
+		if let Ok(mut guard) = self.state.lock() {
+			*guard = next_state;
 		}
 
 		Ok(AsyncGitNotification::RemoteTags)

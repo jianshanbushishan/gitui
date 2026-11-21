@@ -1,18 +1,18 @@
-use crate::{
-	error::Error,
-	item::{FileTreeItemKind, PathCollapsed},
-	FileTreeItem,
-};
+use crate::{error::Error, FileTreeItem};
 use crate::{error::Result, treeitems_iter::TreeItemsIterator};
 use std::{
 	collections::{BTreeSet, HashMap},
 	path::{Path, PathBuf},
 };
 
+type CreatedItems<'a> =
+	(Vec<FileTreeItem>, HashMap<&'a Path, (usize, u8)>);
+
 ///
 #[derive(Default)]
 pub struct FileTreeItems {
 	pub tree_items: Vec<FileTreeItem>,
+	visible_indices: Vec<usize>,
 	files: usize,
 }
 
@@ -26,33 +26,53 @@ impl FileTreeItems {
 
 		Self::fold_paths(&mut items, &paths);
 
-		Ok(Self {
+		let mut res = Self {
 			tree_items: items,
+			visible_indices: Vec::new(),
 			files: list.len(),
-		})
+		};
+		res.rebuild_visible_indices();
+
+		Ok(res)
+	}
+
+	pub(crate) fn visible_indices(&self) -> &[usize] {
+		&self.visible_indices
+	}
+
+	fn rebuild_visible_indices(&mut self) {
+		self.visible_indices.clear();
+		for (idx, item) in self.tree_items.iter().enumerate() {
+			if item.info().is_visible() {
+				self.visible_indices.push(idx);
+			}
+		}
 	}
 
 	fn create_items<'a>(
 		list: &'a [&Path],
 		collapsed: &BTreeSet<&String>,
-	) -> Result<(Vec<FileTreeItem>, HashMap<&'a Path, usize>)> {
+	) -> Result<CreatedItems<'a>> {
 		// scopetime::scope_time!("create_items");
 
 		let mut items = Vec::with_capacity(list.len());
-		let mut paths_added: HashMap<&Path, usize> =
-			HashMap::with_capacity(list.len());
+		let mut paths_added: HashMap<&'a Path, (usize, u8)> =
+			HashMap::with_capacity((list.len() / 4).max(16));
+		let mut ancestors_buf: Vec<&'a Path> = Vec::with_capacity(16);
 
 		for e in list {
-			{
-				Self::push_dirs(
-					e,
-					&mut items,
-					&mut paths_added,
-					collapsed,
-				)?;
-			}
+			let file_indent = Self::push_dirs(
+				e,
+				&mut items,
+				&mut paths_added,
+				&mut ancestors_buf,
+				collapsed,
+			)?;
 
-			items.push(FileTreeItem::new_file(e)?);
+			items.push(FileTreeItem::new_file_with_indent(
+				PathBuf::from(e),
+				file_indent,
+			));
 		}
 
 		Ok((items, paths_added))
@@ -81,49 +101,71 @@ impl FileTreeItems {
 		item_path: &'a Path,
 		nodes: &mut Vec<FileTreeItem>,
 		// helps to only add new nodes for paths that were not added before
-		// we also count the number of children a node has for later folding
-		paths_added: &mut HashMap<&'a Path, usize>,
+		// we also track (children_count, indent) for later folding and O(1) indent lookup
+		paths_added: &mut HashMap<&'a Path, (usize, u8)>,
+		ancestors_buf: &mut Vec<&'a Path>,
 		collapsed: &BTreeSet<&String>,
-	) -> Result<()> {
-		let mut ancestors =
-			item_path.ancestors().skip(1).collect::<Vec<_>>();
-		ancestors.reverse();
+	) -> Result<u8> {
+		ancestors_buf.clear();
 
-		for c in &ancestors {
-			if c.parent().is_some() && !paths_added.contains_key(c) {
-				// add node and set count to have no children
-				paths_added.insert(c, 0);
-
-				// increase the number of children in the parent node count
-				if let Some(parent) = c.parent() {
-					if !parent.as_os_str().is_empty() {
-						*paths_added.entry(parent).or_insert(0) += 1;
-					}
-				}
-
-				//TODO: make non alloc
-				let path_string = Self::path_to_string(c)?;
-				let is_collapsed = collapsed.contains(&path_string);
-				nodes.push(FileTreeItem::new_path(c, is_collapsed)?);
+		for c in item_path.ancestors().skip(1) {
+			if c.parent().is_none() || paths_added.contains_key(c) {
+				break;
 			}
+			ancestors_buf.push(c);
 		}
 
-		// increase child count in parent node (the above ancenstor ignores the leaf component)
+		for &c in ancestors_buf.iter().rev() {
+			let parent_info = c.parent().and_then(|parent| {
+				if parent.as_os_str().is_empty() {
+					None
+				} else {
+					paths_added.get_mut(parent).map(|entry| {
+						entry.0 += 1;
+						entry.1
+					})
+				}
+			});
+
+			let indent = if let Some(parent_indent) = parent_info {
+				u8::try_from(usize::from(parent_indent) + 1)?
+			} else {
+				u8::try_from(c.ancestors().count().saturating_sub(2))?
+			};
+
+			paths_added.insert(c, (0, indent));
+
+			let path_str = c
+				.to_str()
+				.ok_or_else(|| Error::InvalidPath(c.to_path_buf()))?;
+			let is_collapsed = if collapsed.is_empty() {
+				false
+			} else {
+				collapsed.contains(&path_str.to_owned())
+			};
+			nodes.push(FileTreeItem::new_path_with_indent(
+				c.to_owned(),
+				indent,
+				is_collapsed,
+			));
+		}
+
+		// increase child count in parent node (the above ancestor loop ignores the leaf component)
 		if let Some(parent) = item_path.parent() {
-			*paths_added.entry(parent).or_insert(0) += 1;
+			if let Some(entry) = paths_added.get_mut(parent) {
+				entry.0 += 1;
+				return Ok(u8::try_from(usize::from(entry.1) + 1)?);
+			}
+			let indent = u8::try_from(
+				item_path.ancestors().count().saturating_sub(2),
+			)?;
+			paths_added.insert(parent, (1, indent.saturating_sub(1)));
+			return Ok(indent);
 		}
 
-		Ok(())
-	}
-
-	//TODO: return ref
-	fn path_to_string(p: &Path) -> Result<String> {
-		Ok(p.to_str()
-			.map_or_else(
-				|| Err(Error::InvalidPath(p.to_path_buf())),
-				Ok,
-			)?
-			.to_string())
+		Ok(u8::try_from(
+			item_path.ancestors().count().saturating_sub(2),
+		)?)
 	}
 
 	pub fn collapse(&mut self, index: usize, recursive: bool) {
@@ -150,6 +192,8 @@ impl FileTreeItems {
 					break;
 				}
 			}
+
+			self.rebuild_visible_indices();
 		}
 	}
 
@@ -184,26 +228,25 @@ impl FileTreeItems {
 				index + 1,
 				false,
 			);
+			self.rebuild_visible_indices();
 		}
 	}
 
 	/// makes sure `index` is visible.
 	/// this expands all parents and shows all siblings
 	pub fn show_element(&mut self, index: usize) -> Option<usize> {
-		Some(
-			self.show_element_upward(index)?
-				+ self.show_element_downward(index)?,
-		)
+		let shown = self.show_element_upward(index)?
+			+ self.show_element_downward(index)?;
+		self.rebuild_visible_indices();
+		Some(shown)
 	}
 
 	fn show_element_upward(&mut self, index: usize) -> Option<usize> {
 		let mut shown = 0_usize;
 
 		let item = self.tree_items.get(index)?;
-		let mut current_folder: (PathBuf, u8) = (
-			item.info().full_path().parent()?.to_path_buf(),
-			item.info().indent(),
-		);
+		item.info().full_path().parent()?;
+		let mut current_indent = item.info().indent();
 
 		let item_count = self.tree_items.len();
 		for item in self
@@ -212,10 +255,10 @@ impl FileTreeItems {
 			.rev()
 			.skip(item_count - index - 1)
 		{
-			if item.info().indent() == current_folder.1 {
+			if item.info().indent() == current_indent {
 				item.show();
 				shown += 1;
-			} else if item.info().indent() == current_folder.1 - 1 {
+			} else if item.info().indent() == current_indent - 1 {
 				// this must be our parent
 
 				item.expand_path();
@@ -228,10 +271,8 @@ impl FileTreeItems {
 				item.show();
 				shown += 1;
 
-				current_folder = (
-					item.info().full_path().parent()?.to_path_buf(),
-					item.info().indent(),
-				);
+				item.info().full_path().parent()?;
+				current_indent = item.info().indent();
 			}
 		}
 
@@ -245,26 +286,22 @@ impl FileTreeItems {
 		let mut shown = 0_usize;
 
 		let item = self.tree_items.get(index)?;
-		let mut current_folder: (PathBuf, u8) = (
-			item.info().full_path().parent()?.to_path_buf(),
-			item.info().indent(),
-		);
+		item.info().full_path().parent()?;
+		let mut current_indent = item.info().indent();
 
 		for item in self.tree_items.iter_mut().skip(index + 1) {
-			if item.info().indent() == current_folder.1 {
+			if item.info().indent() == current_indent {
 				item.show();
 				shown += 1;
 			}
-			if item.info().indent() == current_folder.1 - 1 {
+			if item.info().indent() == current_indent - 1 {
 				// this must be our parent
 
 				item.show();
 				shown += 1;
 
-				current_folder = (
-					item.info().full_path().parent()?.to_path_buf(),
-					item.info().indent(),
-				);
+				item.info().full_path().parent()?;
+				current_indent = item.info().indent();
 			}
 		}
 
@@ -278,14 +315,19 @@ impl FileTreeItems {
 		set_defaults: bool,
 	) {
 		// if we are in any subpath that is collapsed we keep skipping over it
-		let mut inner_collapsed: Option<PathBuf> = None;
+		let mut inner_collapsed: Option<usize> = None;
 
 		for i in start_idx..self.tree_items.len() {
-			if let Some(ref collapsed_path) = inner_collapsed {
-				let p = Path::new(
-					self.tree_items[i].info().full_path_str(),
-				);
-				if p.starts_with(collapsed_path) {
+			if let Some(collapsed_idx) = inner_collapsed {
+				let is_child = self.tree_items[i]
+					.info()
+					.full_path()
+					.starts_with(
+						self.tree_items[collapsed_idx]
+							.info()
+							.full_path(),
+					);
+				if is_child {
 					if set_defaults {
 						self.tree_items[i]
 							.info_mut()
@@ -297,20 +339,19 @@ impl FileTreeItems {
 				inner_collapsed = None;
 			}
 
-			let item_kind = self.tree_items[i].kind().clone();
-			let item_path =
-				Path::new(self.tree_items[i].info().full_path_str());
-
-			if matches!(item_kind, FileTreeItemKind::Path(PathCollapsed(collapsed)) if collapsed)
-			{
+			if self.tree_items[i].kind().is_path_collapsed() {
 				// we encountered an inner path that is still collapsed
-				inner_collapsed = Some(item_path.into());
+				inner_collapsed = Some(i);
 			}
 
-			if prefix
-				.as_ref()
-				.is_none_or(|prefix| item_path.starts_with(prefix))
-			{
+			let matches_prefix = prefix.is_none_or(|prefix| {
+				self.tree_items[i]
+					.info()
+					.full_path()
+					.starts_with(prefix)
+			});
+
+			if matches_prefix {
 				self.tree_items[i].info_mut().set_visible(true);
 			} else {
 				// if we do not set defaults we can early out
@@ -325,58 +366,55 @@ impl FileTreeItems {
 
 	fn fold_paths(
 		items: &mut Vec<FileTreeItem>,
-		paths: &HashMap<&Path, usize>,
+		paths: &HashMap<&Path, (usize, u8)>,
 	) {
-		let mut i = 0;
+		let mut out: Vec<FileTreeItem> =
+			Vec::with_capacity(items.len());
+		let mut active_folds: Vec<(usize, u8)> = Vec::new();
+		let mut current_unindent: u8 = 0;
 
-		while i < items.len() {
-			let item = &items[i];
-			if item.kind().is_path() {
-				let children = paths
-					.get(&Path::new(item.info().full_path_str()));
-
-				if let Some(children) = children {
-					if *children == 1 {
-						if i + 1 >= items.len() {
-							return;
-						}
-
-						if items
-							.get(i + 1)
-							.is_some_and(|item| item.kind().is_path())
-						{
-							let next_item = items.remove(i + 1);
-							let item_mut = &mut items[i];
-							item_mut.fold(next_item);
-
-							let prefix = item_mut
-								.info()
-								.full_path_str()
-								.to_owned();
-
-							Self::unindent(items, &prefix, i + 1);
-							continue;
-						}
-					}
+		for mut item in items.drain(..) {
+			while let Some(&(dir_idx, count)) = active_folds.last() {
+				let prefix = out[dir_idx].info().full_path_str();
+				if item.info().full_path_str().starts_with(prefix) {
+					break;
 				}
+				current_unindent -= count;
+				active_folds.pop();
 			}
 
-			i += 1;
-		}
-	}
+			let should_fold = item.kind().is_path()
+				&& out.last().is_some_and(|prev| {
+					prev.kind().is_path()
+						&& paths
+							.get(&prev.info().full_path())
+							.is_some_and(|&(children, _)| {
+								children == 1
+							})
+				});
 
-	fn unindent(
-		items: &mut [FileTreeItem],
-		prefix: &str,
-		start: usize,
-	) {
-		for elem in items.iter_mut().skip(start) {
-			if elem.info().full_path_str().starts_with(prefix) {
-				elem.info_mut().unindent();
+			if should_fold {
+				let last_idx = out.len() - 1;
+				out[last_idx].fold(item);
+				if let Some((idx, count)) = active_folds.last_mut() {
+					if *idx == last_idx {
+						*count += 1;
+					} else {
+						active_folds.push((last_idx, 1));
+					}
+				} else {
+					active_folds.push((last_idx, 1));
+				}
+				current_unindent += 1;
 			} else {
-				return;
+				if current_unindent > 0 {
+					item.info_mut().unindent_by(current_unindent);
+				}
+				out.push(item);
 			}
 		}
+
+		*items = out;
 	}
 }
 
@@ -415,55 +453,61 @@ mod tests {
 	#[test]
 	fn test_push_path() {
 		let mut items = Vec::new();
-		let mut paths: HashMap<&Path, usize> = HashMap::new();
+		let mut paths: HashMap<&Path, (usize, u8)> = HashMap::new();
+		let mut ancestors = Vec::new();
 
 		FileTreeItems::push_dirs(
 			Path::new("a/b/c"),
 			&mut items,
 			&mut paths,
+			&mut ancestors,
 			&BTreeSet::new(),
 		)
 		.unwrap();
 
-		assert_eq!(*paths.get(&Path::new("a")).unwrap(), 1);
+		assert_eq!(paths.get(&Path::new("a")).unwrap().0, 1);
 
 		FileTreeItems::push_dirs(
 			Path::new("a/b2/c"),
 			&mut items,
 			&mut paths,
+			&mut ancestors,
 			&BTreeSet::new(),
 		)
 		.unwrap();
 
-		assert_eq!(*paths.get(&Path::new("a")).unwrap(), 2);
+		assert_eq!(paths.get(&Path::new("a")).unwrap().0, 2);
 	}
 
 	#[test]
 	fn test_push_path2() {
 		let mut items = Vec::new();
-		let mut paths: HashMap<&Path, usize> = HashMap::new();
+		let mut paths: HashMap<&Path, (usize, u8)> = HashMap::new();
+		let mut ancestors = Vec::new();
 
 		FileTreeItems::push_dirs(
 			Path::new("a/b/c"),
 			&mut items,
 			&mut paths,
+			&mut ancestors,
 			&BTreeSet::new(),
 		)
 		.unwrap();
 
-		assert_eq!(*paths.get(&Path::new("a")).unwrap(), 1);
-		assert_eq!(*paths.get(&Path::new("a/b")).unwrap(), 1);
+		assert_eq!(paths.get(&Path::new("a")).unwrap().0, 1);
+		assert_eq!(paths.get(&Path::new("a/b")).unwrap().0, 1);
 
 		FileTreeItems::push_dirs(
 			Path::new("a/b/d"),
 			&mut items,
 			&mut paths,
+			&mut ancestors,
 			&BTreeSet::new(),
 		)
 		.unwrap();
 
-		assert_eq!(*paths.get(&Path::new("a")).unwrap(), 1);
-		assert_eq!(*paths.get(&Path::new("a/b")).unwrap(), 2);
+		assert_eq!(paths.get(&Path::new("a")).unwrap().0, 1);
+		assert_eq!(paths.get(&Path::new("a/b")).unwrap().0, 2);
 	}
 
 	#[test]
@@ -947,8 +991,8 @@ mod test_merging {
 				.unwrap();
 
 		assert_eq!(paths.len(), 2);
-		assert_eq!(*paths.get(&Path::new("a")).unwrap(), 1);
-		assert_eq!(*paths.get(&Path::new("a/b")).unwrap(), 2);
+		assert_eq!(paths.get(&Path::new("a")).unwrap().0, 1);
+		assert_eq!(paths.get(&Path::new("a/b")).unwrap().0, 2);
 		assert_eq!(items.len(), 4);
 
 		FileTreeItems::fold_paths(&mut items, &paths);
@@ -976,10 +1020,10 @@ mod test_merging {
 		assert_eq!(items.len(), 6);
 
 		assert_eq!(paths.len(), 4);
-		assert_eq!(*paths.get(&Path::new("a")).unwrap(), 2);
-		assert_eq!(*paths.get(&Path::new("a/b")).unwrap(), 1);
-		assert_eq!(*paths.get(&Path::new("a/b/c")).unwrap(), 1);
-		assert_eq!(*paths.get(&Path::new("a/e")).unwrap(), 1);
+		assert_eq!(paths.get(&Path::new("a")).unwrap().0, 2);
+		assert_eq!(paths.get(&Path::new("a/b")).unwrap().0, 1);
+		assert_eq!(paths.get(&Path::new("a/b/c")).unwrap().0, 1);
+		assert_eq!(paths.get(&Path::new("a/e")).unwrap().0, 1);
 
 		FileTreeItems::fold_paths(&mut items, &paths);
 

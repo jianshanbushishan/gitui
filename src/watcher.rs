@@ -25,11 +25,16 @@ impl RepoWatcher {
 			timeout,
 			move |result: DebounceEventResult| match result {
 				Ok(events) => {
-					log::debug!("notify events: {}", events.len());
-					for (idx, event) in events.iter().enumerate() {
-						log::debug!("notify [{idx}]: {event:?}");
+					if log::log_enabled!(log::Level::Debug) {
+						log::debug!("notify events: {}", events.len());
+						for (idx, event) in events.iter().enumerate() {
+							log::debug!("notify [{idx}]: {event:?}");
+						}
 					}
-					if !events.is_empty() {
+					let has_relevant = events.iter().any(|ev| {
+						!is_internal_gitui_noise(&ev.path)
+					});
+					if has_relevant {
 						// One pending refresh is enough; subsequent events are
 						// represented by the same repository snapshot.
 						let _ = out_tx.try_send(());
@@ -56,4 +61,19 @@ impl RepoWatcher {
 	pub fn receiver(&self) -> crossbeam_channel::Receiver<()> {
 		self.receiver.clone()
 	}
+}
+
+fn is_internal_gitui_noise(path: &Path) -> bool {
+	let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+		return false;
+	};
+	if name == "index.lock" {
+		return true;
+	}
+	name == "gitui"
+		&& path
+			.parent()
+			.and_then(|p| p.file_name())
+			.and_then(|n| n.to_str())
+			== Some(".git")
 }

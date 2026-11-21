@@ -133,6 +133,7 @@ impl Ord for FileTreeItem {
 #[derive(Default)]
 pub struct FileTreeItems {
 	items: Vec<FileTreeItem>,
+	has_same_indent_sibling: Vec<bool>,
 	file_count: usize,
 }
 
@@ -144,6 +145,7 @@ impl FileTreeItems {
 	) -> Result<Self> {
 		let mut items = Vec::with_capacity(list.len());
 		let mut paths_added = BTreeSet::new();
+		let mut ancestors_buf = Vec::with_capacity(16);
 
 		for e in list {
 			{
@@ -153,6 +155,7 @@ impl FileTreeItems {
 					item_path,
 					&mut items,
 					&mut paths_added,
+					&mut ancestors_buf,
 					collapsed,
 				)?;
 			}
@@ -160,10 +163,39 @@ impl FileTreeItems {
 			items.push(FileTreeItem::new_file(e)?);
 		}
 
+		let has_same_indent_sibling =
+			Self::compute_same_indent_siblings(&items);
+
 		Ok(Self {
 			items,
+			has_same_indent_sibling,
 			file_count: list.len(),
 		})
+	}
+
+	fn compute_same_indent_siblings(
+		items: &[FileTreeItem],
+	) -> Vec<bool> {
+		let len = items.len();
+		let mut res = vec![false; len];
+		let mut stack: Vec<u8> = Vec::with_capacity(16);
+
+		for idx in (0..len).rev() {
+			let indent = items[idx].info.indent;
+			while let Some(&top) = stack.last() {
+				if top > indent {
+					stack.pop();
+				} else {
+					break;
+				}
+			}
+			if idx + 2 < len && stack.last() == Some(&indent) {
+				res[idx] = true;
+			}
+			stack.push(indent);
+		}
+
+		res
 	}
 
 	///
@@ -199,19 +231,24 @@ impl FileTreeItems {
 		item_path: &'a Path,
 		nodes: &mut Vec<FileTreeItem>,
 		paths_added: &mut BTreeSet<&'a Path>,
+		ancestors_buf: &mut Vec<&'a Path>,
 		collapsed: &BTreeSet<&String>,
 	) -> Result<()> {
-		let mut ancestors =
-			{ item_path.ancestors().skip(1).collect::<Vec<_>>() };
-		ancestors.reverse();
+		ancestors_buf.clear();
+		for c in item_path.ancestors().skip(1) {
+			if c.parent().is_none() || paths_added.contains(c) {
+				break;
+			}
+			ancestors_buf.push(c);
+		}
 
-		for c in &ancestors {
-			if c.parent().is_some() && !paths_added.contains(c) {
-				paths_added.insert(c);
+		for &c in ancestors_buf.iter().rev() {
+			if paths_added.insert(c) {
 				//TODO: get rid of expect
 				let path_string =
 					String::from(c.to_str().expect("invalid path"));
-				let is_collapsed = collapsed.contains(&path_string);
+				let is_collapsed = !collapsed.is_empty()
+					&& collapsed.contains(&path_string);
 				nodes.push(FileTreeItem::new_path(
 					c,
 					path_string,
@@ -224,22 +261,10 @@ impl FileTreeItems {
 	}
 
 	pub fn multiple_items_at_path(&self, index: usize) -> bool {
-		let tree_items = self.items();
-		let mut idx_temp_inner;
-		if index + 2 < tree_items.len() {
-			idx_temp_inner = index + 1;
-			while idx_temp_inner < tree_items.len().saturating_sub(1)
-				&& tree_items[index].info.indent
-					< tree_items[idx_temp_inner].info.indent
-			{
-				idx_temp_inner += 1;
-			}
-		} else {
-			return false;
-		}
-
-		tree_items[idx_temp_inner].info.indent
-			== tree_items[index].info.indent
+		self.has_same_indent_sibling
+			.get(index)
+			.copied()
+			.unwrap_or(false)
 	}
 }
 

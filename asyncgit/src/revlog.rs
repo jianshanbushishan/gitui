@@ -12,7 +12,7 @@ use std::{
 	collections::HashSet,
 	sync::{
 		atomic::{AtomicBool, Ordering},
-		Arc, Mutex,
+		Arc, Condvar, Mutex,
 	},
 	thread,
 	time::{Duration, Instant},
@@ -44,6 +44,7 @@ pub struct AsyncLog {
 	pending: Arc<AtomicBool>,
 	background: Arc<AtomicBool>,
 	cancelled: Arc<AtomicBool>,
+	wake: Arc<(Mutex<()>, Condvar)>,
 	reference: Option<String>,
 	filter: Option<SharedCommitFilterFn>,
 	partial_extract: AtomicBool,
@@ -72,6 +73,7 @@ impl AsyncLog {
 			pending: Arc::new(AtomicBool::new(false)),
 			background: Arc::new(AtomicBool::new(false)),
 			cancelled: Arc::new(AtomicBool::new(false)),
+			wake: Arc::new((Mutex::new(()), Condvar::new())),
 			reference: None,
 			filter,
 			partial_extract: AtomicBool::new(false),
@@ -127,9 +129,7 @@ impl AsyncLog {
 	pub fn extract_items(&self) -> Result<Vec<CommitId>> {
 		self.partial_extract.store(true, Ordering::Relaxed);
 		let list = &mut self.current.lock()?.commits;
-		let result = list.clone();
-		list.clear();
-		Ok(result)
+		Ok(std::mem::take(list))
 	}
 
 	///
@@ -200,11 +200,12 @@ impl AsyncLog {
 		let arc_pending = Arc::clone(&self.pending);
 		let arc_background = Arc::clone(&self.background);
 		let arc_cancelled = Arc::clone(&self.cancelled);
+		let arc_wake = Arc::clone(&self.wake);
 		let arc_head = Arc::clone(&self.current_head);
 		let filter = self.filter.clone();
 		let repo_path = self.repo.clone();
 
-		rayon_core::spawn(move || {
+		let work = move || {
 			scope_time!("async::revlog");
 
 			if let Err(error) = Self::fetch_helper(
@@ -215,6 +216,7 @@ impl AsyncLog {
 				filter,
 				start,
 				&arc_cancelled,
+				&arc_wake,
 			) {
 				log::error!("failed to fetch log: {error}");
 				if let Ok(mut head) = arc_head.lock() {
@@ -227,11 +229,23 @@ impl AsyncLog {
 			if !arc_cancelled.load(Ordering::Relaxed) {
 				Self::notify(&sender);
 			}
-		});
+		};
+
+		if thread::Builder::new()
+			.name("gitui-revlog".into())
+			.spawn(work)
+			.is_err()
+		{
+			self.pending.store(false, Ordering::Relaxed);
+			return Err(Error::Generic(
+				"failed to spawn revlog worker thread".into(),
+			));
+		}
 
 		Ok(FetchStatus::Started)
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	fn fetch_helper(
 		repo_path: &RepoPath,
 		arc_current: &Arc<Mutex<AsyncLogResult>>,
@@ -240,6 +254,7 @@ impl AsyncLog {
 		filter: Option<SharedCommitFilterFn>,
 		start: CommitId,
 		cancelled: &AtomicBool,
+		wake: &(Mutex<()>, Condvar),
 	) -> Result<()> {
 		filter.map_or_else(
 			|| {
@@ -250,6 +265,7 @@ impl AsyncLog {
 					sender,
 					start,
 					cancelled,
+					wake,
 				)
 			},
 			|filter| {
@@ -261,11 +277,28 @@ impl AsyncLog {
 					filter,
 					start,
 					cancelled,
+					wake,
 				)
 			},
 		)
 	}
 
+	fn interruptible_pause(
+		duration: Duration,
+		cancelled: &AtomicBool,
+		wake: &(Mutex<()>, Condvar),
+	) {
+		if cancelled.load(Ordering::Relaxed) {
+			return;
+		}
+		if let Ok(guard) = wake.0.lock() {
+			if !cancelled.load(Ordering::Relaxed) {
+				let _ = wake.1.wait_timeout(guard, duration);
+			}
+		}
+	}
+
+	#[allow(clippy::too_many_arguments)]
 	fn fetch_helper_with_filter(
 		repo_path: &RepoPath,
 		arc_current: &Arc<Mutex<AsyncLogResult>>,
@@ -274,6 +307,7 @@ impl AsyncLog {
 		filter: SharedCommitFilterFn,
 		start: CommitId,
 		cancelled: &AtomicBool,
+		wake: &(Mutex<()>, Condvar),
 	) -> Result<()> {
 		let r = repo(repo_path)?;
 		let mut walker =
@@ -291,7 +325,7 @@ impl AsyncLog {
 			arc_current,
 			arc_background,
 			sender,
-			thread::sleep,
+			|dur| Self::interruptible_pause(dur, cancelled, wake),
 		)?;
 
 		log::trace!("revlog visited: {}", walker.visited());
@@ -306,6 +340,7 @@ impl AsyncLog {
 		sender: &Sender<AsyncGitNotification>,
 		start: CommitId,
 		cancelled: &AtomicBool,
+		wake: &(Mutex<()>, Condvar),
 	) -> Result<()> {
 		Self::fetch_with_fallback(
 			|published| {
@@ -322,13 +357,17 @@ impl AsyncLog {
 							return Ok(0);
 						}
 						let count = walker.read(entries)?;
-						published.extend(entries.iter().copied());
+						published.extend_from_slice(entries);
 						Ok(count)
 					},
 					arc_current,
 					arc_background,
 					sender,
-					thread::sleep,
+					|dur| {
+						Self::interruptible_pause(
+							dur, cancelled, wake,
+						);
+					},
 				)?;
 
 				log::trace!("revlog visited: {}", walker.visited());
@@ -343,12 +382,14 @@ impl AsyncLog {
 					start,
 					cancelled,
 					&published,
+					wake,
 				)
 			},
 			cancelled,
 		)
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	fn fetch_helper_fallback(
 		repo_path: &RepoPath,
 		current: &Mutex<AsyncLogResult>,
@@ -357,6 +398,7 @@ impl AsyncLog {
 		start: CommitId,
 		cancelled: &AtomicBool,
 		published: &HashSet<CommitId>,
+		wake: &(Mutex<()>, Condvar),
 	) -> Result<()> {
 		let repo = repo(repo_path)?;
 		let mut walker =
@@ -375,22 +417,24 @@ impl AsyncLog {
 			current,
 			background,
 			sender,
-			thread::sleep,
+			|dur| Self::interruptible_pause(dur, cancelled, wake),
 		)
 	}
 
 	fn fetch_with_fallback(
-		primary: impl FnOnce(&mut HashSet<CommitId>) -> Result<()>,
+		primary: impl FnOnce(&mut Vec<CommitId>) -> Result<()>,
 		fallback: impl FnOnce(HashSet<CommitId>) -> Result<()>,
 		cancelled: &AtomicBool,
 	) -> Result<()> {
-		let mut published = HashSet::new();
+		let mut published = Vec::new();
 		if let Err(error) = primary(&mut published) {
 			log::error!(
 				"gix log traversal failed; falling back to libgit2: {error:?}"
 			);
 			if !cancelled.load(Ordering::Relaxed) {
-				return fallback(published);
+				let published_set: HashSet<CommitId> =
+					published.into_iter().collect();
+				return fallback(published_set);
 			}
 		}
 
@@ -412,7 +456,11 @@ impl AsyncLog {
 
 			{
 				let mut current = current.lock()?;
-				current.commits.extend(entries.iter());
+				if current.commits.is_empty() {
+					std::mem::swap(&mut current.commits, &mut entries);
+				} else {
+					current.commits.extend_from_slice(&entries);
+				}
 				current.duration = start_time.elapsed();
 			}
 
@@ -449,6 +497,9 @@ impl AsyncLog {
 impl Drop for AsyncLog {
 	fn drop(&mut self) {
 		self.cancelled.store(true, Ordering::Relaxed);
+		if let Ok(_guard) = self.wake.0.lock() {
+			self.wake.1.notify_all();
+		}
 	}
 }
 
@@ -491,7 +542,7 @@ mod tests {
 						|entries| {
 							if std::mem::take(&mut first_batch) {
 								entries.push(tip);
-								published.insert(tip);
+								published.push(tip);
 								Ok(1)
 							} else {
 								// A partially read failing batch is not published.
@@ -527,6 +578,7 @@ mod tests {
 						tip,
 						&log.cancelled,
 						&published,
+						&log.wake,
 					)
 				},
 				&log.cancelled,
@@ -563,6 +615,7 @@ mod tests {
 					head,
 					&log.cancelled,
 					&published,
+					&log.wake,
 				)
 			},
 			&log.cancelled,
@@ -668,6 +721,7 @@ mod tests {
 		}));
 		let arc_background = Arc::new(AtomicBool::new(false));
 
+		let wake = (Mutex::new(()), std::sync::Condvar::new());
 		let result = AsyncLog::fetch_helper_without_filter(
 			&subdir_path,
 			&arc_current,
@@ -680,6 +734,7 @@ mod tests {
 				.id()
 				.into(),
 			&AtomicBool::new(false),
+			&wake,
 		);
 
 		assert_eq!(result.unwrap(), ());
@@ -729,6 +784,7 @@ mod tests {
 		}));
 		let arc_background = Arc::new(AtomicBool::new(false));
 
+		let wake = (Mutex::new(()), std::sync::Condvar::new());
 		let result = AsyncLog::fetch_helper_without_filter(
 			// We pass an empty path, thus testing whether `GIT_DIR`, set above, is taken into account.
 			&empty_path,
@@ -742,6 +798,7 @@ mod tests {
 				.id()
 				.into(),
 			&AtomicBool::new(false),
+			&wake,
 		);
 
 		assert_eq!(result.unwrap(), ());

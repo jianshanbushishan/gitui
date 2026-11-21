@@ -65,6 +65,7 @@ pub struct CopyPathPopup {
 	basename: String,
 	extension: String,
 	content: Option<String>,
+	content_line_count: usize,
 	queue: Queue,
 	theme: SharedTheme,
 	key_config: SharedKeyConfig,
@@ -85,6 +86,7 @@ impl CopyPathPopup {
 			basename: String::new(),
 			extension: String::new(),
 			content: None,
+			content_line_count: 0,
 			queue,
 			theme,
 			key_config,
@@ -99,6 +101,8 @@ impl CopyPathPopup {
 	) -> Result<()> {
 		self.relative_path = relative_path;
 		self.absolute_path = absolute_path;
+		self.content_line_count =
+			content.as_deref().map_or(0, |c| c.lines().count());
 		self.content = content;
 
 		let p = Path::new(&self.relative_path);
@@ -159,20 +163,21 @@ impl CopyPathPopup {
 	}
 
 	fn copy_selected(&mut self) {
-		let value = self.value(self.kind).to_string();
-		if crate::clipboard::copy_string(&value).is_err() {
+		let copy_res =
+			crate::clipboard::copy_string(self.value(self.kind));
+		if copy_res.is_err() {
 			self.queue.push(InternalEvent::ShowErrorMsg(
 				strings::POPUP_FAIL_COPY.to_string(),
 			));
 		} else {
 			let label = if self.kind == CopyPathType::Content {
-				self.filename.clone()
+				self.filename.as_str()
 			} else {
-				value
+				self.value(self.kind)
 			};
 			self.queue.push(InternalEvent::ShowInfoLabeledMsg(
 				strings::POPUP_SUCCESS_COPY.to_string(),
-				strings::copy_success(&label),
+				strings::copy_success(label),
 			));
 		}
 		self.hide();
@@ -191,15 +196,15 @@ impl CopyPathPopup {
 			};
 			let prefix = if selected { "> " } else { "  " };
 
-			let value = if kind == CopyPathType::Content {
-				let n = self
-					.content
-					.as_ref()
-					.map_or(0, |c| c.lines().count());
-				format!("({n} lines)")
-			} else {
-				self.value(kind).to_string()
-			};
+			let value: std::borrow::Cow<'_, str> =
+				if kind == CopyPathType::Content {
+					std::borrow::Cow::Owned(format!(
+						"({} lines)",
+						self.content_line_count
+					))
+				} else {
+					std::borrow::Cow::Borrowed(self.value(kind))
+				};
 
 			lines.push(Line::from(vec![
 				Span::styled(prefix, style),

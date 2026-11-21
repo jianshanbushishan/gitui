@@ -6,10 +6,7 @@ use super::{
 use crate::{
 	app::Environment,
 	components::{
-		async_delta::{
-			pad_line_bg as delta_pad_line_bg, AsyncDelta,
-			DeltaParams, ProcessedDelta,
-		},
+		async_delta::{AsyncDelta, DeltaParams, ProcessedDelta},
 		CommandInfo, Component, EventState,
 	},
 	keys::{key_match, GituiKeyEvent, SharedKeyConfig},
@@ -139,7 +136,7 @@ impl Selection {
 ///
 pub struct DiffComponent {
 	repo: RepoPathRef,
-	diff: Option<FileDiff>,
+	diff: Option<Arc<FileDiff>>,
 	longest_line: Cell<usize>,
 	pending: bool,
 	selection: Selection,
@@ -167,6 +164,12 @@ pub struct DiffComponent {
 	hunk_offsets: Vec<usize>,
 	/// Diff identity of the displayed rows; old rows may remain while loading.
 	delta_rendered_hash: Cell<Option<u64>>,
+	/// Optional `(index, total)` position of the current file in the parent list.
+	file_position: Option<(usize, usize)>,
+	/// In-diff content search state.
+	search_query: String,
+	search_matches: Vec<usize>,
+	search_cursor: usize,
 }
 
 impl DiffComponent {
@@ -200,6 +203,114 @@ impl DiffComponent {
 			line_num_width: 1,
 			hunk_offsets: Vec::new(),
 			delta_rendered_hash: Cell::new(None),
+			file_position: None,
+			search_query: String::new(),
+			search_matches: Vec::new(),
+			search_cursor: 0,
+		}
+	}
+
+	pub const fn set_file_position(
+		&mut self,
+		pos: Option<(usize, usize)>,
+	) {
+		self.file_position = pos;
+	}
+
+	pub fn scroll_mouse(&mut self, down: bool) {
+		for _ in 0..3 {
+			self.move_selection(if down {
+				ScrollType::Down
+			} else {
+				ScrollType::Up
+			});
+		}
+	}
+
+	fn reset_search(&mut self) {
+		self.search_query.clear();
+		self.search_matches.clear();
+		self.search_cursor = 0;
+	}
+
+	/// Plain searchable lines matching the currently displayed diff rows.
+	fn searchable_lines(&self) -> Vec<String> {
+		if self.is_delta_preview() {
+			return self
+				.delta_display_lines
+				.borrow()
+				.iter()
+				.map(|line| {
+					line.spans
+						.iter()
+						.map(|s| s.content.as_ref())
+						.collect::<String>()
+				})
+				.collect();
+		}
+		self.diff.as_ref().map_or_else(Vec::new, |diff| {
+			diff.hunks
+				.iter()
+				.flat_map(|h| h.lines.iter())
+				.map(|l| l.content.as_ref().trim_end_matches(['\n', '\r']).to_owned())
+				.collect()
+		})
+	}
+
+	pub fn start_search(&self) {
+		let lines = self.searchable_lines();
+		if !lines.is_empty() {
+			self.queue.push(InternalEvent::OpenContentSearch(lines));
+		}
+	}
+
+	pub fn content_search_selected(
+		&mut self,
+		query: &str,
+		line: usize,
+		matching_lines: &[usize],
+	) {
+		self.search_query.clear();
+		self.search_query.push_str(query);
+		self.search_matches = matching_lines.to_vec();
+		self.search_cursor = self
+			.search_matches
+			.iter()
+			.position(|&m| m >= line)
+			.unwrap_or(0);
+		self.jump_to_row(line);
+	}
+
+	fn move_search_match(&mut self, forward: bool) {
+		if self.search_matches.is_empty() {
+			return;
+		}
+		let len = self.search_matches.len();
+		self.search_cursor = if forward {
+			(self.search_cursor + 1) % len
+		} else {
+			(self.search_cursor + len - 1) % len
+		};
+		let target = self.search_matches[self.search_cursor];
+		self.jump_to_row(target);
+	}
+
+	fn jump_to_row(&mut self, row: usize) {
+		let max = if self.is_delta_preview() {
+			self.delta_display_lines.borrow().len().saturating_sub(1)
+		} else {
+			self.lines_count().saturating_sub(1)
+		};
+		let target = row.min(max);
+		if self.is_delta_preview() {
+			self.selection = Selection::Single(target);
+			self.selected_hunk = self
+				.delta_line_hunks
+				.borrow()
+				.get(target)
+				.copied();
+		} else {
+			self.update_selection(target);
 		}
 	}
 	///
@@ -230,6 +341,7 @@ impl DiffComponent {
 		self.horizontal_scroll.reset();
 		self.selection = Selection::Single(0);
 		self.selected_hunk = None;
+		self.reset_search();
 		self.pending = pending;
 	}
 	///
@@ -249,19 +361,13 @@ impl DiffComponent {
 			|| self.current.is_stage != is_stage
 			|| self.current.diff_type != diff_type
 		{
-			self.update_diff_layout(&diff);
-			self.line_stats = diff
-				.hunks
-				.iter()
-				.flat_map(|hunk| hunk.lines.iter())
-				.fold((0, 0), |(added, deleted), line| {
-					match line.line_type {
-						DiffLineType::Add => (added + 1, deleted),
-						DiffLineType::Delete => (added, deleted + 1),
-						_ => (added, deleted),
-					}
-				});
+			let (added, deleted, longest) =
+				self.update_diff_layout(&diff);
+			self.line_stats = (added, deleted);
 			let reset_selection = self.current.path != path;
+			if reset_selection {
+				self.reset_search();
+			}
 
 			self.current = Current {
 				path,
@@ -270,27 +376,11 @@ impl DiffComponent {
 				diff_type,
 			};
 
-			self.diff = Some(diff);
-
-			self.longest_line.set(
-				self.diff
-					.iter()
-					.flat_map(|diff| diff.hunks.iter())
-					.flat_map(|hunk| hunk.lines.iter())
-					.map(|line| {
-						let converted_content = tabs_to_spaces(
-							line.content.as_ref().to_string(),
-						);
-
-						converted_content.len()
-					})
-					.max()
-					.map_or(0, |len| {
-						// Each hunk uses a 1-character wide vertical bar to its left to indicate
-						// selection.
-						len + 1
-					}),
-			);
+			self.diff = Some(Arc::new(diff));
+			// Each hunk uses a 1-character wide vertical bar to its left to indicate
+			// selection.
+			self.longest_line
+				.set(if longest > 0 { longest + 1 } else { 0 });
 
 			if self.is_delta_preview() {
 				// Keep the current view until the matching worker result arrives.
@@ -324,32 +414,51 @@ impl DiffComponent {
 		}
 	}
 
-	fn update_diff_layout(&mut self, diff: &FileDiff) {
+	fn update_diff_layout(
+		&mut self,
+		diff: &FileDiff,
+	) -> (usize, usize, usize) {
 		let mut offset = 0;
-		self.hunk_offsets = diff
-			.hunks
-			.iter()
-			.map(|hunk| {
-				let start = offset;
-				offset += hunk.lines.len();
-				start
-			})
-			.collect();
-		let max_line = diff
-			.hunks
-			.iter()
-			.flat_map(|hunk| &hunk.lines)
-			.flat_map(|line| {
-				[line.position.old_lineno, line.position.new_lineno]
-			})
-			.flatten()
-			.max()
-			.unwrap_or(0);
+		let mut max_line = 0_u32;
+		let mut added = 0_usize;
+		let mut deleted = 0_usize;
+		let mut max_len = 0_usize;
+
+		self.hunk_offsets.clear();
+		self.hunk_offsets.reserve(diff.hunks.len());
+
+		for hunk in &diff.hunks {
+			self.hunk_offsets.push(offset);
+			offset += hunk.lines.len();
+			for line in &hunk.lines {
+				match line.line_type {
+					DiffLineType::Add => added += 1,
+					DiffLineType::Delete => deleted += 1,
+					_ => {}
+				}
+				if let Some(n) = line.position.old_lineno {
+					max_line = max_line.max(n);
+				}
+				if let Some(n) = line.position.new_lineno {
+					max_line = max_line.max(n);
+				}
+				// Each `\t` expands to 2 spaces in `tabs_to_spaces`, adding +1 byte.
+				let expanded_len = line.content.len()
+					+ line
+						.content
+						.bytes()
+						.filter(|&b| b == b'\t')
+						.count();
+				max_len = max_len.max(expanded_len);
+			}
+		}
+
 		self.line_num_width = if max_line == 0 {
 			1
 		} else {
 			(max_line.ilog10() + 1) as usize
 		};
+		(added, deleted, max_len)
 	}
 
 	fn move_selection(&mut self, move_type: ScrollType) {
@@ -444,8 +553,11 @@ impl DiffComponent {
 			let max = diff.lines.saturating_sub(1);
 			let new_start = cmp::min(max, new_start);
 			self.selection = Selection::Single(new_start);
-			self.selected_hunk =
-				Self::find_selected_hunk(diff, new_start);
+			self.selected_hunk = Self::find_selected_hunk(
+				diff,
+				&self.hunk_offsets,
+				new_start,
+			);
 		}
 	}
 
@@ -495,30 +607,50 @@ impl DiffComponent {
 					})
 					.collect();
 
-			try_or_popup!(
-				self,
-				"copy to clipboard error:",
-				crate::clipboard::copy_string(
-					&lines_to_copy.join("\n")
-				)
-			);
+			let copied_count = lines_to_copy.len();
+			match crate::clipboard::copy_string(
+				&lines_to_copy.join("\n"),
+			) {
+				Ok(()) => {
+					self.queue.push(InternalEvent::ShowToast(
+						format!(
+							"Copied {copied_count} line{}",
+							if copied_count == 1 { "" } else { "s" }
+						),
+					));
+				}
+				Err(e) => {
+					log::error!("copy to clipboard error: {e}");
+					self.queue.push(InternalEvent::ShowErrorMsg(
+						format!("copy to clipboard error:\n{e}"),
+					));
+				}
+			}
 		}
 	}
 
 	fn find_selected_hunk(
 		diff: &FileDiff,
+		hunk_offsets: &[usize],
 		line_selected: usize,
 	) -> Option<usize> {
+		if hunk_offsets.len() == diff.hunks.len()
+			&& !hunk_offsets.is_empty()
+		{
+			let idx = hunk_offsets
+				.partition_point(|&o| o <= line_selected)
+				.checked_sub(1)?;
+			let start = hunk_offsets[idx];
+			let end = start + diff.hunks[idx].lines.len();
+			return (line_selected < end).then_some(idx);
+		}
 		let mut line_cursor = 0_usize;
 		for (i, hunk) in diff.hunks.iter().enumerate() {
 			let hunk_len = hunk.lines.len();
 			let hunk_min = line_cursor;
 			let hunk_max = line_cursor + hunk_len;
 
-			let hunk_selected =
-				hunk_min <= line_selected && hunk_max > line_selected;
-
-			if hunk_selected {
+			if hunk_min <= line_selected && hunk_max > line_selected {
 				return Some(i);
 			}
 
@@ -817,10 +949,22 @@ impl DiffComponent {
 		if self.is_delta_preview() {
 			let positions = self.delta_line_positions.borrow();
 			let sel = self.selection.get_end();
-			let result: Vec<DiffLinePosition> = (0..positions.len())
-				.filter(|&i| self.selection.contains(i))
-				.filter_map(|i| positions[i])
-				.collect();
+			let top = self.selection.get_top();
+			let bottom = self
+				.selection
+				.get_bottom()
+				.min(positions.len().saturating_sub(1));
+			let result: Vec<DiffLinePosition> = if positions.is_empty()
+				|| top > bottom
+			{
+				Vec::new()
+			} else {
+				positions[top..=bottom]
+					.iter()
+					.copied()
+					.flatten()
+					.collect()
+			};
 			log::debug!(
 				"delta selected_lines: sel={}, positions_len={}, has_pos={}, result_len={}",
 				sel,
@@ -833,23 +977,41 @@ impl DiffComponent {
 		self.diff
 			.as_ref()
 			.map(|diff| {
-				diff.hunks
-					.iter()
-					.flat_map(|hunk| hunk.lines.iter())
-					.enumerate()
-					.filter_map(|(i, line)| {
-						let is_add_or_delete = line.line_type
-							== DiffLineType::Add
-							|| line.line_type == DiffLineType::Delete;
-						if self.selection.contains(i)
-							&& is_add_or_delete
+				let top = self.selection.get_top();
+				let bottom = self.selection.get_bottom();
+				let mut res = Vec::new();
+				let start_hunk = self
+					.hunk_offsets
+					.partition_point(|&o| o <= top)
+					.saturating_sub(1);
+				for (h_idx, hunk) in
+					diff.hunks.iter().enumerate().skip(start_hunk)
+				{
+					let h_start = self
+						.hunk_offsets
+						.get(h_idx)
+						.copied()
+						.unwrap_or(0);
+					if h_start > bottom {
+						break;
+					}
+					let local_start = top.saturating_sub(h_start);
+					let local_end = (bottom - h_start + 1)
+						.min(hunk.lines.len());
+					if local_start < local_end {
+						for line in &hunk.lines[local_start..local_end]
 						{
-							Some(line.position)
-						} else {
-							None
+							if matches!(
+								line.line_type,
+								DiffLineType::Add
+									| DiffLineType::Delete
+							) {
+								res.push(line.position);
+							}
 						}
-					})
-					.collect()
+					}
+				}
+				res
 			})
 			.unwrap_or_default()
 	}
@@ -875,13 +1037,12 @@ impl DiffComponent {
 		}
 
 		let diff = self.diff.as_ref()?;
-
-		// Unified mode: the selection indexes the flattened
-		// hunks[].lines[] directly.
-		diff.hunks
-			.iter()
-			.flat_map(|hunk| hunk.lines.iter())
-			.nth(sel)
+		let hunk_idx =
+			Self::find_selected_hunk(diff, &self.hunk_offsets, sel)?;
+		let local_idx = sel - self.hunk_offsets[hunk_idx];
+		diff.hunks[hunk_idx]
+			.lines
+			.get(local_idx)
 			.and_then(|line| line.position.new_lineno)
 	}
 
@@ -941,18 +1102,20 @@ impl DiffComponent {
 		}
 		if let Some(hunk_index) = hunk_index {
 			if self.is_delta_preview() {
-				// In delta mode, find the delta output line range for this hunk
+				// In delta mode, find the delta output line range for this hunk via binary search
 				let hunk_map = self.delta_line_hunks.borrow();
-				let delta_start = hunk_map
-					.iter()
-					.position(|&h| h == hunk_index)
-					.unwrap_or(0);
-				// Find end: next hunk's start or end of all lines
-				let delta_end = hunk_map
-					.iter()
-					.skip(delta_start)
-					.position(|&h| h > hunk_index)
-					.map_or(hunk_map.len(), |p| delta_start + p);
+				let start_pos =
+					hunk_map.partition_point(|&h| h < hunk_index);
+				let delta_start = if hunk_map.get(start_pos)
+					== Some(&hunk_index)
+				{
+					start_pos
+				} else {
+					0
+				};
+				let delta_end = hunk_map[delta_start..]
+					.partition_point(|&h| h <= hunk_index)
+					+ delta_start;
 				self.selection = Selection::Single(delta_start);
 				self.selected_hunk = Some(hunk_index);
 				self.vertical_scroll.move_area_to_visible(
@@ -961,11 +1124,11 @@ impl DiffComponent {
 					delta_end,
 				);
 			} else {
-				let line_index = diff
-					.hunks
-					.iter()
-					.take(hunk_index)
-					.fold(0, |sum, hunk| sum + hunk.lines.len());
+				let line_index = self
+					.hunk_offsets
+					.get(hunk_index)
+					.copied()
+					.unwrap_or(0);
 				let hunk = &diff.hunks[hunk_index];
 				self.selection = Selection::Single(line_index);
 				self.selected_hunk = Some(hunk_index);
@@ -983,14 +1146,18 @@ impl DiffComponent {
 		matches!(self.diff_mode, DiffMode::DeltaSideBySide)
 	}
 
-	/// Check if the `delta` binary is available on PATH
+	/// Check if the `delta` binary is available on PATH (cached per process)
 	pub(crate) fn is_delta_available() -> bool {
-		std::process::Command::new("delta")
-			.arg("--version")
-			.stdout(std::process::Stdio::null())
-			.stderr(std::process::Stdio::null())
-			.status()
-			.is_ok_and(|s| s.success())
+		static DELTA_AVAILABLE: std::sync::OnceLock<bool> =
+			std::sync::OnceLock::new();
+		*DELTA_AVAILABLE.get_or_init(|| {
+			std::process::Command::new("delta")
+				.arg("--version")
+				.stdout(std::process::Stdio::null())
+				.stderr(std::process::Stdio::null())
+				.status()
+				.is_ok_and(|s| s.success())
+		})
 	}
 
 	/// Request a delta render. On cache hit, applies the result
@@ -1170,60 +1337,6 @@ impl DiffComponent {
 		let scroll = self.vertical_scroll.get_top();
 		let cursor = self.selection.get_end().saturating_sub(scroll);
 		let sel_style = self.theme.text(true, true);
-		let txt: Vec<Line<'static>> = if display.is_empty() {
-			vec![Line::from(vec![Span::styled(
-				Cow::from("No delta output available."),
-				self.theme.text(false, false),
-			)])]
-		} else {
-			display
-				.iter()
-				.skip(scroll)
-				.take(usize::from(height))
-				.enumerate()
-				.map(|(i, line)| {
-					let mut line = {
-						let is_sbs = self.diff_mode
-							== DiffMode::DeltaSideBySide;
-						if is_sbs {
-							delta_pad_line_bg(
-								line.clone(),
-								panel_width,
-								true,
-								None,
-							)
-						} else {
-							// Already padded by rebuild_display_lines with dominant bg
-							line.clone()
-						}
-					};
-					if i == cursor {
-						for span in &mut line.spans {
-							span.style = sel_style;
-						}
-						// Pad to full width with selection style
-						let content_width: usize = line
-							.spans
-							.iter()
-							.map(|s| {
-								unicode_width::UnicodeWidthStr::width(
-									s.content.as_ref(),
-								)
-							})
-							.sum();
-						if content_width < panel_width {
-							let padding = " "
-								.repeat(panel_width - content_width);
-							line.spans.push(Span::styled(
-								Cow::Owned(padding),
-								sel_style,
-							));
-						}
-					}
-					line
-				})
-				.collect()
-		};
 
 		let block = Block::default()
 			.title(Span::styled(
@@ -1234,7 +1347,63 @@ impl DiffComponent {
 			.border_style(self.theme.block(self.focused()));
 		let inner = block.inner(r);
 		f.render_widget(block, r);
-		ui::render_lines(f.buffer_mut(), inner, &txt);
+
+		let buf = f.buffer_mut();
+		if display.is_empty() {
+			let empty_line = Line::from(vec![Span::styled(
+				Cow::from("No delta output available."),
+				self.theme.text(false, false),
+			)]);
+			ui::render_lines(buf, inner, std::iter::once(&empty_line));
+		} else if !inner.is_empty() {
+			for (i, line) in display
+				.iter()
+				.skip(scroll)
+				.take(usize::from(height))
+				.enumerate()
+			{
+				let Ok(row) = u16::try_from(i) else {
+					break;
+				};
+				let y = inner.top().saturating_add(row);
+				if y >= inner.bottom() {
+					break;
+				}
+				if i == cursor {
+					let mut cursor_line = line.clone();
+					for span in &mut cursor_line.spans {
+						span.style = sel_style;
+					}
+					let content_width: usize = cursor_line
+						.spans
+						.iter()
+						.map(|s| {
+							unicode_width::UnicodeWidthStr::width(
+								s.content.as_ref(),
+							)
+						})
+						.sum();
+					if content_width < panel_width {
+						cursor_line.spans.push(Span::styled(
+							Cow::Owned(
+								" ".repeat(
+									panel_width - content_width,
+								),
+							),
+							sel_style,
+						));
+					}
+					buf.set_line(
+						inner.left(),
+						y,
+						&cursor_line,
+						inner.width,
+					);
+				} else {
+					buf.set_line(inner.left(), y, line, inner.width);
+				}
+			}
+		}
 
 		if self.focused() {
 			self.vertical_scroll.draw(f, r, &self.theme);
@@ -1313,12 +1482,32 @@ impl DrawableComponent for DiffComponent {
 			format!(" (+{added} -{deleted})")
 		};
 
+		let file_pos_info = self
+			.file_position
+			.filter(|&(_, total)| total > 1 && self.focused())
+			.map_or_else(String::new, |(pos, total)| {
+				format!(" ({pos}/{total})")
+			});
+
+		let search_info = if self.search_matches.is_empty() {
+			String::new()
+		} else {
+			format!(
+				" [/{} {}/{}]",
+				self.search_query,
+				self.search_cursor + 1,
+				self.search_matches.len()
+			)
+		};
+
 		let title = format!(
-			"{}{}{}{}",
+			"{}{}{}{}{}{}",
 			strings::title_diff(&self.key_config),
 			self.current.path,
+			file_pos_info,
 			line_stats,
 			hunk_info,
+			search_info,
 		);
 
 		// Show "Loading..." only when we have no delta output at all
@@ -1455,6 +1644,11 @@ impl Component for DiffComponent {
 		out.push(CommandInfo::new(
 			strings::commands::copy(&self.key_config),
 			true,
+			self.focused(),
+		));
+		out.push(CommandInfo::new(
+			strings::commands::find_file(&self.key_config),
+			self.can_scroll(),
 			self.focused(),
 		));
 		out.push(
@@ -1628,6 +1822,27 @@ impl Component for DiffComponent {
 				) {
 					self.toggle_diff_mode();
 					Ok(EventState::Consumed)
+				} else if (key_match(
+					e,
+					self.key_config.keys.file_find,
+				) || (e.code == KeyCode::Char('/')
+					&& e.modifiers.is_empty()))
+					&& self.can_scroll()
+				{
+					self.start_search();
+					Ok(EventState::Consumed)
+				} else if !self.search_matches.is_empty()
+					&& e.code == KeyCode::Char('n')
+					&& e.modifiers == KeyModifiers::CONTROL
+				{
+					self.move_search_match(true);
+					Ok(EventState::Consumed)
+				} else if !self.search_matches.is_empty()
+					&& e.code == KeyCode::Char('p')
+					&& e.modifiers == KeyModifiers::CONTROL
+				{
+					self.move_search_match(false);
+					Ok(EventState::Consumed)
 				} else {
 					Ok(EventState::NotConsumed)
 				};
@@ -1647,6 +1862,7 @@ impl Component for DiffComponent {
 
 #[cfg(test)]
 mod tests {
+	use crate::components::async_delta::pad_line_bg as delta_pad_line_bg;
 	use super::*;
 	use crate::app::Environment;
 	use crate::components::async_delta::wrap_line as delta_wrap_line;

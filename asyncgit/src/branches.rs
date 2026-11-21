@@ -55,21 +55,25 @@ impl AsyncJob for AsyncBranchesJob {
 		&mut self,
 		_params: RunParams<Self::Notification, Self::Progress>,
 	) -> Result<Self::Notification> {
-		if let Ok(mut state) = self.state.lock() {
-			*state = state.take().map(|state| match state {
-				JobState::Request {
-					local_branches,
-					repo,
-				} => {
-					let branches =
-						get_branches_info(&repo, local_branches);
+		let state = self
+			.state
+			.lock()
+			.ok()
+			.and_then(|mut guard| guard.take());
+		let next_state = state.map(|state| match state {
+			JobState::Request {
+				local_branches,
+				repo,
+			} => {
+				let branches =
+					get_branches_info(&repo, local_branches);
 
-					JobState::Response(branches)
-				}
-				JobState::Response(result) => {
-					JobState::Response(result)
-				}
-			});
+				JobState::Response(branches)
+			}
+			JobState::Response(result) => JobState::Response(result),
+		});
+		if let Ok(mut guard) = self.state.lock() {
+			*guard = next_state;
 		}
 
 		Ok(AsyncGitNotification::Branches)

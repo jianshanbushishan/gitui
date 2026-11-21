@@ -10,7 +10,7 @@ use crate::{
 	queue::{InternalEvent, Queue, StackablePopupOpen},
 	string_utils::tabs_to_spaces,
 	strings,
-	ui::{self, style::SharedTheme, AsyncSyntaxJob, SyntaxText},
+	ui::{self, style::SharedTheme, AsyncSyntaxJob},
 	AsyncAppNotification, AsyncNotification, SyntaxHighlightProgress,
 };
 use anyhow::Result;
@@ -37,7 +37,7 @@ static MAX_AUTHOR_WIDTH: usize = 20;
 
 struct SyntaxFileBlame {
 	pub file_blame: FileBlame,
-	pub styled_text: Option<SyntaxText>,
+	pub styled_text: Option<Text<'static>>,
 }
 
 impl SyntaxFileBlame {
@@ -104,7 +104,6 @@ impl DrawableComponent for BlameFilePopup {
 		if self.is_visible() {
 			let title = self.get_title();
 
-			let rows = self.get_rows(area.width.into());
 			let author_width = get_author_width(area.width.into());
 			let constraints = [
 				// commit id
@@ -122,7 +121,30 @@ impl DrawableComponent for BlameFilePopup {
 				Constraint::Percentage(100),
 			];
 
-			let number_of_rows: usize = rows.len();
+			let number_of_rows: usize = self
+				.blame
+				.as_ref()
+				.and_then(|blame| blame.result())
+				.map_or(0, |b| b.lines().len());
+			let inner_height =
+				usize::from(area.height.saturating_sub(2));
+			let mut table_state = self.table_state.take();
+			let selected = table_state.selected();
+			let mut offset = table_state.offset();
+			if let Some(sel) = selected {
+				if sel < offset {
+					offset = sel;
+				} else if inner_height > 0
+					&& sel >= offset + inner_height
+				{
+					offset = sel + 1 - inner_height;
+				}
+			}
+			let end =
+				offset.saturating_add(inner_height).min(number_of_rows);
+			let rows =
+				self.get_rows_slice(area.width.into(), offset, end);
+
 			let syntax_highlight_progress = match self.blame {
 				Some(BlameProcess::SyntaxHighlighting {
 					ref job,
@@ -149,10 +171,13 @@ impl DrawableComponent for BlameFilePopup {
 						.border_style(self.theme.block(true)),
 				);
 
-			let mut table_state = self.table_state.take();
+			let mut visible_state = TableState::default();
+			visible_state
+				.select(selected.map(|sel| sel.saturating_sub(offset)));
 
 			f.render_widget(Clear, area);
-			f.render_stateful_widget(table, area, &mut table_state);
+			f.render_stateful_widget(table, area, &mut visible_state);
+			*table_state.offset_mut() = offset;
 
 			ui::draw_scrollbar(
 				f,
@@ -484,6 +509,15 @@ impl BlameFilePopup {
 	}
 
 	fn update_syntax(&mut self, ev: AsyncNotification) {
+		let AsyncNotification::App(
+			AsyncAppNotification::SyntaxHighlighting(
+				SyntaxHighlightProgress::Done,
+			),
+		) = ev
+		else {
+			return;
+		};
+
 		let Some(BlameProcess::SyntaxHighlighting {
 			ref unstyled_file_blame,
 			ref job,
@@ -492,33 +526,26 @@ impl BlameFilePopup {
 			return;
 		};
 
-		if let AsyncNotification::App(
-			AsyncAppNotification::SyntaxHighlighting(progress),
-		) = ev
-		{
-			match progress {
-				SyntaxHighlightProgress::Done => {
-					if let Some(job) = job.take_last() {
-						if let Some(syntax) = job.result() {
-							if syntax.path()
-								== Path::new(
-									unstyled_file_blame.path(),
-								) {
-								self.blame =
-									Some(BlameProcess::Result(
-										SyntaxFileBlame {
-											file_blame:
-												unstyled_file_blame
-													.file_blame
-													.clone(),
-											styled_text: Some(syntax),
-										},
-									));
-							}
-						}
+		if let Some(job) = job.take_last() {
+			if let Some(syntax) = job.result() {
+				if syntax.path()
+					== Path::new(unstyled_file_blame.path())
+				{
+					let styled_text = syntax.to_owned_text();
+					if let Some(BlameProcess::SyntaxHighlighting {
+						unstyled_file_blame,
+						..
+					}) = self.blame.take()
+					{
+						self.blame = Some(BlameProcess::Result(
+							SyntaxFileBlame {
+								file_blame: unstyled_file_blame
+									.file_blame,
+								styled_text: Some(styled_text),
+							},
+						));
 					}
 				}
-				SyntaxHighlightProgress::Progress => {}
 			}
 		}
 	}
@@ -555,26 +582,30 @@ impl BlameFilePopup {
 	}
 
 	///
-	fn get_rows(&self, width: usize) -> Vec<Row<'_>> {
+	fn get_rows_slice(
+		&self,
+		width: usize,
+		offset: usize,
+		end: usize,
+	) -> Vec<Row<'_>> {
 		self.blame
 			.as_ref()
 			.and_then(|blame| blame.result())
 			.map(|file_blame| {
-				let styled_text: Option<Text<'_>> = file_blame
-					.styled_text
-					.as_ref()
-					.map(std::convert::Into::into);
-				file_blame
-					.lines()
+				let lines = file_blame.lines();
+				let start = offset.min(lines.len());
+				let end = end.min(lines.len());
+				let styled_text = file_blame.styled_text.as_ref();
+				lines[start..end]
 					.iter()
 					.enumerate()
-					.map(|(i, (blame_hunk, line))| {
+					.map(|(rel_i, (blame_hunk, line))| {
 						self.get_line_blame(
 							width,
-							i,
+							start + rel_i,
 							(blame_hunk.as_ref(), line.as_ref()),
 							file_blame,
-							styled_text.as_ref(),
+							styled_text,
 						)
 					})
 					.collect()
@@ -595,12 +626,17 @@ impl BlameFilePopup {
 			return;
 		};
 
-		let raw_lines = unstyled_file_blame
-			.lines()
-			.iter()
-			.map(|l| l.1.clone())
-			.collect::<Vec<_>>();
-		let mut text = tabs_to_spaces(raw_lines.join("\n"));
+		let lines = unstyled_file_blame.lines();
+		let total_len: usize =
+			lines.iter().map(|l| l.1.len() + 1).sum();
+		let mut joined = String::with_capacity(total_len);
+		for (i, (_, line)) in lines.iter().enumerate() {
+			if i > 0 {
+				joined.push('\n');
+			}
+			joined.push_str(line);
+		}
+		let mut text = tabs_to_spaces(joined);
 		text.push('\n');
 
 		job.spawn(AsyncSyntaxJob::new(

@@ -317,6 +317,19 @@ impl CompareCommitsPopup {
 		self.diff.sync_diff_mode();
 	}
 
+	pub fn content_search_selected(
+		&mut self,
+		query: &str,
+		line: usize,
+		matching_lines: &[usize],
+	) {
+		self.diff.content_search_selected(
+			query,
+			line,
+			matching_lines,
+		);
+	}
+
 	fn update(&mut self) -> Result<()> {
 		self.details.set_commits(
 			self.get_ids().map(CommitFilesParams::from),

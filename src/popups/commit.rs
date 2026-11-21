@@ -42,21 +42,29 @@ use std::{
 		Arc, Mutex,
 	},
 	thread,
+	time::{Duration, Instant},
 };
+use unicode_width::UnicodeWidthStr;
 
 use super::ExternalEditorPopup;
 
-enum CommitResult {
-	CommitDone,
-	Aborted,
-}
-
+#[derive(Clone, Copy)]
 enum Mode {
 	Normal,
 	Amend(CommitId),
-	Merge(Vec<CommitId>),
+	Merge,
 	Revert,
 	Reword(CommitId),
+}
+
+enum CommitJobOutcome {
+	Committed {
+		raw_msg: String,
+		is_reword: bool,
+		post_hook_error: Option<String>,
+	},
+	HookRejected(String),
+	Error(String),
 }
 
 type AiGenerationResult = Result<(String, String)>;
@@ -67,10 +75,12 @@ struct AiGeneration {
 	result: AiGenerationResult,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 pub struct CommitPopup {
 	repo: RepoPathRef,
 	input: TextInputComponent,
 	mode: Mode,
+	merge_ids: Vec<CommitId>,
 	queue: Queue,
 	key_config: SharedKeyConfig,
 	git_branch_name: cached::BranchName,
@@ -79,14 +89,22 @@ pub struct CommitPopup {
 	commit_msg_history_idx: usize,
 	options: SharedOptions,
 	verify: bool,
+	staged_summary: Option<String>,
 	ai_sender: Sender<AsyncAppNotification>,
 	ai_result: Arc<Mutex<Option<AiGeneration>>>,
 	ai_generation: Arc<AtomicU64>,
 	ai_pending: bool,
+	ai_started: Option<Instant>,
+	ai_last_secs: u64,
+	ai_overwrite_armed: Option<Instant>,
+	commit_pending: bool,
+	commit_result: Arc<Mutex<Option<CommitJobOutcome>>>,
+	has_head: bool,
 }
 
 const FIRST_LINE_LIMIT: usize = 50;
 const AI_COMMIT_HISTORY_LENGTH: usize = 5;
+const AI_OVERWRITE_WINDOW: Duration = Duration::from_secs(5);
 
 impl CommitPopup {
 	///
@@ -94,6 +112,7 @@ impl CommitPopup {
 		Self {
 			queue: env.queue.clone(),
 			mode: Mode::Normal,
+			merge_ids: Vec::new(),
 			input: TextInputComponent::new(
 				env,
 				"",
@@ -110,20 +129,55 @@ impl CommitPopup {
 			commit_msg_history_idx: 0,
 			options: env.options.clone(),
 			verify: true,
+			staged_summary: None,
 			ai_sender: env.sender_app.clone(),
 			ai_result: Arc::new(Mutex::new(None)),
 			ai_generation: Arc::new(AtomicU64::new(0)),
 			ai_pending: false,
+			ai_started: None,
+			ai_last_secs: 0,
+			ai_overwrite_armed: None,
+			commit_pending: false,
+			commit_result: Arc::new(Mutex::new(None)),
+			has_head: false,
 		}
 	}
 
 	pub const fn any_work_pending(&self) -> bool {
-		self.ai_pending
+		self.ai_pending || self.commit_pending
+	}
+
+	pub fn set_staged_summary(&mut self, summary: Option<String>) {
+		self.staged_summary = summary;
+	}
+
+	/// Update the elapsed-seconds indicator in the popup title while AI
+	/// generation is running. Returns `true` when the displayed text changed.
+	pub fn update_ai_indicator(&mut self, now: Instant) -> bool {
+		if !self.ai_pending || !self.is_visible() {
+			return false;
+		}
+		let Some(started) = self.ai_started else {
+			return false;
+		};
+		let secs = now.saturating_duration_since(started).as_secs();
+		if secs == self.ai_last_secs {
+			return false;
+		}
+		self.ai_last_secs = secs;
+		self.input.set_title(format!(
+			"{} · Generating… {secs}s (Esc cancel)",
+			strings::commit_title()
+		));
+		true
 	}
 
 	fn invalidate_ai_generation(&mut self) {
 		self.ai_generation.fetch_add(1, Ordering::Relaxed);
 		self.ai_pending = false;
+		self.ai_started = None;
+		self.ai_last_secs = 0;
+		self.ai_overwrite_armed = None;
 		if let std::result::Result::Ok(mut result) =
 			self.ai_result.lock()
 		{
@@ -132,19 +186,33 @@ impl CommitPopup {
 	}
 
 	fn generate_commit_message(&mut self) -> Result<()> {
-		if !matches!(self.mode, Mode::Normal) || self.ai_pending {
+		if !matches!(self.mode, Mode::Normal)
+			|| self.ai_pending
+			|| self.commit_pending
+		{
 			return Ok(());
 		}
 		let initial_input = self.input.get_text().to_owned();
-		if !initial_input.trim().is_empty()
+		let has_user_draft = !initial_input.trim().is_empty()
 			&& self.commit_template.as_deref()
-				!= Some(initial_input.as_str())
-		{
-			self.queue.push(InternalEvent::ShowInfoMsg(
-				"Clear the current commit message before generating a new one."
-					.to_owned(),
-			));
-			return Ok(());
+				!= Some(initial_input.as_str());
+		if has_user_draft {
+			let armed = self.ai_overwrite_armed.is_some_and(|t| {
+				t.elapsed() <= AI_OVERWRITE_WINDOW
+			});
+			if !armed {
+				self.ai_overwrite_armed = Some(Instant::now());
+				let hint = self.key_config.get_hint(
+					self.key_config.keys.generate_commit_message,
+				);
+				self.queue.push(InternalEvent::ShowWarningToast(
+					format!(
+						"Press [{hint}] again to replace draft with AI"
+					),
+				));
+				return Ok(());
+			}
+			self.ai_overwrite_armed = None;
 		}
 		let command = self.options.borrow().ai_commit_command()?;
 		let repo = self.repo.borrow().clone();
@@ -195,14 +263,22 @@ impl CommitPopup {
 				}
 			})?;
 		self.ai_pending = true;
+		self.ai_started = Some(Instant::now());
+		self.ai_last_secs = 0;
 		self.input.set_title(format!(
-			"{} (generating...)",
+			"{} · Generating… (Esc cancel)",
 			strings::commit_title()
 		));
 		Ok(())
 	}
 
 	pub fn update_async(&mut self, ev: AsyncNotification) {
+		if ev
+			== AsyncNotification::App(AsyncAppNotification::CommitDone)
+		{
+			self.finish_async_commit();
+			return;
+		}
 		if ev
 			!= AsyncNotification::App(
 				AsyncAppNotification::AiCommitMessage,
@@ -221,6 +297,8 @@ impl CommitPopup {
 			return;
 		}
 		self.ai_pending = false;
+		self.ai_started = None;
+		self.ai_last_secs = 0;
 		if !self.is_visible() || !matches!(self.mode, Mode::Normal) {
 			return;
 		}
@@ -228,23 +306,30 @@ impl CommitPopup {
 		match finished.result {
 			std::result::Result::Ok((diff, message)) => {
 				if self.input.get_text() != finished.initial_input {
-					self.queue.push(InternalEvent::ShowInfoMsg(
-						"Commit message changed while AI was running; suggestion discarded."
+					self.queue.push(InternalEvent::ShowWarningToast(
+						"Commit draft edited while AI ran; suggestion discarded."
 							.to_owned(),
-						));
+					));
 					return;
 				}
 				match asyncgit::sync::diff::get_staged_diff_for_ai(
 					&self.repo.borrow(),
 				) {
-					std::result::Result::Ok(current) if current == diff => {
+					std::result::Result::Ok(current)
+						if current == diff =>
+					{
 						self.input.set_text(message);
 						self.persist_draft();
+						self.queue.push(InternalEvent::ShowToast(
+							"AI commit draft ready".to_owned(),
+						));
 					}
-					_ => self.queue.push(InternalEvent::ShowInfoMsg(
-						"Staged changes changed while AI was running; suggestion discarded."
-							.to_owned(),
-					)),
+					_ => self.queue.push(
+						InternalEvent::ShowWarningToast(
+							"Staged changes changed while AI ran; suggestion discarded."
+								.to_owned(),
+						),
+					),
 				}
 			}
 			Err(error) => {
@@ -255,9 +340,74 @@ impl CommitPopup {
 		}
 	}
 
+	fn finish_async_commit(&mut self) {
+		self.commit_pending = false;
+		let outcome = self
+			.commit_result
+			.lock()
+			.ok()
+			.and_then(|mut slot| slot.take());
+		let Some(outcome) = outcome else {
+			return;
+		};
+		match outcome {
+			CommitJobOutcome::Committed {
+				raw_msg,
+				is_reword,
+				post_hook_error,
+			} => {
+				self.options.borrow_mut().add_commit_msg(&raw_msg);
+				self.commit_msg_history_idx = 0;
+				self.hide();
+				if is_reword {
+					self.queue.push(InternalEvent::TabSwitchStatus);
+				}
+				self.queue
+					.push(InternalEvent::Update(NeedsUpdate::ALL));
+				self.queue.push(InternalEvent::StatusLastFileMoved);
+				self.input.clear();
+				self.options.borrow_mut().set_commit_draft(None);
+				if let Some(err) = post_hook_error {
+					self.queue.push(InternalEvent::ShowErrorMsg(
+						format!("post-commit hook error:\n{err}"),
+					));
+				} else {
+					self.queue.push(InternalEvent::ShowToast(
+						"Commit created".to_owned(),
+					));
+				}
+			}
+			CommitJobOutcome::HookRejected(err) => {
+				self.restore_mode_title();
+				self.queue.push(InternalEvent::ShowErrorMsg(err));
+			}
+			CommitJobOutcome::Error(err) => {
+				self.restore_mode_title();
+				self.queue.push(InternalEvent::ShowErrorMsg(format!(
+					"commit error:\n{err}"
+				)));
+			}
+		}
+	}
+
+	fn restore_mode_title(&mut self) {
+		let title = match self.mode {
+			Mode::Normal => strings::commit_title(),
+			Mode::Amend(_) => strings::commit_title_amend(),
+			Mode::Merge => strings::commit_title_merge(),
+			Mode::Revert => strings::commit_title_revert(),
+			Mode::Reword(_) => strings::commit_reword_title(),
+		};
+		self.input.set_title(title);
+	}
+
 	///
 	pub fn update(&mut self) {
 		self.git_branch_name.lookup().ok();
+		if self.is_visible() {
+			self.has_head =
+				sync::get_head(&self.repo.borrow()).is_ok();
+		}
 	}
 
 	/// Current text in the commit message input.
@@ -299,18 +449,38 @@ impl CommitPopup {
 		}
 	}
 
+	fn draw_staged_summary(&self, f: &mut Frame) {
+		let Some(summary) = &self.staged_summary else {
+			return;
+		};
+		let area = self.input.get_area();
+		if area.width < 12 || area.height < 3 {
+			return;
+		}
+		let rect = Rect::new(
+			area.x + 1,
+			area.y + area.height.saturating_sub(1),
+			area.width.saturating_sub(2),
+			1,
+		);
+		let w = Paragraph::new(format!("[{summary}]"))
+			.style(self.theme.text(false, false))
+			.alignment(Alignment::Left);
+		f.render_widget(w, rect);
+	}
+
 	fn draw_warnings(&self, f: &mut Frame) {
 		let first_line = self
 			.input
 			.get_text()
 			.lines()
 			.next()
-			.map(str::len)
+			.map(|line| line.chars().count())
 			.unwrap_or_default();
 
 		if first_line > FIRST_LINE_LIMIT {
 			let msg = strings::commit_first_line_warning(first_line);
-			let msg_length: u16 = msg.len().cast();
+			let msg_length: u16 = msg.width().cast();
 			let w =
 				Paragraph::new(msg).style(self.theme.text_danger());
 
@@ -394,107 +564,131 @@ impl CommitPopup {
 	}
 
 	fn commit(&mut self) -> Result<()> {
-		let msg = self.input.get_text().to_string();
-
-		if matches!(
-			self.commit_with_msg(msg)?,
-			CommitResult::CommitDone
-		) {
-			self.options
-				.borrow_mut()
-				.add_commit_msg(self.input.get_text());
-			self.commit_msg_history_idx = 0;
-
-			self.hide();
-			self.queue.push(InternalEvent::Update(NeedsUpdate::ALL));
-			self.queue.push(InternalEvent::StatusLastFileMoved);
-			self.input.clear();
-			self.options.borrow_mut().set_commit_draft(None);
+		if self.commit_pending {
+			return Ok(());
 		}
-
-		Ok(())
-	}
-
-	fn commit_with_msg(
-		&mut self,
-		msg: String,
-	) -> Result<CommitResult> {
-		// on exit verify should always be on
+		let raw_msg = self.input.get_text().to_string();
 		let verify = self.verify;
 		self.verify = true;
+		let mode = self.mode;
+		let merge_ids = self.merge_ids.clone();
+		let repo = self.repo.borrow().clone();
+		let result_slot = Arc::clone(&self.commit_result);
+		let sender = self.ai_sender.clone();
 
-		if verify {
-			// run pre commit hook - can reject commit
-			if let HookResult::NotOk(e) =
-				sync::hooks_pre_commit(&self.repo.borrow())?
-			{
-				log::error!("pre-commit hook error: {e}");
-				self.queue.push(InternalEvent::ShowErrorMsg(
-					format!("pre-commit hook error:\n{e}"),
-				));
-				return Ok(CommitResult::Aborted);
-			}
-		}
+		self.commit_pending = true;
+		self.input.set_title(format!(
+			"{} · Committing…",
+			strings::commit_title()
+		));
 
-		let mut msg =
-			commit_message_prettify(&self.repo.borrow(), msg)?;
+		thread::Builder::new()
+			.name("gitui-commit".to_owned())
+			.spawn(move || {
+				let outcome = Self::run_commit_job(
+					&repo,
+					mode,
+					&merge_ids,
+					verify,
+					raw_msg,
+				);
+				if let std::result::Result::Ok(mut slot) =
+					result_slot.lock()
+				{
+					*slot = Some(outcome);
+				}
+				let _ = sender.send(AsyncAppNotification::CommitDone);
+			})?;
 
-		if verify {
-			// run commit message check hook - can reject commit
-			if let HookResult::NotOk(e) =
-				sync::hooks_commit_msg(&self.repo.borrow(), &mut msg)?
-			{
-				log::error!("commit-msg hook error: {e}");
-				self.queue.push(InternalEvent::ShowErrorMsg(
-					format!("commit-msg hook error:\n{e}"),
-				));
-				return Ok(CommitResult::Aborted);
-			}
-		}
-		self.do_commit(&msg)?;
-
-		if let HookResult::NotOk(e) =
-			sync::hooks_post_commit(&self.repo.borrow())?
-		{
-			log::error!("post-commit hook error: {e}");
-			self.queue.push(InternalEvent::ShowErrorMsg(format!(
-				"post-commit hook error:\n{e}"
-			)));
-		}
-
-		Ok(CommitResult::CommitDone)
+		Ok(())
 	}
 
-	fn do_commit(&self, msg: &str) -> Result<()> {
-		match &self.mode {
-			Mode::Normal => sync::commit(&self.repo.borrow(), msg)?,
-			Mode::Amend(amend) => {
-				sync::amend(&self.repo.borrow(), *amend, msg)?
+	fn run_commit_job(
+		repo: &asyncgit::sync::RepoPath,
+		mode: Mode,
+		merge_ids: &[CommitId],
+		verify: bool,
+		raw_msg: String,
+	) -> CommitJobOutcome {
+		if verify {
+			match sync::hooks_pre_commit(repo) {
+				std::result::Result::Ok(HookResult::NotOk(e)) => {
+					log::error!("pre-commit hook error: {e}");
+					return CommitJobOutcome::HookRejected(format!(
+						"pre-commit hook error:\n{e}"
+					));
+				}
+				Err(e) => {
+					return CommitJobOutcome::Error(e.to_string());
+				}
+				std::result::Result::Ok(HookResult::Ok) => {}
 			}
-			Mode::Merge(ids) => {
-				sync::merge_commit(&self.repo.borrow(), msg, ids)?
+		}
+
+		let mut msg = match commit_message_prettify(repo, raw_msg.clone()) {
+			std::result::Result::Ok(m) => m,
+			Err(e) => return CommitJobOutcome::Error(e.to_string()),
+		};
+
+		if verify {
+			match sync::hooks_commit_msg(repo, &mut msg) {
+				std::result::Result::Ok(HookResult::NotOk(e)) => {
+					log::error!("commit-msg hook error: {e}");
+					return CommitJobOutcome::HookRejected(format!(
+						"commit-msg hook error:\n{e}"
+					));
+				}
+				Err(e) => {
+					return CommitJobOutcome::Error(e.to_string());
+				}
+				std::result::Result::Ok(HookResult::Ok) => {}
+			}
+		}
+
+		let commit_res = match mode {
+			Mode::Normal => sync::commit(repo, &msg).map(|_| false),
+			Mode::Amend(amend) => {
+				sync::amend(repo, amend, &msg).map(|_| false)
+			}
+			Mode::Merge => {
+				sync::merge_commit(repo, &msg, merge_ids).map(|_| false)
 			}
 			Mode::Revert => {
-				sync::commit_revert(&self.repo.borrow(), msg)?
+				sync::commit_revert(repo, &msg).map(|_| false)
 			}
 			Mode::Reword(id) => {
-				let commit =
-					sync::reword(&self.repo.borrow(), *id, msg)?;
-				self.queue.push(InternalEvent::TabSwitchStatus);
-
-				commit
+				sync::reword(repo, id, &msg).map(|_| true)
 			}
 		};
-		Ok(())
+
+		let is_reword = match commit_res {
+			std::result::Result::Ok(reword) => reword,
+			Err(e) => return CommitJobOutcome::Error(e.to_string()),
+		};
+
+		let post_hook_error = match sync::hooks_post_commit(repo) {
+			std::result::Result::Ok(HookResult::NotOk(e)) => {
+				log::error!("post-commit hook error: {e}");
+				Some(e)
+			}
+			Err(e) => Some(e.to_string()),
+			std::result::Result::Ok(HookResult::Ok) => None,
+		};
+
+		CommitJobOutcome::Committed {
+			raw_msg,
+			is_reword,
+			post_hook_error,
+		}
 	}
 
 	fn can_commit(&self) -> bool {
-		!self.is_empty() && self.is_changed()
+		!self.commit_pending && !self.is_empty() && self.is_changed()
 	}
 
 	fn can_amend(&self) -> bool {
 		matches!(self.mode, Mode::Normal)
-			&& sync::get_head(&self.repo.borrow()).is_ok()
+			&& self.has_head
 			&& (self.is_empty() || !self.is_changed())
 	}
 
@@ -574,6 +768,7 @@ impl CommitPopup {
 		}
 
 		self.mode = Mode::Normal;
+		self.has_head = sync::get_head(&self.repo.borrow()).is_ok();
 
 		let repo_state = sync::repo_state(&self.repo.borrow())?;
 
@@ -598,12 +793,13 @@ impl CommitPopup {
 				RepoState::Merge => {
 					let ids =
 						sync::mergehead_ids(&self.repo.borrow())?;
+					self.merge_ids = ids;
 					self.input
 						.set_title(strings::commit_title_merge());
 					self.input.set_text(sync::merge_msg(
 						&self.repo.borrow(),
 					)?);
-					(Mode::Merge(ids), PrepareCommitMsgSource::Merge)
+					(Mode::Merge, PrepareCommitMsgSource::Merge)
 				}
 				RepoState::Revert => {
 					self.input
@@ -732,6 +928,7 @@ impl DrawableComponent for CommitPopup {
 		if self.is_visible() {
 			self.input.draw(f, rect)?;
 			self.draw_branch_name(f);
+			self.draw_staged_summary(f);
 			self.draw_warnings(f);
 		}
 
@@ -890,7 +1087,7 @@ impl Component for CommitPopup {
 						false
 					};
 
-				if !input_consumed {
+				if !input_consumed && !self.commit_pending {
 					let was_visible = self.input.is_visible();
 					self.input.event(ev)?;
 					if was_visible && !self.input.is_visible() {

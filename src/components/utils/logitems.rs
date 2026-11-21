@@ -1,22 +1,23 @@
 use asyncgit::sync::{CommitId, CommitInfo};
 use chrono::{DateTime, Duration, Local, Utc};
 use indexmap::IndexSet;
-use std::{rc::Rc, slice::Iter};
+use std::{borrow::Cow, rc::Rc, slice::Iter};
 
 #[cfg(feature = "ghemoji")]
 use super::emoji::emojifi_string;
+use super::string_width_align;
 
 static SLICE_OFFSET_RELOAD_THRESHOLD: usize = 100;
+pub const AUTHOR_WIDTH: usize = 18;
 
 type BoxStr = Box<str>;
 
 pub struct LogEntry {
-	//TODO: cache string representation
 	pub time: DateTime<Local>,
-	//TODO: use tinyvec here
+	pub date_str: BoxStr,
 	pub author: BoxStr,
+	pub author_aligned: BoxStr,
 	pub msg: BoxStr,
-	//TODO: use tinyvec here
 	pub hash_short: BoxStr,
 	pub id: CommitId,
 	pub highlighted: bool,
@@ -40,7 +41,10 @@ impl From<CommitInfo> for LogEntry {
 			)
 		};
 
+		let date_str = time.format("%Y-%m-%d").to_string().into();
 		let author = c.author;
+		let author_aligned =
+			string_width_align(&author, AUTHOR_WIDTH).into();
 		let msg = c.message;
 
 		// Replace markdown emojis with Unicode equivalent
@@ -49,8 +53,10 @@ impl From<CommitInfo> for LogEntry {
 
 		Self {
 			author: author.into(),
+			author_aligned,
 			msg: msg.into(),
 			time,
+			date_str,
 			hash_short,
 			id: c.id,
 			highlighted: false,
@@ -59,7 +65,7 @@ impl From<CommitInfo> for LogEntry {
 }
 
 impl LogEntry {
-	pub fn time_to_string(&self, now: DateTime<Local>) -> String {
+	pub fn time_to_string(&self, now: DateTime<Local>) -> Cow<'_, str> {
 		let delta = now - self.time;
 		if delta < Duration::try_minutes(30).unwrap_or_default() {
 			let delta_str = if delta
@@ -69,11 +75,11 @@ impl LogEntry {
 			} else {
 				format!("{:0>2}m ago", delta.num_minutes())
 			};
-			format!("{delta_str: <10}")
+			Cow::Owned(format!("{delta_str: <10}"))
 		} else if self.time.date_naive() == now.date_naive() {
-			self.time.format("%T  ").to_string()
+			Cow::Owned(self.time.format("%T  ").to_string())
 		} else {
-			self.time.format("%Y-%m-%d").to_string()
+			Cow::Borrowed(&self.date_str)
 		}
 	}
 }

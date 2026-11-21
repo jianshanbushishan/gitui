@@ -52,14 +52,15 @@ pub fn string_width_align(s: &str, width: usize) -> String {
 	let len = UnicodeWidthStr::width(s);
 	let width_wo_postfix = width.saturating_sub(POSTFIX.len());
 
-	if (len >= width_wo_postfix && len <= width)
-		|| (len <= width_wo_postfix)
-	{
+	if len <= width {
 		format!("{s:width$}")
 	} else {
-		let mut s = s.to_string();
-		s.truncate(find_truncate_point(&s, width_wo_postfix));
-		format!("{s}{POSTFIX}")
+		let cut = find_truncate_point(s, width_wo_postfix);
+		let prefix = &s[..cut];
+		let mut out = String::with_capacity(prefix.len() + POSTFIX.len());
+		out.push_str(prefix);
+		out.push_str(POSTFIX);
+		out
 	}
 }
 

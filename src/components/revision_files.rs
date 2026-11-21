@@ -57,6 +57,7 @@ pub struct RevisionFilesComponent {
 	theme: SharedTheme,
 	//TODO: store TreeFiles in `tree`
 	files: Option<Vec<TreeFile>>,
+	file_index: std::collections::HashMap<PathBuf, usize>,
 	load_state: TreeLoadState,
 	async_treefiles: AsyncSingleJob<AsyncTreeFilesJob>,
 	current_file: SyntaxTextComponent,
@@ -85,6 +86,7 @@ impl RevisionFilesComponent {
 			current_file: SyntaxTextComponent::new(env),
 			theme: env.theme.clone(),
 			files: None,
+			file_index: std::collections::HashMap::new(),
 			load_state: TreeLoadState::Loading,
 			async_treefiles: AsyncSingleJob::new(
 				env.sender_git.clone(),
@@ -114,6 +116,7 @@ impl RevisionFilesComponent {
 
 		if !same_id {
 			self.files = None;
+			self.file_index.clear();
 			self.tree = FileTree::default();
 			self.current_file.clear();
 			self.revision = None;
@@ -142,6 +145,7 @@ impl RevisionFilesComponent {
 		self.revision = None;
 		self.requested_commit = None;
 		self.files = None;
+		self.file_index.clear();
 		self.tree = FileTree::default();
 		self.current_file.clear();
 		self.load_state = TreeLoadState::NoCommits;
@@ -152,6 +156,7 @@ impl RevisionFilesComponent {
 		self.revision = None;
 		self.requested_commit = None;
 		self.files = None;
+		self.file_index.clear();
 		self.tree = FileTree::default();
 		self.current_file.clear();
 		self.load_state = TreeLoadState::Failed(format!(
@@ -229,6 +234,11 @@ impl RevisionFilesComponent {
 
 		match result {
 			Ok((tree, files)) => {
+				self.file_index = files
+					.iter()
+					.enumerate()
+					.map(|(idx, f)| (f.path.clone(), idx))
+					.collect();
 				self.tree = tree;
 				self.files = Some(files);
 				self.load_state = TreeLoadState::Ready;
@@ -238,6 +248,7 @@ impl RevisionFilesComponent {
 			}
 			Err(error) => {
 				self.files = None;
+				self.file_index.clear();
 				self.tree = FileTree::default();
 				self.current_file.clear();
 				self.load_state = TreeLoadState::Failed(format!(
@@ -405,28 +416,35 @@ impl RevisionFilesComponent {
 		}
 	}
 
+	fn lookup_tree_file(&self, path: &Path) -> Option<&TreeFile> {
+		let files = self.files.as_ref()?;
+		if let Some(&idx) = self.file_index.get(path) {
+			return files.get(idx);
+		}
+		files.iter().find(|f| f.path == path)
+	}
+
 	fn read_selected_file_content(&self) -> Option<String> {
 		self.tree.selected_file()?;
 
 		let file = self.selected_file_path_with_prefix()?;
 		let path = Path::new(&file);
-		let files = self.files.as_ref()?;
-		let tree_file = files.iter().find(|f| f.path == path)?;
+		let tree_file = self.lookup_tree_file(path)?;
 		tree_file_content(&self.repo.borrow(), tree_file).ok()
 	}
 
 	fn selection_changed(&mut self) {
 		//TODO: retrieve TreeFile from tree datastructure
 		if let Some(file) = self.selected_file_path_with_prefix() {
-			if let Some(files) = &self.files {
+			if self.files.is_some() {
 				let path = Path::new(&file);
 				if let Some(item) =
-					files.iter().find(|f| f.path == path)
+					self.lookup_tree_file(path).cloned()
 				{
 					if let Ok(path) = path.strip_prefix("./") {
 						return self.current_file.load_file(
 							path.to_string_lossy().to_string(),
-							item,
+							&item,
 						);
 					}
 				}
@@ -722,6 +740,7 @@ impl Component for RevisionFilesComponent {
 		CommandBlocking::PassingOn
 	}
 
+	#[allow(clippy::too_many_lines)]
 	fn event(
 		&mut self,
 		event: &crossterm::event::Event,
@@ -732,6 +751,35 @@ impl Component for RevisionFilesComponent {
 
 		if !self.is_visible() {
 			return Ok(EventState::NotConsumed);
+		}
+
+		if let Event::Mouse(mouse) = event {
+			match mouse.kind {
+				crossterm::event::MouseEventKind::ScrollDown
+				| crossterm::event::MouseEventKind::ScrollUp => {
+					let down = matches!(
+						mouse.kind,
+						crossterm::event::MouseEventKind::ScrollDown
+					);
+					match self.focus {
+						Focus::Tree => {
+							let dir = if down {
+								filetreelist::MoveSelection::Down
+							} else {
+								filetreelist::MoveSelection::Up
+							};
+							if self.tree.move_selection(dir) {
+								self.selection_changed();
+							}
+						}
+						Focus::File => {
+							self.current_file.scroll_mouse(down);
+						}
+					}
+					return Ok(EventState::Consumed);
+				}
+				_ => {}
+			}
 		}
 
 		if let Event::Key(key) = event {

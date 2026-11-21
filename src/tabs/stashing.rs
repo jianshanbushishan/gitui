@@ -233,7 +233,6 @@ impl Component for Stashing {
 				) {
 					self.options.keep_index =
 						!self.options.keep_index;
-					self.update()?;
 					Ok(EventState::Consumed)
 				} else if key_match(
 					k,
@@ -241,7 +240,6 @@ impl Component for Stashing {
 				) {
 					self.options.stash_untracked =
 						!self.options.stash_untracked;
-					self.update()?;
 					Ok(EventState::Consumed)
 				} else {
 					Ok(EventState::NotConsumed)

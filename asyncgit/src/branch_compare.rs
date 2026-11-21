@@ -56,8 +56,8 @@ impl AsyncJob for AsyncBranchCompareJob {
 		&mut self,
 		_params: RunParams<Self::Notification, Self::Progress>,
 	) -> Result<Self::Notification> {
-		let mut state = self.state.lock()?;
-		*state = state.take().map(|state| match state {
+		let state = self.state.lock()?.take();
+		let next_state = state.map(|state| match state {
 			JobState::Request { repo, branch } => {
 				let result =
 					sync::branch_compare_upstream(&repo, &branch);
@@ -67,6 +67,7 @@ impl AsyncJob for AsyncBranchCompareJob {
 				JobState::Response { branch, result }
 			}
 		});
+		*self.state.lock()? = next_state;
 		Ok(AsyncGitNotification::BranchCompare)
 	}
 }

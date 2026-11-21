@@ -367,9 +367,11 @@ impl StatusScanner {
 		}
 		let mut environment: Vec<_> = std::env::vars_os()
 			.filter(|(name, _)| {
-				name.to_string_lossy()
-					.to_ascii_uppercase()
-					.starts_with("GIT_")
+				name.as_encoded_bytes()
+					.get(..4)
+					.is_some_and(|prefix| {
+						prefix.eq_ignore_ascii_case(b"GIT_")
+					})
 			})
 			.collect();
 		environment.sort();

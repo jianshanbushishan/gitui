@@ -8,7 +8,6 @@ use ratatui::{
 	widgets::Paragraph,
 	Frame,
 };
-use std::borrow::Cow;
 use unicode_width::UnicodeWidthStr;
 
 enum DrawListEntry {
@@ -24,6 +23,10 @@ struct Command {
 /// helper to be used while drawing
 pub struct CommandBar {
 	draw_list: Vec<DrawListEntry>,
+	rendered_lines: Vec<Line<'static>>,
+	more_width: u16,
+	more_line: Line<'static>,
+	less_line: Line<'static>,
 	cmd_infos: Vec<CommandInfo>,
 	theme: SharedTheme,
 	key_config: SharedKeyConfig,
@@ -33,15 +36,30 @@ pub struct CommandBar {
 	expanded: bool,
 }
 
-const MORE_WIDTH: u16 = 9;
-
 impl CommandBar {
-	pub const fn new(
+	pub fn new(
 		theme: SharedTheme,
 		key_config: SharedKeyConfig,
 	) -> Self {
+		let hint =
+			key_config.get_hint(key_config.keys.cmd_bar_toggle);
+		let more_str = format!("more [{hint}]");
+		let less_str = format!("less [{hint}]");
+		let more_width = u16::try_from(
+			more_str.width().max(less_str.width()).saturating_add(1),
+		)
+		.unwrap_or(9);
+		let more_line =
+			Self::build_styled_line(&theme, &more_str);
+		let less_line =
+			Self::build_styled_line(&theme, &less_str);
+
 		Self {
 			draw_list: Vec::new(),
+			rendered_lines: Vec::new(),
+			more_width,
+			more_line,
+			less_line,
 			cmd_infos: Vec::new(),
 			theme,
 			key_config,
@@ -50,6 +68,30 @@ impl CommandBar {
 			expandable: false,
 			expanded: false,
 		}
+	}
+
+	fn build_styled_line(theme: &SharedTheme, txt: &str) -> Line<'static> {
+		if let Some(bracket_idx) = txt.rfind('[') {
+			if txt.ends_with(']') {
+				let (label, key_part) = txt.split_at(bracket_idx);
+				let mut spans = Vec::with_capacity(2);
+				if !label.is_empty() {
+					spans.push(Span::styled(
+						label.to_owned(),
+						theme.commandbar_label(),
+					));
+				}
+				spans.push(Span::styled(
+					key_part.to_owned(),
+					theme.commandbar_key(),
+				));
+				return Line::from(spans);
+			}
+		}
+		Line::from(vec![Span::styled(
+			txt.to_owned(),
+			theme.commandbar_label(),
+		)])
 	}
 
 	pub fn refresh_width(&mut self, width: u16) {
@@ -78,8 +120,9 @@ impl CommandBar {
 	fn refresh_list(&mut self, width: u16) {
 		self.draw_list.clear();
 
+		let more_width = self.more_width;
 		let width = if self.is_multiline(width) {
-			width.saturating_sub(MORE_WIDTH)
+			width.saturating_sub(more_width)
 		} else {
 			width
 		};
@@ -107,24 +150,80 @@ impl CommandBar {
 		}
 
 		self.expandable = lines > 1;
-
 		self.lines = lines;
+		self.rebuild_rendered_lines();
+	}
+
+	fn rebuild_rendered_lines(&mut self) {
+		self.rendered_lines.clear();
+		let splitter = Span::raw(strings::cmd_splitter(&self.key_config));
+		let label_style = self.theme.commandbar_label();
+		let key_style = self.theme.commandbar_key();
+
+		for c_arr in self
+			.draw_list
+			.split(|c| matches!(c, DrawListEntry::LineBreak))
+		{
+			let mut spans: Vec<Span<'static>> = Vec::new();
+			for c in c_arr {
+				match c {
+					DrawListEntry::Command(c) => {
+						let txt = c.txt.as_str();
+						if let Some(bracket_idx) = txt.rfind('[') {
+							if txt.ends_with(']') {
+								let (label, key_part) =
+									txt.split_at(bracket_idx);
+								if !label.is_empty() {
+									spans.push(Span::styled(
+										label.to_owned(),
+										label_style,
+									));
+								}
+								spans.push(Span::styled(
+									key_part.to_owned(),
+									key_style,
+								));
+								continue;
+							}
+						}
+						spans.push(Span::styled(
+							txt.to_owned(),
+							label_style,
+						));
+					}
+					DrawListEntry::LineBreak => {}
+					DrawListEntry::Splitter => {
+						spans.push(splitter.clone());
+					}
+				}
+			}
+			self.rendered_lines.push(Line::from(spans));
+		}
 	}
 
 	pub fn set_cmds(&mut self, cmds: Vec<CommandInfo>) {
-		self.cmd_infos = cmds
+		let mut filtered = cmds
 			.into_iter()
 			.filter(CommandInfo::show_in_quickbar)
 			.collect::<Vec<_>>();
-		self.cmd_infos.sort_by_key(|e| e.order);
+		filtered.sort_by_key(|e| e.order);
 		// deduplicate by visible label, keeping the first (lowest
 		// order) occurrence so distinct components can't push the
-		// same shortcut twice (e.g. two "Close [esc]"). Uses a set
-		// rather than `dedup_by` because equal-order entries are not
-		// guaranteed to be adjacent after the sort.
+		// same shortcut twice (e.g. two "Close [esc]").
 		let mut seen: std::collections::HashSet<String> =
-			std::collections::HashSet::new();
-		self.cmd_infos.retain(|e| seen.insert(e.text.name.clone()));
+			std::collections::HashSet::with_capacity(filtered.len());
+		filtered.retain(|e| seen.insert(e.text.name.clone()));
+
+		let unchanged = self.cmd_infos.len() == filtered.len()
+			&& self
+				.cmd_infos
+				.iter()
+				.zip(filtered.iter())
+				.all(|(a, b)| a.text.name == b.text.name);
+		if unchanged {
+			return;
+		}
+		self.cmd_infos = filtered;
 		self.refresh_list(self.width);
 	}
 
@@ -143,62 +242,32 @@ impl CommandBar {
 	}
 
 	pub fn draw(&self, f: &mut Frame, r: Rect) {
-		if r.width < MORE_WIDTH {
+		let more_width = self.more_width;
+		if r.width < more_width {
 			return;
 		}
-		let splitter = Span::raw(Cow::from(strings::cmd_splitter(
-			&self.key_config,
-		)));
-
-		let texts = self
-			.draw_list
-			.split(|c| matches!(c, DrawListEntry::LineBreak))
-			.map(|c_arr| {
-				Line::from(
-					c_arr
-						.iter()
-						.map(|c| match c {
-							DrawListEntry::Command(c) => {
-								Span::styled(
-									Cow::from(c.txt.as_str()),
-									self.theme.commandbar(),
-								)
-							}
-							DrawListEntry::LineBreak => {
-								// Doesn't exist in split array
-								Span::raw("")
-							}
-							DrawListEntry::Splitter => {
-								splitter.clone()
-							}
-						})
-						.collect::<Vec<Span>>(),
-				)
-			})
-			.collect::<Vec<Line>>();
 
 		f.render_widget(
-			Paragraph::new(texts).alignment(Alignment::Left),
+			Paragraph::new(self.rendered_lines.clone())
+				.alignment(Alignment::Left),
 			r,
 		);
 
 		if self.expandable {
 			let r = Rect::new(
-				r.width.saturating_sub(MORE_WIDTH),
+				r.width.saturating_sub(more_width),
 				r.y + r.height.saturating_sub(1),
-				MORE_WIDTH.min(r.width),
+				more_width.min(r.width),
 				1.min(r.height),
 			);
 
+			let line = if self.expanded {
+				self.less_line.clone()
+			} else {
+				self.more_line.clone()
+			};
 			f.render_widget(
-				Paragraph::new(Line::from(vec![Span::raw(
-					Cow::from(if self.expanded {
-						"less [.]"
-					} else {
-						"more [.]"
-					}),
-				)]))
-				.alignment(Alignment::Right),
+				Paragraph::new(line).alignment(Alignment::Right),
 				r,
 			);
 		}

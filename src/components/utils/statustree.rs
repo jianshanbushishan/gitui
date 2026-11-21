@@ -143,15 +143,12 @@ impl StatusTree {
 				}
 				MoveSelection::Home => SelectionChange::new(0, false),
 				MoveSelection::End => self.selection_end(),
-				MoveSelection::PageUp => self.selection_page_updown(
-					selection,
-					(0..=selection).rev(),
-				),
-				MoveSelection::PageDown => self
-					.selection_page_updown(
-						selection,
-						selection..(self.tree.len()),
-					),
+				MoveSelection::PageUp => {
+					self.selection_page_updown(selection, true)
+				}
+				MoveSelection::PageDown => {
+					self.selection_page_updown(selection, false)
+				}
 			};
 
 			let changed_index =
@@ -166,6 +163,11 @@ impl StatusTree {
 	///
 	pub fn selected_item(&self) -> Option<FileTreeItem> {
 		self.selection.map(|i| self.tree[i].clone())
+	}
+
+	///
+	pub fn selected_item_ref(&self) -> Option<&FileTreeItem> {
+		self.selection.map(|i| &self.tree[i])
 	}
 
 	///
@@ -211,31 +213,14 @@ impl StatusTree {
 		current_index: usize,
 		up: bool,
 	) -> SelectionChange {
-		let mut current_index_in_available_selections;
-		let mut cur_index_find = current_index;
-		if self.available_selections.is_empty() {
-			// Go to top
-			current_index_in_available_selections = 0;
-		} else {
-			loop {
-				if let Some(pos) = self
-					.available_selections
-					.iter()
-					.position(|i| *i == cur_index_find)
-				{
-					current_index_in_available_selections = pos;
-					break;
-				}
-
-				// Find the closest to the index, usually this shouldn't happen
-				if current_index == 0 {
-					// This should never happen
-					current_index_in_available_selections = 0;
-					break;
-				}
-				cur_index_find -= 1;
-			}
-		}
+		let mut current_index_in_available_selections =
+			if self.available_selections.is_empty() {
+				0
+			} else {
+				self.available_selections
+					.partition_point(|&i| i <= current_index)
+					.saturating_sub(1)
+			};
 
 		let mut new_index;
 
@@ -294,18 +279,37 @@ impl StatusTree {
 	fn selection_page_updown(
 		&self,
 		current_index: usize,
-		range: impl Iterator<Item = usize>,
+		up: bool,
 	) -> SelectionChange {
 		let page_size = self.window_height.get().unwrap_or(0);
+		if page_size == 0 || self.available_selections.is_empty() {
+			return SelectionChange::new(current_index, false);
+		}
 
-		let new_index = range
-			.filter(|index| {
-				self.available_selections.contains(index)
-					&& self.is_visible_index(*index)
-			})
-			.take(page_size)
-			.last()
-			.unwrap_or(current_index);
+		let new_index = if up {
+			let end = self
+				.available_selections
+				.partition_point(|&i| i <= current_index);
+			self.available_selections[..end]
+				.iter()
+				.rev()
+				.copied()
+				.filter(|&idx| self.is_visible_index(idx))
+				.take(page_size)
+				.last()
+				.unwrap_or(current_index)
+		} else {
+			let start = self
+				.available_selections
+				.partition_point(|&i| i < current_index);
+			self.available_selections[start..]
+				.iter()
+				.copied()
+				.filter(|&idx| self.is_visible_index(idx))
+				.take(page_size)
+				.last()
+				.unwrap_or(current_index)
+		};
 
 		SelectionChange::new(new_index, false)
 	}
@@ -355,7 +359,7 @@ impl StatusTree {
 		{
 			let mut cur_parent =
 				self.tree.find_parent_index(current_selection);
-			while !self.available_selections.contains(&cur_parent)
+			while self.available_selections.binary_search(&cur_parent).is_err()
 				&& cur_parent != 0
 			{
 				cur_parent = self.tree.find_parent_index(cur_parent);

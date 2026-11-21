@@ -48,14 +48,13 @@ impl AsyncProgress for PushTagsProgress {
 }
 
 /// lists the remotes tags
-fn remote_tag_refs(
-	repo_path: &RepoPath,
+fn remote_tag_refs_in_repo(
+	repo: &git2::Repository,
 	remote: &str,
 	basic_credential: Option<BasicAuthCredential>,
 ) -> Result<Vec<String>> {
 	scope_time!("remote_tags");
 
-	let repo = repo(repo_path)?;
 	let mut remote = repo.find_remote(remote)?;
 	let callbacks = Callbacks::new(None, basic_credential);
 	let conn = remote.connect_auth(
@@ -67,13 +66,51 @@ fn remote_tag_refs(
 	let remote_heads = conn.list()?;
 	let remote_tags = remote_heads
 		.iter()
-		.map(|s| s.name().to_string())
-		.filter(|name| {
-			name.starts_with("refs/tags/") && !name.ends_with("^{}")
+		.filter_map(|s| {
+			let name = s.name();
+			(name.starts_with("refs/tags/")
+				&& !name.ends_with("^{}"))
+			.then(|| name.to_string())
 		})
 		.collect::<Vec<_>>();
 
 	Ok(remote_tags)
+}
+
+#[cfg(test)]
+fn remote_tag_refs(
+	repo_path: &RepoPath,
+	remote: &str,
+	basic_credential: Option<BasicAuthCredential>,
+) -> Result<Vec<String>> {
+	let repo = repo(repo_path)?;
+	remote_tag_refs_in_repo(&repo, remote, basic_credential)
+}
+
+fn tags_missing_remote_in_repo(
+	repo: &git2::Repository,
+	remote: &str,
+	basic_credential: Option<BasicAuthCredential>,
+) -> Result<Vec<String>> {
+	let tags = repo.tag_names(None)?;
+
+	let mut local_tags = tags
+		.iter()
+		.filter_map(|tag| {
+			tag.ok().flatten().map(|tag| format!("refs/tags/{tag}"))
+		})
+		.collect::<HashSet<_>>();
+	if local_tags.is_empty() {
+		return Ok(Vec::new());
+	}
+	let remote_tags =
+		remote_tag_refs_in_repo(repo, remote, basic_credential)?;
+
+	for t in remote_tags {
+		local_tags.remove(&t);
+	}
+
+	Ok(local_tags.into_iter().collect())
 }
 
 /// lists the remotes tags missing
@@ -85,22 +122,7 @@ pub fn tags_missing_remote(
 	scope_time!("tags_missing_remote");
 
 	let repo = repo(repo_path)?;
-	let tags = repo.tag_names(None)?;
-
-	let mut local_tags = tags
-		.iter()
-		.filter_map(|tag| {
-			tag.ok().flatten().map(|tag| format!("refs/tags/{tag}"))
-		})
-		.collect::<HashSet<_>>();
-	let remote_tags =
-		remote_tag_refs(repo_path, remote, basic_credential)?;
-
-	for t in remote_tags {
-		local_tags.remove(&t);
-	}
-
-	Ok(local_tags.into_iter().collect())
+	tags_missing_remote_in_repo(&repo, remote, basic_credential)
 }
 
 ///
@@ -131,12 +153,12 @@ pub fn push_tags_with_hook(
 	if let Some(sender) = &progress_sender {
 		let _ = sender.send(PushTagsProgress::CheckRemote);
 	}
-	let tags_missing = tags_missing_remote(
-		repo_path,
+	let repo = repo(repo_path)?;
+	let tags_missing = tags_missing_remote_in_repo(
+		&repo,
 		remote,
 		basic_credential.clone(),
 	)?;
-	let repo = repo(repo_path)?;
 	let configured_remote = repo.find_remote(remote)?;
 	let url = configured_remote
 		.pushurl()?

@@ -18,6 +18,7 @@ pub struct WordWrapper<'a, 'b> {
 	max_line_width: u16,
 	current_line: Vec<StyledGrapheme<'a>>,
 	next_line: Vec<StyledGrapheme<'a>>,
+	next_line_width: u16,
 	/// Removes the leading whitespace from lines
 	trim: bool,
 }
@@ -33,6 +34,7 @@ impl<'a, 'b> WordWrapper<'a, 'b> {
 			max_line_width,
 			current_line: vec![],
 			next_line: vec![],
+			next_line_width: 0,
 			trim,
 		}
 	}
@@ -46,13 +48,8 @@ impl<'a> LineComposer<'a> for WordWrapper<'a, '_> {
 		std::mem::swap(&mut self.current_line, &mut self.next_line);
 		self.next_line.clear();
 
-		let mut current_line_width = self
-			.current_line
-			.iter()
-			.map(|StyledGrapheme { symbol, .. }| -> u16 {
-				symbol.width().cast()
-			})
-			.sum();
+		let mut current_line_width = self.next_line_width;
+		self.next_line_width = 0;
 
 		let mut symbols_to_last_word_end: usize = 0;
 		let mut width_to_last_word_end: u16 = 0;
@@ -63,9 +60,10 @@ impl<'a> LineComposer<'a> for WordWrapper<'a, '_> {
 			let symbol_whitespace =
 				symbol.chars().all(&char::is_whitespace)
 					&& symbol != NBSP;
+			let sym_w: u16 = symbol.width().cast();
 
 			// Ignore characters wider that the total max width.
-			if Cast::<u16>::cast(symbol.width()) > self.max_line_width
+			if sym_w > self.max_line_width
                 // Skip leading whitespace when trim is enabled.
                 || self.trim && symbol_whitespace && symbol != "\n" && current_line_width == 0
 			{
@@ -89,7 +87,7 @@ impl<'a> LineComposer<'a> for WordWrapper<'a, '_> {
 			}
 
 			self.current_line.push(StyledGrapheme { symbol, style });
-			current_line_width += Cast::<u16>::cast(symbol.width());
+			current_line_width += sym_w;
 
 			if current_line_width > self.max_line_width {
 				// If there was no word break in the text, wrap at the end of the line.
@@ -117,9 +115,14 @@ impl<'a> LineComposer<'a> for WordWrapper<'a, '_> {
 									.all(&char::is_whitespace)
 							},
 						) {
-						self.next_line.extend_from_slice(
-							&remainder[remainder_nonwhite..],
-						);
+						let tail = &remainder[remainder_nonwhite..];
+						self.next_line.extend_from_slice(tail);
+						self.next_line_width = tail
+							.iter()
+							.map(|StyledGrapheme { symbol, .. }| -> u16 {
+								symbol.width().cast()
+							})
+							.sum();
 					}
 				}
 				self.current_line.truncate(truncate_at);
@@ -183,10 +186,11 @@ impl<'a> LineComposer<'a> for LineTruncator<'a, '_> {
 		let mut horizontal_offset = self.horizontal_offset as usize;
 		for StyledGrapheme { symbol, style } in &mut self.symbols {
 			symbols_exhausted = false;
+			let sym_w = symbol.width();
+			let sym_w_u16: u16 = sym_w.cast();
 
 			// Ignore characters wider that the total max width.
-			if Cast::<u16>::cast(symbol.width()) > self.max_line_width
-			{
+			if sym_w_u16 > self.max_line_width {
 				continue;
 			}
 
@@ -195,28 +199,23 @@ impl<'a> LineComposer<'a> for LineTruncator<'a, '_> {
 				break;
 			}
 
-			if current_line_width + Cast::<u16>::cast(symbol.width())
-				> self.max_line_width
-			{
+			if current_line_width + sym_w_u16 > self.max_line_width {
 				// Exhaust the remainder of the line.
 				skip_rest = true;
 				break;
 			}
 
-			let symbol = if horizontal_offset == 0 {
-				symbol
+			let (symbol, out_w) = if horizontal_offset == 0 {
+				(symbol, sym_w_u16)
+			} else if sym_w > horizontal_offset {
+				let t = trim_offset(symbol, horizontal_offset);
+				horizontal_offset = 0;
+				(t, t.width().cast())
 			} else {
-				let w = symbol.width();
-				if w > horizontal_offset {
-					let t = trim_offset(symbol, horizontal_offset);
-					horizontal_offset = 0;
-					t
-				} else {
-					horizontal_offset -= w;
-					""
-				}
+				horizontal_offset -= sym_w;
+				("", 0)
 			};
-			current_line_width += Cast::<u16>::cast(symbol.width());
+			current_line_width += out_w;
 			self.current_line.push(StyledGrapheme { symbol, style });
 		}
 

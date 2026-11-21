@@ -9,11 +9,19 @@ use crate::{
 	strings, ui,
 };
 use anyhow::Result;
-use crossterm::event::Event;
-use ratatui::{layout::Rect, text::Text, widgets::Clear, Frame};
-use std::borrow::Cow;
+use crossterm::event::{Event, KeyCode, KeyModifiers};
+use ratatui::{
+	layout::Rect,
+	text::{Line, Span},
+	widgets::{Block, BorderType, Borders, Padding},
+	Frame,
+};
+#[cfg(test)]
+use ratatui::text::Text;
 use ui::style::SharedTheme;
+use unicode_width::UnicodeWidthStr;
 
+#[cfg(test)]
 use super::render_popup;
 
 ///
@@ -25,35 +33,113 @@ pub struct ConfirmPopup {
 	key_config: SharedKeyConfig,
 }
 
+impl ConfirmPopup {
+	const fn is_destructive(action: &Action) -> bool {
+		matches!(
+			action,
+			Action::Reset(_)
+				| Action::ResetAll
+				| Action::ResetHunk(_, _)
+				| Action::ResetLines(_, _)
+				| Action::StashDrop(_)
+				| Action::DeleteLocalBranch(_)
+				| Action::DeleteRemoteBranch(_)
+				| Action::DeleteTag(_)
+				| Action::DeleteRemoteTag(_, _)
+				| Action::DeleteRemote(_)
+				| Action::ForcePush(_, true)
+				| Action::AbortMerge
+				| Action::AbortRebase
+				| Action::AbortRevert
+				| Action::UndoCommit
+		)
+	}
+
+	fn footer_hint(&self) -> String {
+		format!(
+			"[{} / y] Confirm   [{} / n] Cancel",
+			self.key_config.get_hint(self.key_config.keys.enter),
+			self.key_config.get_hint(self.key_config.keys.exit_popup),
+		)
+	}
+}
+
 impl DrawableComponent for ConfirmPopup {
 	fn draw(&self, f: &mut Frame, _rect: Rect) -> Result<()> {
 		if self.visible {
 			let (title, msg) = self.get_text();
+			let destructive = self
+				.target
+				.as_ref()
+				.is_some_and(Self::is_destructive);
 
-			let txt = Text::styled(
-				Cow::from(msg),
-				self.theme.text_danger(),
-			);
+			let viewport = f.area();
+			let footer = self.footer_hint();
+			let max_popup_width =
+				viewport.width.saturating_sub(4).clamp(24, 68);
+			let desired_width = msg
+				.lines()
+				.map(UnicodeWidthStr::width)
+				.max()
+				.unwrap_or(0)
+				.max(footer.width())
+				.max(title.width() + 2)
+				.saturating_add(4);
+			let width = u16::try_from(desired_width)
+				.unwrap_or(max_popup_width)
+				.clamp(32.min(max_popup_width), max_popup_width);
+			let inner_width = usize::from(width.saturating_sub(4));
+			let wrapped_msg = if inner_width > 0 {
+				bwrap::wrap_maybrk!(&msg, inner_width)
+			} else {
+				msg
+			};
 
-			let area = ui::centered_rect(50, 20, f.area());
-			// Clear a 1-cell margin around the popup so that a wide
-			// (CJK/emoji) grapheme sitting just outside the popup area
-			// cannot visually overflow into the popup's border cells.
-			let clear_area = Rect::new(
-				area.x.saturating_sub(1),
-				area.y.saturating_sub(1),
-				area.width.saturating_add(2),
-				area.height.saturating_add(2),
-			);
-			f.render_widget(Clear, clear_area);
-			render_popup(
+			let body_style = if destructive {
+				self.theme.text_danger()
+			} else {
+				self.theme.text(true, false)
+			};
+			let title_style = if destructive {
+				self.theme.text_danger()
+			} else {
+				self.theme.title(true)
+			};
+			let border_style = if destructive {
+				self.theme.text_danger()
+			} else {
+				self.theme.block(true)
+			};
+
+			let mut lines: Vec<Line<'_>> = wrapped_msg
+				.lines()
+				.map(|l| Line::from(Span::styled(l.to_owned(), body_style)))
+				.collect();
+			lines.push(Line::default());
+			lines.push(Line::from(Span::styled(
+				footer,
+				self.theme.text(false, false),
+			)));
+
+			let height = u16::try_from(lines.len())
+				.unwrap_or(u16::MAX)
+				.saturating_add(2)
+				.min(viewport.height);
+			let area =
+				ui::centered_rect_absolute(width, height, viewport);
+
+			ui::clear_popup_area(f, area);
+			let block = Block::default()
+				.title(Span::styled(title, title_style))
+				.borders(Borders::ALL)
+				.border_type(BorderType::Thick)
+				.border_style(border_style)
+				.padding(Padding::horizontal(1));
+			ui::render_block_text(
 				f.buffer_mut(),
 				area,
-				&title,
-				txt,
-				&self.theme,
-				true,
-				true,
+				block,
+				&lines,
 			);
 		}
 
@@ -84,12 +170,31 @@ impl Component for ConfirmPopup {
 	fn event(&mut self, ev: &Event) -> Result<EventState> {
 		if self.visible {
 			if let Event::Key(e) = ev {
-				if key_match(e, self.key_config.keys.exit_popup) {
+				let is_yes = e.modifiers.is_empty()
+					&& matches!(
+						e.code,
+						KeyCode::Char('y' | 'Y')
+					);
+				let is_no = e.modifiers.is_empty()
+					&& matches!(
+						e.code,
+						KeyCode::Char('n' | 'N')
+					);
+				let is_yes_shifted = e.modifiers == KeyModifiers::SHIFT
+					&& e.code == KeyCode::Char('Y');
+				let is_no_shifted = e.modifiers == KeyModifiers::SHIFT
+					&& e.code == KeyCode::Char('N');
+
+				if key_match(e, self.key_config.keys.exit_popup)
+					|| is_no
+					|| is_no_shifted
+				{
 					self.hide();
-				} else if key_match(e, self.key_config.keys.enter) {
-					self.confirm();
-				} else if key_match(e, self.key_config.keys.copy) {
-					// Allow 'y' (copy key) to confirm as well
+				} else if key_match(e, self.key_config.keys.enter)
+					|| is_yes
+					|| is_yes_shifted
+					|| key_match(e, self.key_config.keys.copy)
+				{
 					self.confirm();
 				}
 
@@ -290,6 +395,50 @@ mod tests {
 		buffer::Buffer,
 		widgets::{Clear, Widget},
 	};
+
+	#[test]
+	fn confirm_distinguishes_severity_and_accepts_y_n() {
+		let env = Environment::test_env();
+		let mut popup = ConfirmPopup::new(&env);
+
+		// Normal push is non-destructive; 'n' cancels cleanly.
+		popup
+			.open(Action::ForcePush("refs/heads/main".into(), false))
+			.unwrap();
+		assert!(!ConfirmPopup::is_destructive(
+			popup.target.as_ref().unwrap()
+		));
+		popup
+			.event(&Event::Key(crossterm::event::KeyEvent::new(
+				KeyCode::Char('n'),
+				KeyModifiers::NONE,
+			)))
+			.unwrap();
+		assert!(!popup.is_visible());
+		assert!(env.queue.pop().is_none());
+
+		// Force push is destructive; 'y' confirms cleanly.
+		popup
+			.open(Action::ForcePush("refs/heads/main".into(), true))
+			.unwrap();
+		assert!(ConfirmPopup::is_destructive(
+			popup.target.as_ref().unwrap()
+		));
+		popup
+			.event(&Event::Key(crossterm::event::KeyEvent::new(
+				KeyCode::Char('y'),
+				KeyModifiers::NONE,
+			)))
+			.unwrap();
+		assert!(!popup.is_visible());
+		assert!(matches!(
+			env.queue.pop(),
+			Some(InternalEvent::ConfirmedAction(Action::ForcePush(
+				_,
+				true
+			)))
+		));
+	}
 
 	#[test]
 	fn reset_all_can_be_cancelled_or_confirmed() {

@@ -21,7 +21,7 @@ use ratatui::{
 		Alignment, Constraint, Direction, Layout, Margin, Rect,
 	},
 	text::{Line, Span},
-	widgets::{Block, Borders, Clear, Paragraph},
+	widgets::{Block, Borders, Paragraph},
 	Frame,
 };
 use std::time::{Duration, Instant};
@@ -58,6 +58,7 @@ pub struct LogSearchPopupPopup {
 	jump_commit_id: Option<CommitId>,
 	file_history: bool,
 	previous_filter_results: Option<bool>,
+	last_query: String,
 	blink_started: Instant,
 	blink_visible: bool,
 }
@@ -92,6 +93,7 @@ impl LogSearchPopupPopup {
 			jump_commit_id: None,
 			file_history: false,
 			previous_filter_results: None,
+			last_query: String::new(),
 			blink_started: Instant::now(),
 			blink_visible: true,
 		}
@@ -124,10 +126,15 @@ impl LogSearchPopupPopup {
 		self.show()?;
 		self.selection = Selection::EnterText;
 		self.find_text.show()?;
-		self.find_text.set_text(String::new());
 		self.find_text.enabled(true);
 
 		self.set_mode(&PopupMode::Search);
+		if !self.last_query.is_empty() {
+			self.find_text.set_text(self.last_query.clone());
+			let end_col = u16::try_from(self.last_query.chars().count())
+				.unwrap_or(u16::MAX);
+			self.find_text.set_cursor(0, end_col);
+		}
 
 		Ok(())
 	}
@@ -188,13 +195,12 @@ impl LogSearchPopupPopup {
 
 		match self.mode {
 			PopupMode::Search => {
+				let pattern = self.find_text.get_text().to_string();
+				self.last_query.clone_from(&pattern);
 				let options = LogFilterSearchOptions {
 					fields: self.options.0,
 					options: self.options.1,
-					search_pattern: self
-						.find_text
-						.get_text()
-						.to_string(),
+					search_pattern: pattern,
 				};
 				self.queue.push(if self.file_history {
 					InternalEvent::FileHistorySearch(options)
@@ -293,81 +299,61 @@ impl LogSearchPopupPopup {
 				" "
 			};
 
+		let opt_line = |checked: &str, label: &str, selected: bool| {
+			let prefix = if selected { "> " } else { "  " };
+			Line::from(vec![Span::styled(
+				format!("{prefix}[{checked}] {label}"),
+				self.theme.text(true, selected),
+			)])
+		};
+
 		let mut lines = vec![
-			Line::from(vec![Span::styled(
-				format!("[{x_opt_fuzzy}] fuzzy search"),
-				self.theme.text(
-					matches!(self.selection, Selection::FuzzyOption),
-					false,
+			opt_line(
+				x_opt_fuzzy,
+				"fuzzy search",
+				matches!(self.selection, Selection::FuzzyOption),
+			),
+			opt_line(
+				x_opt_casesensitive,
+				"case sensitive",
+				matches!(self.selection, Selection::CaseOption),
+			),
+			opt_line(
+				x_filter_results,
+				"filter results",
+				matches!(
+					self.selection,
+					Selection::FilterResultsOption
 				),
-			)]),
-			Line::from(vec![Span::styled(
-				format!("[{x_opt_casesensitive}] case sensitive"),
-				self.theme.text(
-					matches!(self.selection, Selection::CaseOption),
-					false,
+			),
+			opt_line(
+				x_summary,
+				"summary",
+				matches!(self.selection, Selection::SummarySearch),
+			),
+			opt_line(
+				x_body,
+				"message body",
+				matches!(
+					self.selection,
+					Selection::MessageBodySearch
 				),
-			)]),
-			Line::from(vec![Span::styled(
-				format!("[{x_filter_results}] filter results"),
-				self.theme.text(
-					matches!(
-						self.selection,
-						Selection::FilterResultsOption
-					),
-					false,
-				),
-			)]),
-			Line::from(vec![Span::styled(
-				format!("[{x_summary}] summary"),
-				self.theme.text(
-					matches!(
-						self.selection,
-						Selection::SummarySearch
-					),
-					false,
-				),
-			)]),
-			Line::from(vec![Span::styled(
-				format!("[{x_body}] message body"),
-				self.theme.text(
-					matches!(
-						self.selection,
-						Selection::MessageBodySearch
-					),
-					false,
-				),
-			)]),
-			Line::from(vec![Span::styled(
-				format!("[{x_files}] committed files"),
-				self.theme.text(
-					matches!(
-						self.selection,
-						Selection::FilenameSearch
-					),
-					false,
-				),
-			)]),
-			Line::from(vec![Span::styled(
-				format!("[{x_authors}] authors"),
-				self.theme.text(
-					matches!(
-						self.selection,
-						Selection::AuthorsSearch
-					),
-					false,
-				),
-			)]),
-			Line::from(vec![Span::styled(
-				format!("[{x_commit_hash}] commit hash"),
-				self.theme.text(
-					matches!(
-						self.selection,
-						Selection::CommitHashSearch
-					),
-					false,
-				),
-			)]),
+			),
+			opt_line(
+				x_files,
+				"committed files",
+				matches!(self.selection, Selection::FilenameSearch),
+			),
+			opt_line(
+				x_authors,
+				"authors",
+				matches!(self.selection, Selection::AuthorsSearch),
+			),
+			opt_line(
+				x_commit_hash,
+				"commit hash",
+				matches!(self.selection, Selection::CommitHashSearch),
+			),
 		];
 		if self.file_history {
 			lines.remove(2);
@@ -512,11 +498,11 @@ impl LogSearchPopupPopup {
 		const SIZE: (u16, u16) = (60, 12);
 		let area = ui::centered_rect_absolute(SIZE.0, SIZE.1, area);
 
-		f.render_widget(Clear, area);
+		ui::clear_popup_area(f, area);
 		f.render_widget(
 			Block::default()
 				.borders(Borders::all())
-				.style(self.theme.title(true))
+				.border_style(self.theme.block(true))
 				.title(Span::styled(
 					strings::POPUP_TITLE_LOG_SEARCH,
 					self.theme.title(true),
@@ -559,20 +545,20 @@ impl LogSearchPopupPopup {
 		const SIZE: (u16, u16) = (60, 3);
 		let area = ui::centered_rect_absolute(SIZE.0, SIZE.1, area);
 
-		let mut block_style = self.theme.title(true);
+		let mut block_style = self.theme.block(true);
 
 		let show_invalid = !self.is_valid()
 			&& !self.find_text.get_text().trim().is_empty();
 
 		if show_invalid {
-			block_style = block_style.patch(self.theme.text_danger());
+			block_style = self.theme.text_danger();
 		}
 
-		f.render_widget(Clear, area);
+		ui::clear_popup_area(f, area);
 		f.render_widget(
 			Block::default()
 				.borders(Borders::all())
-				.style(block_style)
+				.border_style(block_style)
 				.title(Span::styled(
 					strings::POPUP_TITLE_LOG_SEARCH,
 					self.theme.title(true),

@@ -35,6 +35,11 @@ impl Spinner {
 		self.active = active;
 	}
 
+	///
+	pub const fn is_active(&self) -> bool {
+		self.active
+	}
+
 	/// draws or removes spinner char depending on `pending` state
 	pub fn draw<B: ratatui::backend::Backend>(
 		&self,
@@ -54,7 +59,7 @@ impl Spinner {
 
 			terminal
 				.backend_mut()
-				.draw(vec![(0_u16, 0_u16, &c)].into_iter())?;
+				.draw(std::iter::once((0_u16, 0_u16, &c)))?;
 
 			Backend::flush(terminal.backend_mut())?;
 		}

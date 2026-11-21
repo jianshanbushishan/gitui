@@ -20,7 +20,8 @@ use asyncgit::{
 	sync::{
 		diff_contains_file, filter_commit_by_search,
 		get_commits_info, CommitId, LogFilterSearch,
-		LogFilterSearchOptions, RepoPathRef, SharedCommitFilterFn,
+		LogFilterSearchOptions, RepoPathRef, SearchFields,
+		SharedCommitFilterFn,
 	},
 	AsyncDiff, AsyncGitNotification, AsyncLog, DiffParams, DiffType,
 };
@@ -48,11 +49,21 @@ fn history_filter(
 ) -> SharedCommitFilterFn {
 	let file_filter = diff_contains_file(file_path);
 	if let Some(options) = search {
+		let search_checks_filenames =
+			options.fields.contains(SearchFields::FILENAMES);
 		let search_filter =
 			filter_commit_by_search(LogFilterSearch::new(options));
-		Arc::new(Box::new(move |repo, id| {
-			Ok(file_filter(repo, id)? && search_filter(repo, id)?)
-		}))
+		if search_checks_filenames {
+			Arc::new(Box::new(move |repo, id| {
+				Ok(file_filter(repo, id)? && search_filter(repo, id)?)
+			}))
+		} else {
+			// When search only inspects cheap commit metadata (summary/body/author/hash),
+			// run it before the expensive tree-to-tree file diff filter.
+			Arc::new(Box::new(move |repo, id| {
+				Ok(search_filter(repo, id)? && file_filter(repo, id)?)
+			}))
+		}
 	} else {
 		file_filter
 	}
@@ -280,6 +291,19 @@ impl FileRevlogPopup {
 		self.diff.sync_diff_mode();
 	}
 
+	pub fn content_search_selected(
+		&mut self,
+		query: &str,
+		line: usize,
+		matching_lines: &[usize],
+	) {
+		self.diff.content_search_selected(
+			query,
+			line,
+			matching_lines,
+		);
+	}
+
 	fn fetch_commits(
 		&mut self,
 		new_offset: usize,
@@ -428,13 +452,20 @@ impl FileRevlogPopup {
 		);
 	}
 
-	fn get_rows(&self, now: DateTime<Local>) -> Vec<Row<'_>> {
+	fn get_rows_slice(
+		&self,
+		now: DateTime<Local>,
+		start: usize,
+		count: usize,
+	) -> Vec<Row<'_>> {
 		self.items
 			.iter()
+			.skip(start)
+			.take(count)
 			.map(|entry| {
 				let spans = Line::from(vec![
 					Span::styled(
-						entry.hash_short.to_string(),
+						entry.hash_short.as_ref(),
 						self.theme.commit_hash(false),
 					),
 					Span::raw(" "),
@@ -444,13 +475,13 @@ impl FileRevlogPopup {
 					),
 					Span::raw(" "),
 					Span::styled(
-						entry.author.to_string(),
+						entry.author.as_ref(),
 						self.theme.commit_author(false),
 					),
 				]);
 
 				let mut text = Text::from(spans);
-				text.extend(Text::raw(entry.msg.to_string()));
+				text.extend(Text::raw(entry.msg.as_ref()));
 
 				let cells = vec![Cell::from(""), Cell::from(text)];
 
@@ -559,7 +590,29 @@ impl FileRevlogPopup {
 		let now = Local::now();
 
 		let title = self.get_title();
-		let rows = self.get_rows(now);
+		let mut table_state = self.table_state.take();
+		let base_offset = self.items.index_offset();
+		let inner_height =
+			usize::from(area.height.saturating_sub(2));
+		// Each row has height 2.
+		let visible_rows = inner_height.div_ceil(2).max(1);
+		let selected_local = table_state
+			.selected()
+			.map(|s| s.saturating_sub(base_offset));
+		let mut local_offset =
+			table_state.offset().saturating_sub(base_offset);
+		if let Some(sel) = selected_local {
+			if sel < local_offset {
+				local_offset = sel;
+			} else if sel >= local_offset + visible_rows {
+				local_offset = sel + 1 - visible_rows;
+			}
+		}
+		*table_state.offset_mut() =
+			base_offset.saturating_add(local_offset);
+
+		let rows =
+			self.get_rows_slice(now, local_offset, visible_rows);
 
 		let table = Table::new(rows, constraints)
 			.column_spacing(1)
@@ -574,25 +627,11 @@ impl FileRevlogPopup {
 					.border_style(self.theme.block(true)),
 			);
 
-		let table_state = self.table_state.take();
-		// We have to adjust the table state for drawing to account for the fact
-		// that `self.items` not necessarily starts at index 0.
-		//
-		// When a user scrolls down, items outside of the current view are removed
-		// when new data is fetched. Let’s have a look at an example: if the item at
-		// index 50 is the first item in the current view and `self.items` has been
-		// freshly fetched, the current offset is 50 and `self.items[0]` is the item
-		// at index 50. Subtracting the current offset from the selected index
-		// yields the correct index in `self.items`, in this case 0.
 		let mut adjusted_table_state = TableState::default()
-			.with_selected(table_state.selected().map(|selected| {
-				selected.saturating_sub(self.items.index_offset())
-			}))
-			.with_offset(
-				table_state
-					.offset()
-					.saturating_sub(self.items.index_offset()),
-			);
+			.with_selected(
+				selected_local.map(|s| s.saturating_sub(local_offset)),
+			)
+			.with_offset(0);
 
 		f.render_widget(Clear, area);
 		f.render_stateful_widget(

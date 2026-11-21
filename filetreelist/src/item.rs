@@ -74,6 +74,10 @@ impl TreeItemInfo {
 		self.indent = self.indent.saturating_sub(1);
 	}
 
+	pub(crate) const fn unindent_by(&mut self, amount: u8) {
+		self.indent = self.indent.saturating_sub(amount);
+	}
+
 	pub const fn set_visible(&mut self, visible: bool) {
 		self.visible = visible;
 	}
@@ -118,20 +122,39 @@ impl FileTreeItem {
 			item_path.ancestors().count().saturating_sub(2),
 		)?;
 
-		Ok(Self {
+		Ok(Self::new_file_with_indent(item_path, indent))
+	}
+
+	pub(crate) const fn new_file_with_indent(
+		item_path: PathBuf,
+		indent: u8,
+	) -> Self {
+		Self {
 			info: TreeItemInfo::new(indent, item_path),
 			kind: FileTreeItemKind::File,
-		})
+		}
 	}
 
 	pub fn new_path(path: &Path, collapsed: bool) -> Result<Self> {
 		let indent =
 			u8::try_from(path.ancestors().count().saturating_sub(2))?;
 
-		Ok(Self {
-			info: TreeItemInfo::new(indent, path.to_owned()),
+		Ok(Self::new_path_with_indent(
+			path.to_owned(),
+			indent,
+			collapsed,
+		))
+	}
+
+	pub(crate) const fn new_path_with_indent(
+		path: PathBuf,
+		indent: u8,
+		collapsed: bool,
+	) -> Self {
+		Self {
+			info: TreeItemInfo::new(indent, path),
 			kind: FileTreeItemKind::Path(PathCollapsed(collapsed)),
-		})
+		}
 	}
 
 	///

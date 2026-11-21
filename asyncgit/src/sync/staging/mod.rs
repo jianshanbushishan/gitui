@@ -29,21 +29,28 @@ pub(super) fn ensure_partial_edit_allowed(
 
 #[derive(Default)]
 struct NewFromOldContent {
-	lines: Vec<String>,
+	buf: String,
+	has_lines: bool,
 	old_index: usize,
 }
 
 impl NewFromOldContent {
-	fn add_from_hunk(&mut self, line: &DiffLine) -> Result<()> {
-		let line = String::from_utf8(line.content().into())?;
-
-		let line = if line.ends_with(NEWLINE) {
-			line[0..line.len() - 1].to_string()
+	fn push_line(&mut self, line: &str) {
+		if self.has_lines {
+			self.buf.push(NEWLINE);
 		} else {
-			line
-		};
+			self.has_lines = true;
+		}
+		self.buf.push_str(line);
+	}
 
-		self.lines.push(line);
+	fn add_from_hunk(&mut self, line: &DiffLine) -> Result<()> {
+		let bytes = line.content();
+		let bytes =
+			bytes.strip_suffix(b"\n").unwrap_or(bytes);
+		let text = std::str::from_utf8(bytes)
+			.map_err(|e| crate::error::Error::Generic(e.to_string()))?;
+		self.push_line(text);
 
 		Ok(())
 	}
@@ -54,7 +61,7 @@ impl NewFromOldContent {
 
 	fn add_old_line(&mut self, old_lines: &[&str]) {
 		if let Some(line) = old_lines.get(self.old_index) {
-			self.lines.push((*line).to_string());
+			self.push_line(line);
 			self.old_index += 1;
 		}
 	}
@@ -73,16 +80,12 @@ impl NewFromOldContent {
 
 	fn finish(mut self, old_lines: &[&str]) -> String {
 		for line in old_lines.iter().skip(self.old_index) {
-			self.lines.push((*line).to_string());
+			self.push_line(line);
 		}
-		let lines = self.lines.join("\n");
-		if lines.ends_with(NEWLINE) {
-			lines
-		} else {
-			let mut lines = lines;
-			lines.push(NEWLINE);
-			lines
+		if !self.buf.ends_with(NEWLINE) {
+			self.buf.push(NEWLINE);
 		}
+		self.buf
 	}
 }
 
@@ -217,7 +220,7 @@ mod tests {
 		content.catchup_to_hunkstart(99, &old_lines);
 
 		assert_eq!(content.old_index, old_lines.len());
-		assert_eq!(content.lines, vec!["a", "b", "c"]);
+		assert_eq!(content.buf, "a\nb\nc");
 	}
 
 	#[test]
@@ -229,6 +232,6 @@ mod tests {
 
 		content.add_old_line(&old_lines);
 		assert_eq!(content.old_index, 1);
-		assert_eq!(content.lines, vec!["only-line"]);
+		assert_eq!(content.buf, "only-line");
 	}
 }

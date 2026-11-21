@@ -5,10 +5,7 @@ use crate::{
 };
 use git2::{Oid, Repository, Tree};
 use scopetime::scope_time;
-use std::{
-	cmp::Ordering,
-	path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 /// `tree_files` returns a list of `FileTree`
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -37,17 +34,18 @@ pub fn tree_files(
 
 	tree_recurse(&repo, &PathBuf::from("./"), &tree, &mut files)?;
 
-	sort_file_list(&mut files);
-
 	Ok(files)
 }
 
+#[cfg(test)]
 fn sort_file_list(files: &mut [TreeFile]) {
 	files.sort_by(|a, b| path_cmp(&a.path, &b.path));
 }
 
 // applies topologically order on paths sorting
-fn path_cmp(a: &Path, b: &Path) -> Ordering {
+#[cfg(test)]
+fn path_cmp(a: &Path, b: &Path) -> std::cmp::Ordering {
+	use std::cmp::Ordering;
 	let mut comp_a = a.components().peekable();
 	let mut comp_b = b.components().peekable();
 
@@ -153,25 +151,45 @@ fn tree_recurse(
 	tree: &Tree,
 	out: &mut Vec<TreeFile>,
 ) -> Result<()> {
-	out.reserve(tree.len());
+	let mut subtrees: Vec<git2::TreeEntry<'_>> = Vec::new();
+	let mut blobs: Vec<git2::TreeEntry<'_>> = Vec::new();
 
 	for e in tree {
-		let p = String::from_utf8_lossy(e.name_bytes());
-		let path = path.join(p.to_string());
 		match e.kind() {
-			Some(git2::ObjectType::Blob) => {
-				let id = e.id();
-				let filemode = e.filemode();
-				out.push(TreeFile { path, filemode, id });
-			}
-			Some(git2::ObjectType::Tree) => {
-				let obj = e.to_object(repo)?;
-				let tree = obj.peel_to_tree()?;
-				tree_recurse(repo, &path, &tree, out)?;
-			}
+			Some(git2::ObjectType::Blob) => blobs.push(e),
+			Some(git2::ObjectType::Tree) => subtrees.push(e),
 			Some(_) | None => (),
 		}
 	}
+
+	subtrees.sort_unstable_by(|a, b| {
+		let a_name = String::from_utf8_lossy(a.name_bytes());
+		let b_name = String::from_utf8_lossy(b.name_bytes());
+		Path::new(a_name.as_ref()).cmp(Path::new(b_name.as_ref()))
+	});
+	for e in subtrees {
+		let name = String::from_utf8_lossy(e.name_bytes());
+		let child_path = path.join(name.as_ref());
+		let child_tree = repo.find_tree(e.id())?;
+		tree_recurse(repo, &child_path, &child_tree, out)?;
+	}
+
+	blobs.sort_unstable_by(|a, b| {
+		let a_name = String::from_utf8_lossy(a.name_bytes());
+		let b_name = String::from_utf8_lossy(b.name_bytes());
+		Path::new(a_name.as_ref()).cmp(Path::new(b_name.as_ref()))
+	});
+	out.reserve(blobs.len());
+	for e in blobs {
+		let name = String::from_utf8_lossy(e.name_bytes());
+		let file_path = path.join(name.as_ref());
+		out.push(TreeFile {
+			path: file_path,
+			filemode: e.filemode(),
+			id: e.id(),
+		});
+	}
+
 	Ok(())
 }
 
@@ -180,6 +198,7 @@ mod tests {
 	use super::*;
 	use crate::sync::tests::{repo_init, write_commit_file};
 	use pretty_assertions::{assert_eq, assert_ne};
+	use std::cmp::Ordering;
 
 	#[test]
 	fn test_smoke() {

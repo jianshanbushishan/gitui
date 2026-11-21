@@ -201,7 +201,7 @@ impl AsyncDelta {
 		&self,
 		params: DeltaParams,
 		repo: RepoPath,
-		diff: Option<FileDiff>,
+		diff: Option<Arc<FileDiff>>,
 	) -> Option<ProcessedDelta> {
 		let key = hash_params(&params);
 		self.latest_requested.store(key, Ordering::Release);
@@ -232,7 +232,17 @@ impl AsyncDelta {
 
 		pending_count.fetch_add(1, Ordering::Relaxed);
 		rayon_core::spawn(move || {
-			let result = run_delta(&repo, &params, diff.as_ref());
+			// Bail out early if a newer request already superseded this key
+			// before we even spawn `git`/`delta` subprocesses.
+			if latest_requested.load(Ordering::Acquire) != key {
+				if let Ok(mut set) = in_flight.lock() {
+					set.remove(&key);
+				}
+				pending_count.fetch_sub(1, Ordering::Relaxed);
+				return;
+			}
+
+			let result = run_delta(&repo, &params, diff.as_deref());
 
 			// Remove from in-flight first, then publish the result.
 			// Order matters: a re-request after removal will spawn
@@ -491,14 +501,18 @@ fn run_delta(
 		|| (Vec::new(), Vec::new()),
 		|bytes| {
 			let text = String::from_utf8_lossy(&bytes);
-			let (lines, bgs) = ansi_to_lines(&text);
+			let (mut lines, mut bgs) = ansi_to_lines(&text);
 			// Strip leading empty lines — delta always emits a blank
 			// line before the first hunk separator.
 			let first = lines
 				.iter()
 				.position(|l| !l.spans.is_empty())
 				.unwrap_or(0);
-			(lines[first..].to_vec(), bgs[first..].to_vec())
+			if first > 0 {
+				lines.drain(..first);
+				bgs.drain(..first);
+			}
+			(lines, bgs)
 		},
 	);
 
@@ -586,19 +600,25 @@ fn rebuild(
 		let mut current_hunk: usize = 0;
 		let mut first_separator_seen = false;
 		for line in &raw_lines {
-			let text: String = line
-				.spans
-				.iter()
-				.map(|s| s.content.as_ref())
-				.collect();
-			let trimmed = text.trim();
+			let mut has_non_ws = false;
+			let mut last_non_ws = '\0';
+			let mut all_sep_chars = true;
+			for c in
+				line.spans.iter().flat_map(|s| s.content.chars())
+			{
+				if c.is_whitespace() {
+					continue;
+				}
+				has_non_ws = true;
+				last_non_ws = c;
+				if c != '\u{2500}' && c != '\u{2510}' {
+					all_sep_chars = false;
+					break;
+				}
+			}
 
-			let is_top_separator = !trimmed.is_empty()
-				&& trimmed.ends_with('\u{2510}')
-				&& trimmed.chars().all(|c| {
-					c == '\u{2500}'
-						|| c == '\u{2510}' || c.is_whitespace()
-				});
+			let is_top_separator =
+				has_non_ws && all_sep_chars && last_non_ws == '\u{2510}';
 			if is_top_separator {
 				if first_separator_seen {
 					current_hunk += 1;
@@ -629,10 +649,20 @@ fn rebuild(
 		pos_count,
 	);
 
-	// Side-by-side: display lines = raw lines (no wrapping)
+	// Side-by-side: apply bg padding once here on the worker thread
+	// (while indexed colors are still intact) so `draw_delta` can borrow
+	// lines directly without per-frame cloning or width scans.
 	if side_by_side || panel_width == 0 {
+		let display_lines: Vec<Line<'static>> = if side_by_side {
+			raw_lines
+				.into_iter()
+				.map(|line| pad_line_bg(line, panel_width, true, None))
+				.collect()
+		} else {
+			raw_lines
+		};
 		return ProcessedDelta {
-			display_lines: raw_lines.into(),
+			display_lines: display_lines.into(),
 			display_hunks: hunk_map.into(),
 			display_positions: pos_map.into(),
 			line_level_bgs: line_level_bgs.into(),
@@ -640,11 +670,11 @@ fn rebuild(
 	}
 
 	// Non-SBS: wrap each raw line to panel_width and pad bg
-	let mut display_lines = Vec::new();
-	let mut display_hunks = Vec::new();
-	let mut display_positions = Vec::new();
+	let mut display_lines = Vec::with_capacity(raw_lines.len());
+	let mut display_hunks = Vec::with_capacity(raw_lines.len());
+	let mut display_positions = Vec::with_capacity(raw_lines.len());
 
-	for (idx, line) in raw_lines.iter().enumerate() {
+	for (idx, mut line) in raw_lines.into_iter().enumerate() {
 		// ansi_to_lines adds a trailing space for \x1b[K (erase-in-line)
 		// to make bg visible. When the line already fills the panel width,
 		// this extra space causes a spurious wrap. Strip it only in that case.
@@ -653,20 +683,17 @@ fn rebuild(
 			.iter()
 			.map(|s| display_width(s.content.as_ref()))
 			.sum();
-		let trimmed_line = if content_len > panel_width {
-			let mut spans: Vec<Span<'static>> = line.spans.clone();
-			while spans
+		if content_len > panel_width {
+			while line
+				.spans
 				.last()
 				.is_some_and(|s| s.content.trim().is_empty())
 			{
-				spans.pop();
+				line.spans.pop();
 			}
-			Line::from(spans)
-		} else {
-			line.clone()
-		};
+		}
 		let dominant_bg = line_level_bgs.get(idx).copied().flatten();
-		let wrapped = wrap_line(&trimmed_line, panel_width);
+		let wrapped = wrap_line(&line, panel_width);
 		for wline in wrapped {
 			let padded =
 				pad_line_bg(wline, panel_width, false, dominant_bg);
@@ -754,27 +781,28 @@ pub fn wrap_line(
 				continue;
 			}
 
-			let w = display_width(remaining);
-			if w <= space {
-				current_spans.push(Span::styled(
-					Cow::Owned(remaining.to_string()),
-					style,
-				));
-				current_width += w;
-				break;
-			}
-
-			// Find the longest prefix whose display width fits in `space`.
+			// Walk `remaining` once in O(chunk) instead of measuring the full
+			// remaining tail on every wrap iteration (which would be O(L^2 / W)).
 			let mut byte_end = 0;
 			let mut acc = 0;
+			let mut fits_all = true;
 			for (i, ch) in remaining.char_indices() {
 				let cw = unicode_width::UnicodeWidthChar::width(ch)
 					.unwrap_or(0);
 				if acc + cw > space {
+					fits_all = false;
 					break;
 				}
 				acc += cw;
 				byte_end = i + ch.len_utf8();
+			}
+			if fits_all {
+				current_spans.push(Span::styled(
+					Cow::Owned(remaining.to_string()),
+					style,
+				));
+				current_width += acc;
+				break;
 			}
 			if byte_end == 0 {
 				// The very first char is wider than `space` (e.g. a
@@ -835,11 +863,6 @@ pub fn pad_line_bg(
 	is_sbs: bool,
 	dominant_bg: Option<Color>,
 ) -> Line<'static> {
-	let content_width: usize = line
-		.spans
-		.iter()
-		.map(|s| display_width(s.content.as_ref()))
-		.sum();
 	let bg_idx =
 		line.spans.iter().rposition(|s| s.style.bg.is_some());
 	let Some(idx) = bg_idx else {
@@ -897,26 +920,19 @@ pub fn pad_line_bg(
 			span.style = span.style.fg(fg);
 		}
 	}
-	let pad_limit = if is_sbs {
-		boundary.map_or(content_width, |b| {
-			line.spans[..b]
-				.iter()
-				.map(|s| display_width(s.content.as_ref()))
-				.sum()
-		})
-	} else {
-		width
-	};
-	let left_panel_width: usize = line.spans[..apply_end]
-		.iter()
-		.map(|s| display_width(s.content.as_ref()))
-		.sum();
-	if left_panel_width < pad_limit {
-		let pad = pad_limit - left_panel_width;
-		line.spans.insert(
-			apply_end,
-			Span::styled(Cow::Owned(" ".repeat(pad)), bg_style),
-		);
+	if !is_sbs {
+		let content_width: usize = line
+			.spans
+			.iter()
+			.map(|s| display_width(s.content.as_ref()))
+			.sum();
+		if content_width < width {
+			let pad = width - content_width;
+			line.spans.push(Span::styled(
+				Cow::Owned(" ".repeat(pad)),
+				bg_style,
+			));
+		}
 	}
 	line
 }

@@ -1,6 +1,7 @@
 mod blame_file;
 mod branchlist;
 mod checkout_option;
+mod command_palette;
 mod commit;
 mod compare_commits;
 mod confirm;
@@ -16,6 +17,7 @@ mod goto_line;
 mod help;
 mod inspect_commit;
 mod lfs;
+mod lfs_progress;
 mod log_search;
 mod msg;
 mod options;
@@ -36,6 +38,7 @@ mod update_remote_url;
 pub use blame_file::{BlameFileOpen, BlameFilePopup};
 pub use branchlist::BranchListPopup;
 pub use checkout_option::CheckoutOptionPopup;
+pub use command_palette::{CommandPalettePopup, PaletteAction};
 pub use commit::CommitPopup;
 pub use compare_commits::CompareCommitsPopup;
 pub use confirm::ConfirmPopup;
@@ -52,6 +55,7 @@ pub use help::HelpPopup;
 pub use inspect_commit::{InspectCommitOpen, InspectCommitPopup};
 pub use lfs::file_details as lfs_file_details;
 pub use lfs::LfsPopup;
+pub use lfs_progress::draw_lfs_progress;
 pub use log_search::LogSearchPopupPopup;
 pub use msg::MsgPopup;
 pub use options::{AppOption, OptionsPopup};
@@ -69,7 +73,9 @@ pub use tag_commit::TagCommitPopup;
 pub use taglist::TagListPopup;
 pub use update_remote_url::UpdateRemoteUrlPopup;
 
+#[cfg(test)]
 use crate::ui::style::Theme;
+#[cfg(test)]
 use ratatui::{
 	buffer::Buffer,
 	layout::Rect,
@@ -87,6 +93,7 @@ use ratatui::{
 /// border. `Buffer::set_stringn` resets the trailing cell, so we use it
 /// instead. Long lines are word-wrapped beforehand using `unicode-width` so
 /// CJK content still wraps instead of being silently truncated.
+#[cfg(test)]
 fn render_popup<'a, T>(
 	buf: &mut Buffer,
 	area: Rect,
@@ -163,6 +170,7 @@ fn render_popup<'a, T>(
 /// `char` walk would split mid-cluster); popups render short user-facing
 /// strings where that distinction matters more than the diff path's
 /// reuse-coverage.
+#[cfg(test)]
 fn wrap_line<'a>(
 	line: &'a Line<'a>,
 	max_width: usize,
@@ -236,6 +244,7 @@ fn wrap_line<'a>(
 	out
 }
 
+#[cfg(test)]
 fn flush_span<'a>(
 	current_spans: &mut Vec<Span<'a>>,
 	current_width: &mut usize,

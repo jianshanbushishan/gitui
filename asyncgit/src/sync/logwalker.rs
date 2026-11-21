@@ -158,7 +158,7 @@ impl<'a> LogWalkerWithoutFilter<'a> {
 		let platform = repo
 			.rev_walk(tips)
 			.sorting(gix::revision::walk::Sorting::ByCommitTime(gix::traverse::commit::simple::CommitTimeOrder::NewestFirst))
-			.use_commit_graph(false);
+			.use_commit_graph(true);
 
 		let walk = platform.all()?;
 

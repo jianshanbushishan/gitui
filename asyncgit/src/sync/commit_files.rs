@@ -3,10 +3,10 @@
 use super::{diff::DiffOptions, CommitId, RepoPath};
 use crate::{
 	error::Result,
-	sync::{get_stashes, repository::repo},
+	sync::repository::repo,
 	StatusItem, StatusItemType,
 };
-use git2::{Diff, Repository};
+use git2::{Commit, Diff, Repository};
 use scopetime::scope_time;
 use std::collections::HashSet;
 
@@ -58,13 +58,7 @@ pub fn get_commit_files(
 			None,
 		)?
 	} else {
-		get_commit_diff(
-			&repo,
-			id,
-			None,
-			None,
-			Some(&get_stashes(repo_path)?.into_iter().collect()),
-		)?
+		get_commit_diff_checking_stash(&repo, id, None, None)?
 	};
 
 	let res = diff
@@ -112,7 +106,7 @@ pub fn get_compare_commits_diff(
 		opts.interhunk_lines(options.interhunk_lines);
 	}
 	if let Some(p) = &pathspec {
-		opts.pathspec(p.clone());
+		opts.pathspec(p);
 	}
 
 	let diff: Diff<'_> = repo.diff_tree_to_tree(
@@ -124,17 +118,31 @@ pub fn get_compare_commits_diff(
 	Ok(diff)
 }
 
-/// get diff of a commit to its first parent
-pub(crate) fn get_commit_diff<'a>(
+fn is_stash_commit(repo: &Repository, id: git2::Oid) -> bool {
+	repo.reflog("refs/stash")
+		.is_ok_and(|reflog| reflog.iter().any(|e| e.id_new() == id))
+}
+
+/// get diff of a commit to its first parent, checking `refs/stash` lazily
+/// only when the commit has at least 3 parents (stash with untracked files).
+pub(crate) fn get_commit_diff_checking_stash<'a>(
 	repo: &'a Repository,
 	id: CommitId,
-	pathspec: Option<String>,
+	pathspec: Option<&str>,
 	options: Option<DiffOptions>,
-	stashes: Option<&HashSet<CommitId>>,
 ) -> Result<Diff<'a>> {
-	// scope_time!("get_commit_diff");
-
 	let commit = repo.find_commit(id.into())?;
+	get_commit_diff_for_commit(repo, &commit, pathspec, options, true)
+}
+
+/// get diff of an already-loaded commit to its first parent
+pub(crate) fn get_commit_diff_for_commit<'a>(
+	repo: &'a Repository,
+	commit: &Commit<'_>,
+	pathspec: Option<&str>,
+	options: Option<DiffOptions>,
+	check_stash: bool,
+) -> Result<Diff<'a>> {
 	let commit_tree = commit.tree()?;
 
 	let parent = if commit.parent_count() > 0 {
@@ -151,8 +159,8 @@ pub(crate) fn get_commit_diff<'a>(
 		opts.ignore_whitespace(options.ignore_whitespace);
 		opts.interhunk_lines(options.interhunk_lines);
 	}
-	if let Some(p) = &pathspec {
-		opts.pathspec(p.clone());
+	if let Some(p) = pathspec {
+		opts.pathspec(p);
 	}
 	opts.show_binary(true);
 
@@ -162,7 +170,46 @@ pub(crate) fn get_commit_diff<'a>(
 		Some(&mut opts),
 	)?;
 
-	if stashes.is_some_and(|stashes| stashes.contains(&id)) {
+	if check_stash
+		&& commit.parent_count() >= 3
+		&& is_stash_commit(repo, commit.id())
+	{
+		if let Ok(untracked_commit) = commit.parent_id(2) {
+			let untracked = repo.find_commit(untracked_commit)?;
+			let untracked_diff = get_commit_diff_for_commit(
+				repo,
+				&untracked,
+				pathspec,
+				options,
+				false,
+			)?;
+
+			diff.merge(&untracked_diff)?;
+		}
+	}
+
+	Ok(diff)
+}
+
+/// get diff of a commit to its first parent
+pub(crate) fn get_commit_diff<'a>(
+	repo: &'a Repository,
+	id: CommitId,
+	pathspec: Option<String>,
+	options: Option<DiffOptions>,
+	stashes: Option<&HashSet<CommitId>>,
+) -> Result<Diff<'a>> {
+	let commit = repo.find_commit(id.into())?;
+	let check_stash =
+		stashes.is_some_and(|stashes| stashes.contains(&id));
+	if check_stash && commit.parent_count() >= 3 {
+		let mut diff = get_commit_diff_for_commit(
+			repo,
+			&commit,
+			pathspec.as_deref(),
+			options,
+			false,
+		)?;
 		if let Ok(untracked_commit) = commit.parent_id(2) {
 			let untracked_diff = get_commit_diff(
 				repo,
@@ -171,12 +218,18 @@ pub(crate) fn get_commit_diff<'a>(
 				options,
 				stashes,
 			)?;
-
 			diff.merge(&untracked_diff)?;
 		}
+		Ok(diff)
+	} else {
+		get_commit_diff_for_commit(
+			repo,
+			&commit,
+			pathspec.as_deref(),
+			options,
+			false,
+		)
 	}
-
-	Ok(diff)
 }
 
 #[cfg(test)]

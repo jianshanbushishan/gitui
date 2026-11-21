@@ -52,15 +52,20 @@ impl StashList {
 			let stashes = sync::get_stashes(&self.repo.borrow())?;
 			self.list.set_commits(stashes.into_iter().collect());
 
-			if self.commit_details.is_visible() {
-				let commit = self.selected_commit();
-				self.commit_details.set_commits(
-					commit.map(CommitFilesParams::from),
-					None,
-				)?;
-			}
+			self.update_commit_details()?;
 		}
 
+		Ok(())
+	}
+
+	fn update_commit_details(&mut self) -> Result<()> {
+		if self.is_visible() && self.commit_details.is_visible() {
+			let commit = self.selected_commit();
+			self.commit_details.set_commits(
+				commit.map(CommitFilesParams::from),
+				None,
+			)?;
+		}
 		Ok(())
 	}
 
@@ -72,7 +77,7 @@ impl StashList {
 		if self.visible
 			&& matches!(ev, AsyncGitNotification::CommitFiles)
 		{
-			self.update()?;
+			self.update_commit_details()?;
 		}
 
 		Ok(())
@@ -256,14 +261,14 @@ impl Component for StashList {
 	) -> Result<EventState> {
 		if self.is_visible() {
 			if self.list.event(ev)?.is_consumed() {
-				self.update()?;
+				self.update_commit_details()?;
 				return Ok(EventState::Consumed);
 			}
 
 			if let Event::Key(k) = ev {
 				if key_match(k, self.key_config.keys.enter) {
 					self.commit_details.toggle_visible()?;
-					self.update()?;
+					self.update_commit_details()?;
 					return Ok(EventState::Consumed);
 				} else if key_match(k, self.key_config.keys.stash_pop)
 				{

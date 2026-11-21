@@ -135,18 +135,20 @@ impl LogFilterSearch {
 
 	fn match_diff(&self, diff: &Diff<'_>) -> bool {
 		diff.deltas().any(|delta| {
-			if delta
-				.new_file()
-				.path()
+			let new_path = delta.new_file().path();
+			if new_path
 				.and_then(|file| file.as_os_str().to_str())
 				.is_some_and(|file| self.match_text(file))
 			{
 				return true;
 			}
 
-			delta
-				.old_file()
-				.path()
+			let old_path = delta.old_file().path();
+			if old_path == new_path {
+				return false;
+			}
+
+			old_path
 				.and_then(|file| file.as_os_str().to_str())
 				.is_some_and(|file| self.match_text(file))
 		})
@@ -183,54 +185,47 @@ pub fn filter_commit_by_search(
 		move |repo: &Repository,
 		      commit_id: &CommitId|
 		      -> Result<bool> {
+			let fields = filter.options.fields;
+
+			if fields.contains(SearchFields::COMMIT_HASHES) {
+				let hash = commit_id.to_string();
+				if filter.match_text(&hash) {
+					return Ok(true);
+				}
+			}
+
+			if !fields.intersects(
+				SearchFields::MESSAGE_SUMMARY
+					| SearchFields::MESSAGE_BODY
+					| SearchFields::AUTHORS
+					| SearchFields::FILENAMES,
+			) {
+				return Ok(false);
+			}
+
 			let commit = repo.find_commit((*commit_id).into())?;
 
-			let msg_summary_match = filter
-				.options
-				.fields
-				.contains(SearchFields::MESSAGE_SUMMARY)
-				.then(|| {
-					commit
-						.summary()
-						.ok()
-						.flatten()
-						.map(|msg| filter.match_text(msg))
-				})
-				.flatten()
-				.unwrap_or_default();
-
-			let msg_body_match = filter
-				.options
-				.fields
-				.contains(SearchFields::MESSAGE_BODY)
-				.then(|| {
-					commit
-						.body()
-						.ok()
-						.flatten()
-						.map(|msg| filter.match_text(msg))
-				})
-				.flatten()
-				.unwrap_or_default();
-
-			let file_match = filter
-				.options
-				.fields
-				.contains(SearchFields::FILENAMES)
-				.then(|| {
-					get_commit_diff(
-						repo, *commit_id, None, None, None,
-					)
+			if fields.contains(SearchFields::MESSAGE_SUMMARY)
+				&& commit
+					.summary()
 					.ok()
-				})
-				.flatten()
-				.is_some_and(|diff| filter.match_diff(&diff));
-
-			let authors_match = if filter
-				.options
-				.fields
-				.contains(SearchFields::AUTHORS)
+					.flatten()
+					.is_some_and(|msg| filter.match_text(msg))
 			{
+				return Ok(true);
+			}
+
+			if fields.contains(SearchFields::MESSAGE_BODY)
+				&& commit
+					.body()
+					.ok()
+					.flatten()
+					.is_some_and(|msg| filter.match_text(msg))
+			{
+				return Ok(true);
+			}
+
+			if fields.contains(SearchFields::AUTHORS) {
 				let commit_ref = &commit;
 				let filter_ref = &filter;
 				// Mailmap is repo-scoped, not commit-scoped. Cache it per
@@ -239,16 +234,19 @@ pub fn filter_commit_by_search(
 				// commit. `git2::Mailmap` is `!Send` and un-Cloneable, so
 				// the author resolution must happen inside the `with` block
 				// while we hold a borrowed reference to the cached mailmap.
-				MAILMAP_CACHE.with(|cache| {
+				let authors_match = MAILMAP_CACHE.with(|cache| {
 					let mut cache = cache.borrow_mut();
-					let key = repo
-						.workdir()
-						.map(Path::to_path_buf)
-						.unwrap_or_default();
-					let mailmap = cache
-						.entry(key)
-						.or_insert_with(|| repo.mailmap().ok());
-					let author = mailmap.as_ref().map_or_else(
+					let key_ref =
+						repo.workdir().unwrap_or_else(|| Path::new(""));
+					if !cache.contains_key(key_ref) {
+						cache.insert(
+							key_ref.to_path_buf(),
+							repo.mailmap().ok(),
+						);
+					}
+					let mailmap =
+						cache.get(key_ref).and_then(Option::as_ref);
+					let author = mailmap.map_or_else(
 						|| commit_ref.author(),
 						|mm| get_author_of_commit(commit_ref, mm),
 					);
@@ -259,30 +257,22 @@ pub fn filter_commit_by_search(
 								filter_ref.match_text(haystack)
 							})
 						})
-				})
-			} else {
-				false
-			};
+				});
+				if authors_match {
+					return Ok(true);
+				}
+			}
 
-			let commit_hash_match = if filter
-				.options
-				.fields
-				.contains(SearchFields::COMMIT_HASHES)
+			if fields.contains(SearchFields::FILENAMES)
+				&& super::commit_files::get_commit_diff_for_commit(
+					repo, &commit, None, None, false,
+				)
+				.is_ok_and(|diff| filter.match_diff(&diff))
 			{
-				// Search in both short and full hash
-				let short_hash = commit_id.to_string();
-				let full_hash = commit.id().to_string();
-				filter.match_text(&short_hash)
-					|| filter.match_text(&full_hash)
-			} else {
-				false
-			};
+				return Ok(true);
+			}
 
-			Ok(msg_summary_match
-				|| msg_body_match
-				|| file_match
-				|| authors_match
-				|| commit_hash_match)
+			Ok(false)
 		},
 	))
 }
