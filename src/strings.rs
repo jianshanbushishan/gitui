@@ -92,7 +92,7 @@ pub fn tab_divider(_key_config: &SharedKeyConfig) -> String {
 	" | ".to_string()
 }
 pub fn cmd_splitter(_key_config: &SharedKeyConfig) -> String {
-	" ".to_string()
+	" · ".to_string()
 }
 pub fn msg_opening_editor(_key_config: &SharedKeyConfig) -> String {
 	"opening editor...".to_string()

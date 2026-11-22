@@ -5,10 +5,13 @@ use crate::components::{
 use crate::{
 	app::Environment,
 	keys::{key_match, SharedKeyConfig},
+	popups::PaletteAction,
+	queue::{InternalEvent, Queue},
 	strings, ui,
 };
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyModifiers};
+use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use itertools::Itertools;
 use ratatui::{
 	layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -45,6 +48,8 @@ pub struct HelpPopup {
 	filter: String,
 	filtering: bool,
 	viewport_height: Cell<usize>,
+	matcher: SkimMatcherV2,
+	queue: Queue,
 	theme: SharedTheme,
 	key_config: SharedKeyConfig,
 }
@@ -54,11 +59,12 @@ impl DrawableComponent for HelpPopup {
 	fn draw(&self, f: &mut Frame, _rect: Rect) -> Result<()> {
 		if self.visible {
 			let fsize = f.area();
-			let area = ui::centered_rect(76, 78, fsize);
-			let area = ui::rect_inside(
-				ui::Size::new(68, 22),
-				fsize.into(),
-				area,
+			let area = ui::responsive_popup_rect(
+				76,
+				78,
+				ui::Size::new(56, 18),
+				ui::Size::new(96, 36),
+				fsize,
 			);
 
 			ui::clear_popup_area(f, area);
@@ -72,7 +78,7 @@ impl DrawableComponent for HelpPopup {
 						self.theme.title(true),
 					))
 					.borders(Borders::ALL)
-					.border_type(BorderType::Thick)
+					.border_type(BorderType::Rounded)
 					.border_style(self.theme.block(true)),
 				area,
 			);
@@ -99,7 +105,7 @@ impl DrawableComponent for HelpPopup {
 				])
 			} else {
 				Line::from(Span::styled(
-					"Press [/] to filter commands · [↑↓/PgUp/PgDn] scroll",
+					"Press [/] to fuzzy-filter · [↑↓] scroll · [Enter] run command",
 					self.theme.text(false, false),
 				))
 			};
@@ -232,6 +238,7 @@ impl Component for HelpPopup {
 		visibility_blocking(self)
 	}
 
+	#[allow(clippy::too_many_lines)]
 	fn event(&mut self, ev: &Event) -> Result<EventState> {
 		if self.visible {
 			if let Event::Key(e) = ev {
@@ -245,7 +252,9 @@ impl Component for HelpPopup {
 							self.filtering = false;
 						}
 						KeyCode::Enter => {
-							self.filtering = false;
+							if !self.run_selected_command() {
+								self.filtering = false;
+							}
 						}
 						KeyCode::Backspace => {
 							self.filter.pop();
@@ -287,6 +296,10 @@ impl Component for HelpPopup {
 						self.filter.clear();
 						self.selection = 0;
 					}
+				} else if e.code == KeyCode::Enter
+					&& e.modifiers.is_empty()
+				{
+					self.run_selected_command();
 				} else if e.code == KeyCode::Char('/')
 					&& e.modifiers.is_empty()
 				{
@@ -365,8 +378,81 @@ impl HelpPopup {
 			filter: String::new(),
 			filtering: false,
 			viewport_height: Cell::new(16),
+			matcher: SkimMatcherV2::default(),
+			queue: env.queue.clone(),
 			theme: env.theme.clone(),
 			key_config: env.key_config.clone(),
+		}
+	}
+
+	/// Map well-known help commands to directly executable palette actions.
+	fn action_for_cmd(cmd: &CommandInfo) -> Option<PaletteAction> {
+		let name = cmd.text.name.to_lowercase();
+		let desc = cmd.text.desc.to_lowercase();
+		if name.starts_with("commit ") && desc.contains("commit") {
+			Some(PaletteAction::Commit)
+		} else if name.starts_with("branches ")
+			|| desc.contains("select branch")
+		{
+			Some(PaletteAction::Branches)
+		} else if name.starts_with("tags ")
+			|| desc.contains("open tags")
+		{
+			Some(PaletteAction::Tags)
+		} else if name.starts_with("remotes ")
+			|| desc.contains("remotes")
+		{
+			Some(PaletteAction::Remotes)
+		} else if name.starts_with("submodules ") {
+			Some(PaletteAction::Submodules)
+		} else if name.starts_with("lfs ")
+			|| name.starts_with("git lfs ")
+		{
+			Some(PaletteAction::Lfs)
+		} else if name.starts_with("fetch ") {
+			Some(PaletteAction::Fetch)
+		} else if name.starts_with("pull ") {
+			Some(PaletteAction::Pull)
+		} else if name.starts_with("push ") && !name.contains("force") {
+			Some(PaletteAction::Push)
+		} else if name.starts_with("options ") {
+			Some(PaletteAction::Options)
+		} else if desc.contains("toggle diff mode")
+			|| name.contains("diff mode")
+		{
+			Some(PaletteAction::ToggleDiffMode)
+		} else if desc.contains("fullscreen diff zoom") {
+			Some(PaletteAction::ToggleDiffZoom)
+		} else if name.starts_with("external diff")
+			|| desc.contains("external diff")
+		{
+			Some(PaletteAction::ExternalDiff)
+		} else if name.starts_with("stage all") {
+			Some(PaletteAction::StageAll)
+		} else if name.starts_with("unstage all") {
+			Some(PaletteAction::UnstageAll)
+		} else if name.starts_with("find [")
+			&& cmd.text.group == "-- Log --"
+		{
+			Some(PaletteAction::SearchLog)
+		} else if desc.contains("find file") {
+			Some(PaletteAction::FindFile)
+		} else {
+			None
+		}
+	}
+
+	fn run_selected_command(&mut self) -> bool {
+		let action = self
+			.filtered_cmds()
+			.get(self.selection)
+			.and_then(|cmd| Self::action_for_cmd(cmd));
+		if let Some(action) = action {
+			self.hide();
+			self.queue.push(InternalEvent::PaletteAction(action));
+			true
+		} else {
+			false
 		}
 	}
 
@@ -390,18 +476,28 @@ impl HelpPopup {
 	}
 
 	fn filtered_cmds(&self) -> Vec<&CommandInfo> {
-		if self.filter.trim().is_empty() {
+		let query = self.filter.trim();
+		if query.is_empty() {
 			return self.cmds.iter().collect();
 		}
-		let needle = self.filter.to_lowercase();
-		self.cmds
+		let mut scored: Vec<(i64, usize, &CommandInfo)> = self
+			.cmds
 			.iter()
-			.filter(|cmd| {
-				cmd.text.name.to_lowercase().contains(&needle)
-					|| cmd.text.desc.to_lowercase().contains(&needle)
-					|| cmd.text.group.to_lowercase().contains(&needle)
+			.enumerate()
+			.filter_map(|(idx, cmd)| {
+				let haystack = format!(
+					"{} {} {}",
+					cmd.text.name, cmd.text.desc, cmd.text.group
+				);
+				self.matcher
+					.fuzzy_match(&haystack, query)
+					.map(|score| (score, idx, cmd))
 			})
-			.collect()
+			.collect();
+		scored.sort_unstable_by(|a, b| {
+			b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1))
+		});
+		scored.into_iter().map(|(_, _, cmd)| cmd).collect()
 	}
 
 	fn move_selection(&mut self, delta: isize) {
@@ -449,11 +545,23 @@ impl HelpPopup {
 				}
 				processed += 1;
 
+				let runnable =
+					if Self::action_for_cmd(command_info).is_some() {
+						" [⏎]"
+					} else {
+						""
+					};
 				txt.push(Line::from(Span::styled(
 					Cow::from(if is_selected {
-						format!("> {}", command_info.text.name)
+						format!(
+							"> {}{runnable}",
+							command_info.text.name
+						)
 					} else {
-						format!("  {}", command_info.text.name)
+						format!(
+							"  {}{runnable}",
+							command_info.text.name
+						)
 					}),
 					self.theme.text(true, is_selected),
 				)));

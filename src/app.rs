@@ -32,7 +32,6 @@ use crate::{
 		literal_selection, OperationOutcome, PendingOperation,
 		RepoOperation,
 	},
-	setup_popups,
 	strings::{self, order},
 	tabs::{FilesTab, Revlog, StashList, Stashing, Status},
 	try_or_popup,
@@ -47,7 +46,7 @@ use asyncgit::{
 	sync::{
 		self,
 		utils::{repo_work_dir, undo_last_commit},
-		RepoPath, RepoPathRef,
+		RepoPath, RepoPathRef, RepoState,
 	},
 	AsyncGitNotification, PushType,
 };
@@ -336,16 +335,34 @@ impl App {
 			}
 		}
 
-		self.draw_popups(f)?;
-		if let Some(operation) = &self.repo_operation {
-			if let Some(progress) = operation.lfs_progress() {
-				draw_lfs_progress(
-					f,
-					&self.theme,
-					operation.label,
-					progress,
-				);
-			}
+		let popup_area = Layout::default()
+			.direction(Direction::Vertical)
+			.constraints([
+				Constraint::Min(1),
+				Constraint::Length(self.cmdbar.borrow().height()),
+			])
+			.split(fsize)[0];
+
+		self.draw_fullscreen_popups(f, popup_area)?;
+
+		let lfs_progress = self
+			.repo_operation
+			.as_ref()
+			.and_then(PendingOperation::lfs_progress);
+		if self.any_modal_popup_visible() || lfs_progress.is_some() {
+			crate::ui::dim_buffer(f.buffer_mut(), popup_area);
+		}
+
+		self.draw_modal_popups(f, popup_area)?;
+		if let (Some(operation), Some(progress)) =
+			(&self.repo_operation, lfs_progress)
+		{
+			draw_lfs_progress(
+				f,
+				&self.theme,
+				operation.label,
+				progress,
+			);
 		}
 		self.toast.draw(f, fsize, &self.theme);
 
@@ -556,6 +573,9 @@ impl App {
 
 		self.commit_popup.update();
 		self.status_tab.update()?;
+		if !self.status_tab.is_visible() {
+			self.status_tab.refresh_repo_context();
+		}
 		self.revlog.update()?;
 		self.files_tab.update()?;
 		self.stashing_tab.update()?;
@@ -754,7 +774,89 @@ impl App {
 		]
 	);
 
-	setup_popups!(
+	fn any_modal_popup_visible(&self) -> bool {
+		self.commit_popup.is_visible()
+			|| self.stashmsg_popup.is_visible()
+			|| self.help_popup.is_visible()
+			|| self.external_editor_popup.is_visible()
+			|| self.tag_commit_popup.is_visible()
+			|| self.select_branch_popup.is_visible()
+			|| self.remotes_popup.is_visible()
+			|| self.create_remote_popup.is_visible()
+			|| self.rename_remote_popup.is_visible()
+			|| self.update_remote_url_popup.is_visible()
+			|| self.submodule_popup.is_visible()
+			|| self.tags_popup.is_visible()
+			|| self.reset_popup.is_visible()
+			|| self.checkout_option_popup.is_visible()
+			|| self.lfs_popup.is_visible()
+			|| self.create_branch_popup.is_visible()
+			|| self.rename_branch_popup.is_visible()
+			|| self.fuzzy_find_popup.is_visible()
+			|| self.log_search_popup.is_visible()
+			|| self.content_search_popup.is_visible()
+			|| self.push_popup.is_visible()
+			|| self.push_tags_popup.is_visible()
+			|| self.pull_popup.is_visible()
+			|| self.fetch_popup.is_visible()
+			|| self.options_popup.is_visible()
+			|| self.command_palette_popup.is_visible()
+			|| self.confirm_popup.is_visible()
+			|| self.msg_popup.is_visible()
+			|| self.goto_line_popup.is_visible()
+	}
+
+	fn draw_fullscreen_popups(
+		&self,
+		f: &mut Frame,
+		size: Rect,
+	) -> Result<()> {
+		self.inspect_commit_popup.draw(f, size)?;
+		self.compare_commits_popup.draw(f, size)?;
+		self.blame_file_popup.draw(f, size)?;
+		self.file_revlog_popup.draw(f, size)?;
+		self.revision_files_popup.draw(f, size)?;
+		Ok(())
+	}
+
+	fn draw_modal_popups(
+		&self,
+		f: &mut Frame,
+		size: Rect,
+	) -> Result<()> {
+		self.commit_popup.draw(f, size)?;
+		self.stashmsg_popup.draw(f, size)?;
+		self.help_popup.draw(f, size)?;
+		self.external_editor_popup.draw(f, size)?;
+		self.tag_commit_popup.draw(f, size)?;
+		self.select_branch_popup.draw(f, size)?;
+		self.remotes_popup.draw(f, size)?;
+		self.create_remote_popup.draw(f, size)?;
+		self.rename_remote_popup.draw(f, size)?;
+		self.update_remote_url_popup.draw(f, size)?;
+		self.submodule_popup.draw(f, size)?;
+		self.tags_popup.draw(f, size)?;
+		self.reset_popup.draw(f, size)?;
+		self.checkout_option_popup.draw(f, size)?;
+		self.lfs_popup.draw(f, size)?;
+		self.create_branch_popup.draw(f, size)?;
+		self.rename_branch_popup.draw(f, size)?;
+		self.fuzzy_find_popup.draw(f, size)?;
+		self.log_search_popup.draw(f, size)?;
+		self.content_search_popup.draw(f, size)?;
+		self.push_popup.draw(f, size)?;
+		self.push_tags_popup.draw(f, size)?;
+		self.pull_popup.draw(f, size)?;
+		self.fetch_popup.draw(f, size)?;
+		self.options_popup.draw(f, size)?;
+		self.command_palette_popup.draw(f, size)?;
+		self.confirm_popup.draw(f, size)?;
+		self.msg_popup.draw(f, size)?;
+		self.goto_line_popup.draw(f, size)?;
+		Ok(())
+	}
+
+	crate::any_popup_visible!(
 		self,
 		[
 			commit_popup,
@@ -1009,6 +1111,9 @@ impl App {
 			InternalEvent::ShowToast(msg) => {
 				self.toast.show(msg);
 			}
+			InternalEvent::ShowInfoToast(msg) => {
+				self.toast.show_info(msg);
+			}
 			InternalEvent::ShowWarningToast(msg) => {
 				self.toast.show_warning(msg);
 			}
@@ -1109,6 +1214,15 @@ impl App {
 						});
 					if let Err(error) = result {
 						self.msg_popup.show_error(&format!("failed to launch external diff tool:\n{error:#}"))?;
+					} else {
+						let label = self
+							.options
+							.borrow()
+							.external_diff_tool()
+							.label();
+						self.toast.show_info(format!(
+							"Opened external diff ({label})"
+						));
 					}
 				}
 				flags.insert(NeedsUpdate::ALL);
@@ -1428,6 +1542,7 @@ impl App {
 		Ok(())
 	}
 
+	#[allow(clippy::too_many_lines)]
 	fn execute_palette_action(
 		&mut self,
 		action: PaletteAction,
@@ -1447,6 +1562,9 @@ impl App {
 			PaletteAction::Branches => {
 				self.select_branch_popup.open()?;
 			}
+			PaletteAction::CreateBranch => {
+				self.create_branch_popup.open()?;
+			}
 			PaletteAction::Tags => self.tags_popup.open()?,
 			PaletteAction::Remotes => self.remotes_popup.open()?,
 			PaletteAction::Submodules => {
@@ -1455,6 +1573,56 @@ impl App {
 			PaletteAction::Lfs => self.open_lfs_menu(),
 			PaletteAction::Options => self.options_popup.show()?,
 			PaletteAction::Help => self.help_popup.show()?,
+			PaletteAction::ToggleDiffZoom => {
+				if self.tab != 0 {
+					self.set_tab(0)?;
+				}
+				if !self.status_tab.toggle_diff_zoom()? {
+					self.toast
+						.show_warning("Select a file to zoom diff");
+				}
+			}
+			PaletteAction::ExternalDiff => {
+				if !self.status_tab.open_external_diff() {
+					self.toast.show_warning(
+						"No modified file selected for external diff",
+					);
+				}
+			}
+			PaletteAction::ContentSearch => {
+				if self.tab == 0 {
+					if !self.status_tab.start_content_search() {
+						self.toast.show_warning(
+							"No searchable diff or file open",
+						);
+					}
+				} else {
+					self.toast.show_warning(
+						"Open a file or diff to search content",
+					);
+				}
+			}
+			PaletteAction::FindFile => {
+				self.set_tab(2)?;
+				self.files_tab.update()?;
+				self.queue.push(InternalEvent::Update(
+					NeedsUpdate::COMMANDS,
+				));
+				self.toast
+					.show_info("Switched to Files · press [f] to search");
+			}
+			PaletteAction::StageAll => {
+				self.status_tab.stage_all_changes();
+			}
+			PaletteAction::UnstageAll => {
+				self.status_tab.unstage_all_changes();
+			}
+			PaletteAction::CopyCommitHash => {
+				if self.tab != 1 {
+					self.set_tab(1)?;
+				}
+				self.revlog.copy_selected_commit_hash()?;
+			}
 			PaletteAction::ToggleDiffMode => {
 				let next = match self.options.borrow().diff_mode() {
 					crate::components::DiffMode::Unified => {
@@ -1584,9 +1752,12 @@ impl App {
 		}
 		let label = operation.label;
 		match operation.result() {
-			Ok(OperationOutcome::Done) => {}
+			Ok(OperationOutcome::Done) => {
+				self.toast.show(format!("{label} done"));
+			}
 			Ok(OperationOutcome::LastFileMoved) => {
 				self.status_tab.last_file_moved()?;
+				self.toast.show(format!("{label} done"));
 			}
 			Ok(OperationOutcome::CheckoutOptions(branch)) => {
 				self.checkout_option_popup.open(branch)?;
@@ -1594,6 +1765,7 @@ impl App {
 			Ok(OperationOutcome::CheckoutDone {
 				reopen_branches,
 			}) => {
+				self.toast.show(format!("{label} done"));
 				if reopen_branches {
 					self.select_branch_popup.show_local()?;
 				}
@@ -1783,6 +1955,118 @@ impl App {
 		res
 	}
 
+	fn truncate_display(text: &str, max_width: usize) -> String {
+		if text.width() <= max_width {
+			return text.to_owned();
+		}
+		if max_width <= 1 {
+			return "…".to_owned();
+		}
+		let budget = max_width - 1;
+		let mut out = String::new();
+		let mut used = 0;
+		for ch in text.chars() {
+			let w = unicode_width::UnicodeWidthChar::width(ch)
+				.unwrap_or(0);
+			if used + w > budget {
+				break;
+			}
+			out.push(ch);
+			used += w;
+		}
+		out.push('…');
+		out
+	}
+
+	const fn repo_state_badge(
+		state: &RepoState,
+	) -> Option<&'static str> {
+		match state {
+			RepoState::Clean => None,
+			RepoState::Merge => Some("MERGE"),
+			RepoState::Rebase => Some("REBASE"),
+			RepoState::Revert => Some("REVERT"),
+			RepoState::Other => Some("PENDING"),
+		}
+	}
+
+	fn build_global_context_spans(
+		&self,
+		max_width: usize,
+	) -> Vec<Span<'static>> {
+		let mut spans: Vec<Span<'static>> = Vec::new();
+		let mut remaining = max_width;
+
+		if let Some(badge) =
+			Self::repo_state_badge(self.status_tab.repo_state())
+		{
+			let badge_text = format!("[{badge}]");
+			let badge_w = badge_text.width();
+			if badge_w <= remaining {
+				spans.push(Span::styled(
+					badge_text,
+					Theme::attention_block()
+						.add_modifier(ratatui::style::Modifier::BOLD),
+				));
+				remaining = remaining.saturating_sub(badge_w + 1);
+			}
+		}
+
+		if let Some(branch) = self.status_tab.branch_name_cached() {
+			let ab = self.status_tab.branch_ahead_behind();
+			let ab_str = ab.map_or_else(String::new, |(a, b)| {
+				format!(" \u{2191}{a} \u{2193}{b}")
+			});
+			let overhead = 2 + ab_str.width();
+			let include_ab = remaining > overhead + 3;
+			let name_budget = if include_ab {
+				remaining.saturating_sub(overhead).min(24)
+			} else {
+				remaining.saturating_sub(2).min(24)
+			};
+
+			if name_budget >= 2 {
+				if !spans.is_empty() {
+					spans.push(Span::raw(" "));
+				}
+				let display_branch =
+					Self::truncate_display(&branch, name_budget);
+				spans.push(Span::styled(
+					"(",
+					self.theme.text(false, false),
+				));
+				spans.push(Span::styled(
+					display_branch,
+					self.theme.branch(false, true),
+				));
+				if include_ab {
+					if let Some((ahead, behind)) = ab {
+						spans.push(Span::styled(
+							format!(" \u{2191}{ahead}"),
+							self.theme.diff_line(
+								asyncgit::DiffLineType::Add,
+								false,
+							),
+						));
+						spans.push(Span::styled(
+							format!(" \u{2193}{behind}"),
+							self.theme.diff_line(
+								asyncgit::DiffLineType::Delete,
+								false,
+							),
+						));
+					}
+				}
+				spans.push(Span::styled(
+					")",
+					self.theme.text(false, false),
+				));
+			}
+		}
+
+		spans
+	}
+
 	#[allow(clippy::too_many_lines)]
 	fn draw_top_bar(&self, f: &mut Frame, r: Rect) {
 		let r = r.inner(Margin {
@@ -1828,9 +2112,16 @@ impl App {
 			usize::from(cursor_x.saturating_sub(r.x));
 		drop(hit_ranges);
 
+		let right_budget =
+			usize::from(r.width).saturating_sub(tabs_total_w + 1);
+		let context_spans =
+			self.build_global_context_spans(right_budget);
+		let context_w: usize =
+			context_spans.iter().map(Span::width).sum();
+
 		// Shared shortcut hints pinned to the right edge. Progressively
 		// trim less-essential hints on narrow terminals so they never
-		// overwrite the tab strip.
+		// overwrite the tab strip or the global repository context.
 		let kc = &self.key_config;
 		let all_quick = [
 			strings::commands::toggle_tabs_direct(kc).name,
@@ -1840,9 +2131,10 @@ impl App {
 			strings::commands::help_open(kc).name,
 			strings::commands::quit(kc).name,
 		];
-		// Priority order when space is tight (keep Help & Quit longest).
-		let available_for_quick =
-			usize::from(r.width).saturating_sub(tabs_total_w + 1);
+		let sep_before_quick = if context_w > 0 { 3 } else { 0 };
+		let available_for_quick = right_budget
+			.saturating_sub(context_w)
+			.saturating_sub(sep_before_quick);
 		let mut chosen: Vec<&str> = Vec::new();
 		for start_idx in 0..=all_quick.len() {
 			let slice = &all_quick[start_idx..];
@@ -1850,8 +2142,7 @@ impl App {
 				0
 			} else {
 				slice.iter().map(|s| s.width()).sum::<usize>()
-					+ slice.len().saturating_sub(1)
-					+ 2
+					+ slice.len().saturating_sub(1) * 3
 			};
 			if needed <= available_for_quick {
 				chosen = slice.iter().map(String::as_str).collect();
@@ -1878,48 +2169,57 @@ impl App {
 			r,
 		);
 
-		if !chosen.is_empty() {
-			let mut quick_spans: Vec<Span> = Vec::new();
+		if !context_spans.is_empty() || !chosen.is_empty() {
+			let mut right_spans: Vec<Span> = context_spans;
+			if !right_spans.is_empty() && !chosen.is_empty() {
+				right_spans.push(Span::styled(
+					" · ",
+					self.theme.commandbar_splitter(),
+				));
+			}
 			for (i, name) in chosen.iter().enumerate() {
 				if i > 0 {
-					quick_spans.push(Span::raw(" "));
+					right_spans.push(Span::styled(
+						" · ",
+						self.theme.commandbar_splitter(),
+					));
 				}
 				if let Some(bracket_idx) = name.rfind('[') {
 					if name.ends_with(']') {
 						let (label, key_part) =
 							name.split_at(bracket_idx);
 						if !label.is_empty() {
-							quick_spans.push(Span::styled(
+							right_spans.push(Span::styled(
 								label,
 								self.theme.commandbar_label(),
 							));
 						}
-						quick_spans.push(Span::styled(
+						right_spans.push(Span::styled(
 							key_part,
 							self.theme.commandbar_key(),
 						));
 						continue;
 					}
 				}
-				quick_spans.push(Span::styled(
+				right_spans.push(Span::styled(
 					*name,
 					self.theme.commandbar_label(),
 				));
 			}
-			let quick_len: usize =
-				quick_spans.iter().map(Span::width).sum();
+			let right_len: usize =
+				right_spans.iter().map(Span::width).sum();
 			let areas = Layout::default()
 				.direction(Direction::Horizontal)
 				.constraints([
 					Constraint::Min(0),
 					Constraint::Length(
-						u16::try_from(quick_len).unwrap_or(r.width),
+						u16::try_from(right_len).unwrap_or(r.width),
 					),
 				])
 				.split(r);
 
 			f.render_widget(
-				Paragraph::new(Line::from(quick_spans))
+				Paragraph::new(Line::from(right_spans))
 					.alignment(Alignment::Right),
 				areas[1],
 			);

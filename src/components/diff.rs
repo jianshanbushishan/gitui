@@ -31,7 +31,7 @@ use ratatui::{
 	style::Color,
 	symbols,
 	text::{Line, Span},
-	widgets::{Block, Borders},
+	widgets::{Block, BorderType, Borders},
 	Frame,
 };
 use serde::{Deserialize, Serialize};
@@ -41,6 +41,10 @@ use std::{
 	cmp,
 	sync::Arc,
 };
+
+/// Minimum total pane width (in terminal columns) to render side-by-side
+/// delta diffs; narrower panes temporarily downgrade to unified layout.
+const AUTO_UNIFIED_WIDTH_THRESHOLD: u16 = 100;
 
 /// Diff display mode
 #[derive(
@@ -1146,6 +1150,20 @@ impl DiffComponent {
 		matches!(self.diff_mode, DiffMode::DeltaSideBySide)
 	}
 
+	/// Returns `true` when `DeltaSideBySide` is temporarily downgraded to
+	/// unified layout because the diff pane is too narrow for two columns.
+	pub(crate) fn is_auto_unified(&self) -> bool {
+		let inner_w = self.current_size.get().0;
+		self.diff_mode == DiffMode::DeltaSideBySide
+			&& inner_w > 0
+			&& inner_w.saturating_add(2) < AUTO_UNIFIED_WIDTH_THRESHOLD
+	}
+
+	fn effective_side_by_side(&self) -> bool {
+		self.diff_mode == DiffMode::DeltaSideBySide
+			&& !self.is_auto_unified()
+	}
+
 	/// Check if the `delta` binary is available on PATH (cached per process)
 	pub(crate) fn is_delta_available() -> bool {
 		static DELTA_AVAILABLE: std::sync::OnceLock<bool> =
@@ -1172,7 +1190,7 @@ impl DiffComponent {
 			path: self.current.path.clone(),
 			diff_type: self.current.diff_type.clone(),
 			width: self.current_size.get().0,
-			side_by_side: self.diff_mode == DiffMode::DeltaSideBySide,
+			side_by_side: self.effective_side_by_side(),
 			diff_hash: self.current.hash,
 		};
 		let repo = self.repo.borrow().clone();
@@ -1216,7 +1234,7 @@ impl DiffComponent {
 			path: self.current.path.clone(),
 			diff_type: self.current.diff_type.clone(),
 			width: self.current_size.get().0,
-			side_by_side: self.diff_mode == DiffMode::DeltaSideBySide,
+			side_by_side: self.effective_side_by_side(),
 			diff_hash: self.current.hash,
 		};
 		if let Some(result) =
@@ -1344,6 +1362,7 @@ impl DiffComponent {
 				self.theme.title(self.focused()),
 			))
 			.borders(Borders::ALL)
+			.border_type(BorderType::Rounded)
 			.border_style(self.theme.block(self.focused()));
 		let inner = block.inner(r);
 		f.render_widget(block, r);
@@ -1500,13 +1519,22 @@ impl DrawableComponent for DiffComponent {
 			)
 		};
 
+		let auto_unified_info = if self.is_auto_unified()
+			&& !self.current.path.is_empty()
+		{
+			" (auto-unified)"
+		} else {
+			""
+		};
+
 		let title = format!(
-			"{}{}{}{}{}{}",
+			"{}{}{}{}{}{}{}",
 			strings::title_diff(&self.key_config),
 			self.current.path,
 			file_pos_info,
 			line_stats,
 			hunk_info,
+			auto_unified_info,
 			search_info,
 		);
 
@@ -1539,6 +1567,7 @@ impl DrawableComponent for DiffComponent {
 					self.theme.title(self.focused()),
 				))
 				.borders(Borders::ALL)
+				.border_type(BorderType::Rounded)
 				.border_style(self.theme.block(self.focused()));
 			let inner = block.inner(r);
 			f.render_widget(block, r);
@@ -3063,5 +3092,28 @@ mod tests {
 			Some(InternalEvent::OpenExternalEditor(Some(path), _))
 				if path == "src/main.rs"
 		));
+	}
+
+	#[test]
+	fn diff_auto_unified_downgrades_below_threshold_and_recovers() {
+		let env = Environment::test_env();
+		let mut diff = DiffComponent::new(&env, false);
+		diff.diff_mode = DiffMode::DeltaSideBySide;
+		diff.current.path = String::from("src/main.rs");
+
+		// Narrow pane (width 80 < 100) triggers auto-unified.
+		diff.current_size.set((78, 20));
+		assert!(diff.is_auto_unified());
+		assert!(!diff.effective_side_by_side());
+
+		// Wide pane (width 120 >= 100) restores side-by-side.
+		diff.current_size.set((118, 20));
+		assert!(!diff.is_auto_unified());
+		assert!(diff.effective_side_by_side());
+
+		// Explicit Unified mode never reports auto-unified.
+		diff.diff_mode = DiffMode::Unified;
+		diff.current_size.set((78, 20));
+		assert!(!diff.is_auto_unified());
 	}
 }

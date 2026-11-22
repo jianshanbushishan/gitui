@@ -161,6 +161,7 @@ impl TextInputComponent {
 	fn make_block(&self) -> Block<'static> {
 		Block::default()
 			.borders(Borders::ALL)
+			.border_type(ratatui::widgets::BorderType::Rounded)
 			.border_style(self.theme.block(true))
 			.title(ratatui::text::Span::styled(
 				self.title.clone(),

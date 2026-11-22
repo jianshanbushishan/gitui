@@ -184,6 +184,10 @@ impl PushPopup {
 				self.queue.push(InternalEvent::ShowErrorMsg(
 					format!("push failed:\n{err}"),
 				));
+			} else {
+				self.queue.push(InternalEvent::ShowToast(
+					"Push complete".to_owned(),
+				));
 			}
 			self.start_time = None;
 			self.hide();
@@ -352,7 +356,13 @@ impl DrawableComponent for PushPopup {
 			let (label, percent) = self.gauge_content();
 			let detail = self.detail_line();
 
-			let area = ui::centered_rect_absolute(50, 4, f.area());
+			let area = ui::responsive_popup_rect(
+				52,
+				20,
+				ui::Size::new(36, 4),
+				ui::Size::new(56, 4),
+				f.area(),
+			);
 
 			let block = Block::default()
 				.title(Span::styled(
@@ -364,7 +374,7 @@ impl DrawableComponent for PushPopup {
 					self.theme.title(true),
 				))
 				.borders(Borders::ALL)
-				.border_type(BorderType::Thick)
+				.border_type(BorderType::Rounded)
 				.border_style(self.theme.block(true));
 
 			let inner = block.inner(area);

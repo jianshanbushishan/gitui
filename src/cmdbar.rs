@@ -102,16 +102,24 @@ impl CommandBar {
 	}
 
 	fn is_multiline(&self, width: u16) -> bool {
+		let splitter_w = UnicodeWidthStr::width(
+			strings::cmd_splitter(&self.key_config).as_str(),
+		);
 		let mut line_width = 0_usize;
 		for c in &self.cmd_infos {
 			let entry_w =
 				UnicodeWidthStr::width(c.text.name.as_str());
+			let needed = if line_width > 0 {
+				line_width + splitter_w + entry_w
+			} else {
+				entry_w
+			};
 
-			if line_width + entry_w > width as usize {
+			if needed > width as usize {
 				return true;
 			}
 
-			line_width += entry_w + 1;
+			line_width = needed;
 		}
 
 		false
@@ -127,22 +135,31 @@ impl CommandBar {
 			width
 		};
 
+		let splitter_w = UnicodeWidthStr::width(
+			strings::cmd_splitter(&self.key_config).as_str(),
+		);
 		let mut line_width = 0_usize;
 		let mut lines = 1_u16;
 
 		for c in &self.cmd_infos {
 			let entry_w =
 				UnicodeWidthStr::width(c.text.name.as_str());
+			let needed = if line_width > 0 {
+				line_width + splitter_w + entry_w
+			} else {
+				entry_w
+			};
 
-			if line_width + entry_w > width as usize {
+			if needed > width as usize && line_width > 0 {
 				self.draw_list.push(DrawListEntry::LineBreak);
-				line_width = 0;
+				line_width = entry_w;
 				lines += 1;
-			} else if line_width > 0 {
-				self.draw_list.push(DrawListEntry::Splitter);
+			} else {
+				if line_width > 0 {
+					self.draw_list.push(DrawListEntry::Splitter);
+				}
+				line_width = needed;
 			}
-
-			line_width += entry_w + 1;
 
 			self.draw_list.push(DrawListEntry::Command(Command {
 				txt: c.text.name.clone(),
@@ -156,7 +173,10 @@ impl CommandBar {
 
 	fn rebuild_rendered_lines(&mut self) {
 		self.rendered_lines.clear();
-		let splitter = Span::raw(strings::cmd_splitter(&self.key_config));
+		let splitter = Span::styled(
+			strings::cmd_splitter(&self.key_config),
+			self.theme.commandbar_splitter(),
+		);
 		let label_style = self.theme.commandbar_label();
 		let key_style = self.theme.commandbar_key();
 

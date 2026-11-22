@@ -56,7 +56,7 @@ impl AppOption {
 				"Untracked files in Status: Gitconfig, No, Normal, or All."
 			}
 			Self::DiffMode => {
-				"Switch between built-in Unified diff and delta Side-by-side."
+				"Switch between Unified diff and delta Side-by-side."
 			}
 			Self::DiffIgnoreWhitespaces => {
 				"Ignore whitespace-only changes in diffs."
@@ -65,22 +65,22 @@ impl AppOption {
 				"Unchanged context lines shown around each diff hunk."
 			}
 			Self::DiffInterhunkLines => {
-				"Merge adjacent hunks separated by at most N unchanged lines."
+				"Merge adjacent hunks separated by at most N lines."
 			}
 			Self::ExternalDiffTool => {
 				"External viewer launched by [d] for full-file comparison."
 			}
 			Self::AiCommitBackend => {
-				"Backend used by [Ctrl+g] in Commit popup to draft messages."
+				"Backend for [Ctrl+g] in Commit popup to draft messages."
 			}
 			Self::MouseSupport => {
-				"Enable mouse wheel scrolling and click-to-focus (disables terminal drag-select)."
+				"Enable mouse scroll & click focus (no terminal select)."
 			}
 			Self::StatusLeftRatio => {
-				"Left file-tree width (%) in the Status tab. Also adjustable live with [<]/[>]."
+				"Left file-tree width (%) in Status tab; [<]/[>] adjusts."
 			}
 			Self::LogLeftRatio => {
-				"Left commit-list width (%) in Log & Stashes tabs. Also adjustable with [<]/[>]."
+				"Left list width (%) in Log & Stashes; [<]/[>] adjusts."
 			}
 		}
 	}
@@ -448,6 +448,7 @@ impl DrawableComponent for OptionsPopup {
 			ui::clear_popup_area(f, popup_area);
 			let block = Block::default()
 				.borders(Borders::ALL)
+				.border_type(ratatui::widgets::BorderType::Rounded)
 				.padding(Padding::horizontal(1))
 				.title(Span::styled(
 					" Global Options ",
@@ -689,5 +690,19 @@ mod tests {
 			env.options.borrow().diff_mode(),
 			DiffMode::Unified
 		);
+	}
+
+	#[test]
+	fn all_option_descriptions_fit_single_line() {
+		for option in AppOption::ORDER {
+			let desc = option.description();
+			let wrapped_lines =
+				bwrap::wrap_maybrk!(desc, 58).lines().count();
+			assert_eq!(
+				wrapped_lines, 1,
+				"option {option:?} description should fit on 1 line (len {}): {desc}",
+				desc.len()
+			);
+		}
 	}
 }

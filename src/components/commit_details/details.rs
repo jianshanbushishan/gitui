@@ -125,6 +125,25 @@ impl DetailsComponent {
 		}
 	}
 
+	/// Scroll commit details (message or info) via mouse wheel.
+	pub fn scroll_mouse(&self, down: bool) {
+		let dir = if down {
+			ScrollType::Down
+		} else {
+			ScrollType::Up
+		};
+		for _ in 0..3 {
+			match self.focus {
+				DetailsFocus::Info => {
+					self.info_scroll.move_top(dir);
+				}
+				DetailsFocus::Message => {
+					self.scroll.move_top(dir);
+				}
+			}
+		}
+	}
+
 	pub fn set_focus(&mut self, focus: DetailsFocus) {
 		match focus {
 			DetailsFocus::Info => {

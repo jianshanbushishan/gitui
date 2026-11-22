@@ -164,6 +164,7 @@ impl DrawableComponent for BlameFilePopup {
 				.block(
 					Block::default()
 						.borders(Borders::ALL)
+						.border_type(ratatui::widgets::BorderType::Rounded)
 						.title(Span::styled(
 							title_with_highlight_progress,
 							self.theme.title(true),

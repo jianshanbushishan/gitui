@@ -356,7 +356,7 @@ impl DrawableComponent for LfsPopup {
 		let block = Block::default()
 			.title(Span::styled(" Git LFS ", self.theme.title(true)))
 			.borders(Borders::ALL)
-			.border_type(BorderType::Thick)
+			.border_type(BorderType::Rounded)
 			.border_style(self.theme.block(true))
 			.padding(Padding::horizontal(padding));
 		f.render_widget(Clear, rect);

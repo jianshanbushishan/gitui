@@ -18,7 +18,7 @@ use crossterm::event::Event;
 use ratatui::{
 	layout::Rect,
 	text::{Line, Span},
-	widgets::{Block, Borders, Clear},
+	widgets::{Block, Borders},
 	Frame,
 };
 
@@ -157,15 +157,20 @@ impl ResetPopup {
 impl DrawableComponent for ResetPopup {
 	fn draw(&self, f: &mut Frame, area: Rect) -> Result<()> {
 		if self.is_visible() {
-			const SIZE: (u16, u16) = (55, 5);
-			let area =
-				ui::centered_rect_absolute(SIZE.0, SIZE.1, area);
+			let area = ui::responsive_popup_rect(
+				55,
+				25,
+				ui::Size::new(36, 5),
+				ui::Size::new(60, 5),
+				area,
+			);
 
 			let width = area.width;
 
-			f.render_widget(Clear, area);
+			ui::clear_popup_area(f, area);
 			let block = Block::default()
 				.borders(Borders::ALL)
+				.border_type(ratatui::widgets::BorderType::Rounded)
 				.title(Span::styled("Reset", self.theme.title(true)))
 				.border_style(self.theme.block(true));
 			ui::render_block_text(

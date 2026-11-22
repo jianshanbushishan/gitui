@@ -108,6 +108,7 @@ struct LfsState {
 	lines: Vec<String>,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 pub struct Status {
 	repo: RepoPathRef,
 	visible: bool,
@@ -152,6 +153,9 @@ pub struct Status {
 	wd_area: Cell<Rect>,
 	stage_area: Cell<Rect>,
 	right_area: Cell<Rect>,
+	total_area: Cell<Rect>,
+	diff_zoomed: bool,
+	dragging_split: bool,
 }
 
 impl DrawableComponent for Status {
@@ -173,22 +177,26 @@ impl DrawableComponent for Status {
 			std::rc::Rc::new([rect])
 		};
 
+		self.total_area.set(rects[0]);
+
 		let left_ratio = self.options.borrow().status_left_ratio();
 		let right_ratio = 100 - left_ratio;
 
 		let chunks = Layout::default()
 			.direction(Direction::Horizontal)
-			.constraints(if self.focus == Focus::Diff {
-				[
-					Constraint::Percentage(0),
-					Constraint::Percentage(100),
-				]
-			} else {
-				[
-					Constraint::Percentage(left_ratio),
-					Constraint::Percentage(right_ratio),
-				]
-			})
+			.constraints(
+				if self.focus == Focus::Diff && self.diff_zoomed {
+					[
+						Constraint::Percentage(0),
+						Constraint::Percentage(100),
+					]
+				} else {
+					[
+						Constraint::Percentage(left_ratio),
+						Constraint::Percentage(right_ratio),
+					]
+				},
+			)
 			.split(rects[0]);
 
 		let left_chunks = Layout::default()
@@ -235,6 +243,7 @@ impl DrawableComponent for Status {
 						.block(
 							Block::default()
 								.borders(Borders::ALL)
+								.border_type(BorderType::Rounded)
 								.border_style(self.theme.block(false))
 								.title(Span::styled(
 									"Git LFS",
@@ -375,6 +384,9 @@ impl Status {
 			wd_area: Cell::new(Rect::default()),
 			stage_area: Cell::new(Rect::default()),
 			right_area: Cell::new(Rect::default()),
+			total_area: Cell::new(Rect::default()),
+			diff_zoomed: false,
+			dragging_split: false,
 		}
 	}
 
@@ -402,6 +414,99 @@ impl Status {
 		self.git_branch_name.lookup().ok()
 	}
 
+	pub fn branch_name_cached(&self) -> Option<String> {
+		self.git_branch_name.last()
+	}
+
+	pub fn branch_ahead_behind(&self) -> Option<(usize, usize)> {
+		self.git_branch_state
+			.as_ref()
+			.map(|state| (state.ahead, state.behind))
+	}
+
+	pub const fn repo_state(&self) -> &RepoState {
+		&self.git_state
+	}
+
+	/// Refresh lightweight global repository context (branch name,
+	/// upstream ahead/behind, and merge/rebase state) even when another
+	/// tab is active so the global top bar stays accurate everywhere.
+	pub fn refresh_repo_context(&mut self) {
+		let previous_branch = self.git_branch_name.last();
+		let current_branch = self.git_branch_name.lookup().ok();
+		if current_branch != previous_branch
+			|| self.git_branch_state_branch != current_branch
+		{
+			self.request_branch_compare();
+		}
+		if let Ok(state) = sync::repo_state(&self.repo.borrow()) {
+			self.git_state = state;
+		}
+	}
+
+	/// Toggle zoomed (full-width) Diff pane. If currently on a file in
+	/// Unstaged/Staged, focuses Diff and zooms it immediately.
+	pub fn toggle_diff_zoom(&mut self) -> Result<bool> {
+		if self.focus == Focus::Diff {
+			self.diff_zoomed = !self.diff_zoomed;
+			return Ok(true);
+		}
+		if self.can_focus_diff() {
+			self.diff_zoomed = true;
+			self.switch_focus(Focus::Diff)?;
+			return Ok(true);
+		}
+		Ok(false)
+	}
+
+	pub fn open_external_diff(&self) -> bool {
+		if let Some((item, staged)) = self.selected_status_item() {
+			self.queue.push(InternalEvent::OpenExternalDiff(
+				item.path,
+				if staged {
+					DiffType::Stage
+				} else {
+					DiffType::WorkDir
+				},
+			));
+			return true;
+		}
+		false
+	}
+
+	pub fn start_content_search(&self) -> bool {
+		match self.right_pane {
+			RightPane::Diff => {
+				self.diff.start_search();
+				true
+			}
+			RightPane::File => {
+				self.file_preview.start_search();
+				true
+			}
+			RightPane::Lfs => false,
+		}
+	}
+
+	pub fn stage_all_changes(&self) {
+		self.queue.push(InternalEvent::RepoOperation(
+			crate::repo_operation::RepoOperation::StageAll {
+				path: "*".into(),
+				config: self.options.borrow().status_show_untracked(),
+				last: true,
+			},
+		));
+	}
+
+	pub fn unstage_all_changes(&self) {
+		self.queue.push(InternalEvent::RepoOperation(
+			crate::repo_operation::RepoOperation::Unstage {
+				path: "*".into(),
+				last: true,
+			},
+		));
+	}
+
 	pub fn content_search_selected(
 		&mut self,
 		query: &str,
@@ -419,29 +524,6 @@ impl Status {
 			),
 			RightPane::Lfs => {}
 		}
-	}
-
-	fn truncate_to_width(text: &str, max_width: usize) -> String {
-		if text.width() <= max_width {
-			return text.to_owned();
-		}
-		if max_width <= 1 {
-			return "…".to_owned();
-		}
-		let budget = max_width - 1;
-		let mut out = String::new();
-		let mut used = 0;
-		for ch in text.chars() {
-			let w = unicode_width::UnicodeWidthChar::width(ch)
-				.unwrap_or(0);
-			if used + w > budget {
-				break;
-			}
-			out.push(ch);
-			used += w;
-		}
-		out.push('…');
-		out
 	}
 
 	fn styled_line_stats(&self, added: usize, deleted: usize) -> Vec<Span<'static>> {
@@ -464,15 +546,14 @@ impl Status {
 		]
 	}
 
-	#[allow(clippy::too_many_lines)]
 	fn draw_branch_state(
 		&self,
 		f: &mut ratatui::Frame,
 		chunks: &[ratatui::layout::Rect],
 	) {
-		// Unstaged pane top row: keep at least 1 border cell gap after
-		// the left title ("Unstaged Changes") so narrow panes never
-		// overwrite the title.
+		// Unstaged line stats on the Unstaged pane's top border.
+		// (Branch name & upstream ahead/behind now live permanently
+		// in the global top bar so they remain visible in all views.)
 		let wd_rect = chunks[0];
 		let wd_title_w =
 			strings::title_status(&self.key_config).width() + 2;
@@ -487,76 +568,12 @@ impl Status {
 		let stats_w: usize =
 			stats_spans.iter().map(Span::width).sum();
 
-		let branch_spans: Vec<Span<'static>> =
-			self.git_branch_name.last().map_or_else(
-				Vec::new,
-				|branch_name| {
-					let ab = self
-						.git_branch_state
-						.as_ref()
-						.map(|state| (state.ahead, state.behind));
-					let ab_text = ab.map_or_else(
-						String::new,
-						|(ahead, behind)| {
-							format!(" \u{2191}{ahead} \u{2193}{behind}")
-						},
-					);
-					let sep_w = usize::from(stats_w > 0);
-					let budget = wd_avail
-						.saturating_sub(stats_w + sep_w);
-					let overhead = 2 + ab_text.width();
-					if budget <= overhead + 1 {
-						return Vec::new();
-					}
-					let display_name = Self::truncate_to_width(
-						&branch_name,
-						budget - overhead,
-					);
-					let mut spans = vec![
-						Span::styled("(", self.theme.text(false, false)),
-						Span::styled(
-							display_name,
-							self.theme.branch(false, false),
-						),
-					];
-					if let Some((ahead, behind)) = ab {
-						spans.push(Span::styled(
-							format!(" \u{2191}{ahead}"),
-							self.theme.diff_line(
-								asyncgit::DiffLineType::Add,
-								false,
-							),
-						));
-						spans.push(Span::styled(
-							format!(" \u{2193}{behind}"),
-							self.theme.diff_line(
-								asyncgit::DiffLineType::Delete,
-								false,
-							),
-						));
-					}
-					spans.push(Span::styled(
-						")",
-						self.theme.text(false, false),
-					));
-					spans
-				},
-			);
-
-		let mut wd_spans = Vec::new();
-		if stats_w > 0 && stats_w <= wd_avail {
-			wd_spans.extend(stats_spans);
-		}
-		if !branch_spans.is_empty() {
-			if !wd_spans.is_empty() {
-				wd_spans.push(Span::raw(" "));
-			}
-			wd_spans.extend(branch_spans);
-		}
-
-		if !wd_spans.is_empty() && wd_rect.width > 2 && wd_rect.height > 0
+		if stats_w > 0
+			&& stats_w <= wd_avail
+			&& wd_rect.width > 2
+			&& wd_rect.height > 0
 		{
-			let w = Paragraph::new(Line::from(wd_spans))
+			let w = Paragraph::new(Line::from(stats_spans))
 				.alignment(Alignment::Right);
 			let rect = Rect::new(
 				wd_rect.x + 1,
@@ -672,7 +689,7 @@ impl Status {
 			let w = Paragraph::new(line)
 				.block(
 					Block::default()
-						.border_type(BorderType::Plain)
+						.border_type(BorderType::Rounded)
 						.borders(Borders::all())
 						.border_style(Theme::attention_block())
 						.title(Span::styled(
@@ -711,9 +728,11 @@ impl Status {
 
 			match self.focus {
 				Focus::WorkDir => {
+					self.diff_zoomed = false;
 					self.set_diff_target(DiffTarget::WorkingDir);
 				}
 				Focus::Stage => {
+					self.diff_zoomed = false;
 					self.set_diff_target(DiffTarget::Stage);
 				}
 				Focus::Diff => {
@@ -2153,8 +2172,24 @@ impl Component for Status {
 				out.push(
 					CommandInfo::new(
 						crate::components::CommandText::new(
+							if self.diff_zoomed {
+								"Split [z]".to_owned()
+							} else {
+								"Zoom [z]".to_owned()
+							},
+							"toggle fullscreen diff zoom",
+							"-- Diff --",
+						),
+						true,
+						true,
+					)
+					.order(strings::order::NAV),
+				);
+				out.push(
+					CommandInfo::new(
+						crate::components::CommandText::new(
 							"Files [[] / []]".to_owned(),
-							"switch previous/next file while zoomed in diff",
+							"switch previous/next file while in diff",
 							"-- Diff --",
 						),
 						true,
@@ -2275,24 +2310,65 @@ impl Component for Status {
 			if let Event::Mouse(mouse) = ev {
 				let pos =
 					ratatui::layout::Position::new(mouse.column, mouse.row);
+				let total = self.total_area.get();
+				let right_area = self.right_area.get();
+				let split_visible =
+					!(self.focus == Focus::Diff && self.diff_zoomed);
 				match mouse.kind {
 					MouseEventKind::Down(MouseButton::Left) => {
-						if self.focus != Focus::Diff
+						if split_visible
+							&& total.contains(pos)
+							&& total.width >= 20
+							&& mouse.column.abs_diff(right_area.x) <= 1
+						{
+							self.dragging_split = true;
+							return Ok(EventState::Consumed);
+						}
+						if split_visible
 							&& self.wd_area.get().contains(pos)
 						{
 							self.switch_focus(Focus::WorkDir)?;
+							if self.index_wd.select_at_row(mouse.row) {
+								self.update_diff()?;
+							}
 							return Ok(EventState::Consumed);
-						} else if self.focus != Focus::Diff
+						} else if split_visible
 							&& self.stage_area.get().contains(pos)
 						{
 							self.switch_focus(Focus::Stage)?;
+							if self.index.select_at_row(mouse.row) {
+								self.update_diff()?;
+							}
 							return Ok(EventState::Consumed);
-						} else if self.right_area.get().contains(pos)
+						} else if right_area.contains(pos)
 							&& self.can_focus_diff()
 						{
 							self.switch_focus(Focus::Diff)?;
 							return Ok(EventState::Consumed);
 						}
+					}
+					MouseEventKind::Drag(MouseButton::Left)
+						if self.dragging_split && total.width > 0 =>
+					{
+						let rel = mouse.column.saturating_sub(total.x);
+						let ratio = u16::try_from(
+							u32::from(rel) * 100
+								/ u32::from(total.width),
+						)
+						.unwrap_or(50);
+						self.options
+							.borrow_mut()
+							.set_status_left_ratio_preview(ratio);
+						return Ok(EventState::Consumed);
+					}
+					MouseEventKind::Up(MouseButton::Left)
+						if self.dragging_split =>
+					{
+						self.dragging_split = false;
+						self.options
+							.borrow_mut()
+							.save_preferences_now();
+						return Ok(EventState::Consumed);
 					}
 					MouseEventKind::ScrollDown
 					| MouseEventKind::ScrollUp => {
@@ -2300,7 +2376,7 @@ impl Component for Status {
 							mouse.kind,
 							MouseEventKind::ScrollDown
 						);
-						if self.right_area.get().contains(pos) {
+						if right_area.contains(pos) {
 							match self.right_pane {
 								RightPane::Diff => {
 									self.diff.scroll_mouse(down);
@@ -2313,12 +2389,19 @@ impl Component for Status {
 								}
 								RightPane::Lfs => {}
 							}
-						} else if self.wd_area.get().contains(pos) {
-							self.index_wd.scroll_mouse(down);
-							return Ok(EventState::Consumed);
-						} else if self.stage_area.get().contains(pos)
+						} else if split_visible
+							&& self.wd_area.get().contains(pos)
 						{
-							self.index.scroll_mouse(down);
+							if self.index_wd.scroll_mouse(down) {
+								self.update_diff()?;
+							}
+							return Ok(EventState::Consumed);
+						} else if split_visible
+							&& self.stage_area.get().contains(pos)
+						{
+							if self.index.scroll_mouse(down) {
+								self.update_diff()?;
+							}
 							return Ok(EventState::Consumed);
 						}
 					}
@@ -2327,6 +2410,14 @@ impl Component for Status {
 			}
 
 			if let Event::Key(k) = ev {
+				if k.modifiers.is_empty()
+					&& k.code == KeyCode::Char('z')
+					&& (self.focus == Focus::Diff
+						|| self.can_focus_diff())
+				{
+					self.toggle_diff_zoom()?;
+					return Ok(EventState::Consumed);
+				}
 				if self.focus == Focus::Diff
 					&& k.modifiers.is_empty()
 					&& matches!(

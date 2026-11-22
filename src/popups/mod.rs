@@ -109,7 +109,7 @@ fn render_popup<'a, T>(
 		Block::default()
 			.title(Span::styled(title, theme.title(focused)))
 			.borders(Borders::ALL)
-			.border_type(BorderType::Thick)
+			.border_type(BorderType::Rounded)
 			.border_style(theme.block(focused))
 			.padding(Padding::horizontal(1))
 	} else {
@@ -328,15 +328,15 @@ mod tests {
 			true,
 		);
 
-		// four corners should be thick border glyphs
-		assert_eq!(buf[(0, 0)].symbol(), "┏", "top-left corner");
-		assert_eq!(buf[(29, 0)].symbol(), "┓", "top-right corner");
-		assert_eq!(buf[(0, 4)].symbol(), "┗", "bottom-left corner");
-		assert_eq!(buf[(29, 4)].symbol(), "┛", "bottom-right corner");
+		// four corners should be rounded border glyphs
+		assert_eq!(buf[(0, 0)].symbol(), "╭", "top-left corner");
+		assert_eq!(buf[(29, 0)].symbol(), "╮", "top-right corner");
+		assert_eq!(buf[(0, 4)].symbol(), "╰", "bottom-left corner");
+		assert_eq!(buf[(29, 4)].symbol(), "╯", "bottom-right corner");
 		// right edge should be a vertical border, not stomped by content
-		assert_eq!(buf[(29, 2)].symbol(), "┃", "right edge mid");
+		assert_eq!(buf[(29, 2)].symbol(), "│", "right edge mid");
 		// left edge should be a vertical border, not stomped by content
-		assert_eq!(buf[(0, 2)].symbol(), "┃", "left edge mid");
+		assert_eq!(buf[(0, 2)].symbol(), "│", "left edge mid");
 	}
 
 	#[test]
@@ -361,7 +361,7 @@ mod tests {
 		// left border at (0, 1) must remain the vertical border glyph
 		assert_eq!(
 			buf[(0, 1)].symbol(),
-			"┃",
+			"│",
 			"left border preserved"
 		);
 		// the wide char lands at (2, 1) — inside the padding-inner area
@@ -373,7 +373,7 @@ mod tests {
 		// right border at (5, 1) must remain the vertical border glyph
 		assert_eq!(
 			buf[(5, 1)].symbol(),
-			"┃",
+			"│",
 			"right border preserved"
 		);
 	}
@@ -405,13 +405,13 @@ mod tests {
 		render_popup(
 			&mut buf, area, "Reset", txt, &theme, true, true,
 		);
-		// all four corners of the popup must be thick border glyphs
-		assert_eq!(buf[(10, 3)].symbol(), "┏", "tl");
-		assert_eq!(buf[(29, 3)].symbol(), "┓", "tr");
-		assert_eq!(buf[(10, 6)].symbol(), "┗", "bl");
-		assert_eq!(buf[(29, 6)].symbol(), "┛", "br");
+		// all four corners of the popup must be rounded border glyphs
+		assert_eq!(buf[(10, 3)].symbol(), "╭", "tl");
+		assert_eq!(buf[(29, 3)].symbol(), "╮", "tr");
+		assert_eq!(buf[(10, 6)].symbol(), "╰", "bl");
+		assert_eq!(buf[(29, 6)].symbol(), "╯", "br");
 		// left/right edges mid-popup must be vertical borders
-		assert_eq!(buf[(10, 4)].symbol(), "┃", "left edge");
-		assert_eq!(buf[(29, 4)].symbol(), "┃", "right edge");
+		assert_eq!(buf[(10, 4)].symbol(), "│", "left edge");
+		assert_eq!(buf[(29, 4)].symbol(), "│", "right edge");
 	}
 }

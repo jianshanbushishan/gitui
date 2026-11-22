@@ -96,6 +96,10 @@ impl ChangesComponent {
 		self.files.scroll_mouse(down)
 	}
 
+	pub fn select_at_row(&mut self, row: u16) -> bool {
+		self.files.select_at_row(row)
+	}
+
 	#[cfg(test)]
 	pub(crate) const fn is_pending(&self) -> bool {
 		self.files.is_pending()

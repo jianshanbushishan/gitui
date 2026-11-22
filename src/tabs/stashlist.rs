@@ -16,8 +16,11 @@ use asyncgit::{
 	sync::{self, CommitId, RepoPath, RepoPathRef},
 	AsyncGitNotification, CommitFilesParams,
 };
-use crossterm::event::Event;
-use ratatui::layout::{Constraint, Direction, Layout};
+use crossterm::event::{Event, MouseButton, MouseEventKind};
+use ratatui::layout::{
+	Constraint, Direction, Layout, Position, Rect,
+};
+use std::cell::Cell;
 
 pub struct StashList {
 	repo: RepoPathRef,
@@ -27,6 +30,10 @@ pub struct StashList {
 	queue: Queue,
 	key_config: SharedKeyConfig,
 	options: SharedOptions,
+	total_area: Cell<Rect>,
+	list_area: Cell<Rect>,
+	details_area: Cell<Rect>,
+	dragging_split: bool,
 }
 
 impl StashList {
@@ -43,6 +50,10 @@ impl StashList {
 			key_config: env.key_config.clone(),
 			repo: env.repo.clone(),
 			options: env.options.clone(),
+			total_area: Cell::new(Rect::default()),
+			list_area: Cell::new(Rect::default()),
+			details_area: Cell::new(Rect::default()),
+			dragging_split: false,
 		}
 	}
 
@@ -184,6 +195,7 @@ impl DrawableComponent for StashList {
 		f: &mut ratatui::Frame,
 		rect: ratatui::layout::Rect,
 	) -> Result<()> {
+		self.total_area.set(rect);
 		if self.commit_details.is_visible() {
 			let left_ratio = self.options.borrow().log_left_ratio();
 			let right_ratio = 100 - left_ratio;
@@ -196,10 +208,14 @@ impl DrawableComponent for StashList {
 				])
 				.split(rect);
 
+			self.list_area.set(chunks[0]);
+			self.details_area.set(chunks[1]);
 			self.list.draw(f, chunks[0])?;
 			self.commit_details.draw(f, chunks[1])?;
 			self.commit_details.files().draw_popup(f)?;
 		} else {
+			self.list_area.set(rect);
+			self.details_area.set(Rect::default());
 			self.list.draw(f, rect)?;
 		}
 
@@ -255,11 +271,87 @@ impl Component for StashList {
 		visibility_blocking(self)
 	}
 
+	#[allow(clippy::too_many_lines)]
 	fn event(
 		&mut self,
 		ev: &crossterm::event::Event,
 	) -> Result<EventState> {
 		if self.is_visible() {
+			if let Event::Mouse(mouse) = ev {
+				let pos = Position::new(mouse.column, mouse.row);
+				let total = self.total_area.get();
+				let list_area = self.list_area.get();
+				let details_area = self.details_area.get();
+				match mouse.kind {
+					MouseEventKind::Down(MouseButton::Left) => {
+						if self.commit_details.is_visible()
+							&& total.contains(pos)
+							&& total.width >= 20
+							&& mouse.column.abs_diff(details_area.x) <= 1
+						{
+							self.dragging_split = true;
+							return Ok(EventState::Consumed);
+						}
+						if self.commit_details.is_visible()
+							&& details_area.contains(pos)
+							&& self.commit_details.handle_mouse(*mouse)
+						{
+							return Ok(EventState::Consumed);
+						}
+						if list_area.contains(pos) {
+							if self.commit_details.is_visible() {
+								self.commit_details.focus_details();
+							}
+							if self.list.select_at_row(mouse.row) {
+								self.update_commit_details()?;
+							}
+							return Ok(EventState::Consumed);
+						}
+					}
+					MouseEventKind::Drag(MouseButton::Left)
+						if self.dragging_split && total.width > 0 =>
+					{
+						let rel = mouse.column.saturating_sub(total.x);
+						let ratio = u16::try_from(
+							u32::from(rel) * 100
+								/ u32::from(total.width),
+						)
+						.unwrap_or(60);
+						self.options
+							.borrow_mut()
+							.set_log_left_ratio_preview(ratio);
+						return Ok(EventState::Consumed);
+					}
+					MouseEventKind::Up(MouseButton::Left)
+						if self.dragging_split =>
+					{
+						self.dragging_split = false;
+						self.options
+							.borrow_mut()
+							.save_preferences_now();
+						return Ok(EventState::Consumed);
+					}
+					MouseEventKind::ScrollDown
+					| MouseEventKind::ScrollUp => {
+						if self.commit_details.is_visible()
+							&& details_area.contains(pos)
+							&& self.commit_details.handle_mouse(*mouse)
+						{
+							return Ok(EventState::Consumed);
+						}
+						let down = matches!(
+							mouse.kind,
+							MouseEventKind::ScrollDown
+						);
+						if self.list.scroll_mouse(down)? {
+							self.update_commit_details()?;
+						}
+						return Ok(EventState::Consumed);
+					}
+					_ => {}
+				}
+			}
+
 			if self.list.event(ev)?.is_consumed() {
 				self.update_commit_details()?;
 				return Ok(EventState::Consumed);

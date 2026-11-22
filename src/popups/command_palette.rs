@@ -16,7 +16,7 @@ use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use ratatui::{
 	layout::{Constraint, Direction, Layout, Margin, Rect},
 	text::{Line, Span},
-	widgets::{Block, Borders},
+	widgets::{Block, BorderType, Borders},
 	Frame,
 };
 use std::cell::Cell;
@@ -31,6 +31,7 @@ pub enum PaletteAction {
 	TabStashes,
 	Commit,
 	Branches,
+	CreateBranch,
 	Tags,
 	Remotes,
 	Submodules,
@@ -38,6 +39,13 @@ pub enum PaletteAction {
 	Options,
 	Help,
 	ToggleDiffMode,
+	ToggleDiffZoom,
+	ExternalDiff,
+	ContentSearch,
+	FindFile,
+	StageAll,
+	UnstageAll,
+	CopyCommitHash,
 	Fetch,
 	Pull,
 	Push,
@@ -59,10 +67,12 @@ impl PaletteItem {
 	fn new(
 		title: &'static str,
 		category: &'static str,
+		keywords: &'static str,
 		hint: String,
 		action: PaletteAction,
 	) -> Self {
-		let haystack = format!("{category} {title} {hint}");
+		let haystack =
+			format!("{category} {title} {keywords} {hint}");
 		Self {
 			title,
 			category,
@@ -121,96 +131,174 @@ impl CommandPalettePopup {
 			PaletteItem::new(
 				"Switch to Status tab",
 				"Tab",
+				"状态 变更 status changes",
 				format!("[{}]", kc.get_hint(kc.keys.tab_status)),
 				PaletteAction::TabStatus,
 			),
 			PaletteItem::new(
 				"Switch to Log tab",
 				"Tab",
+				"日志 提交记录 log history",
 				format!("[{}]", kc.get_hint(kc.keys.tab_log)),
 				PaletteAction::TabLog,
 			),
 			PaletteItem::new(
 				"Switch to Files tab",
 				"Tab",
+				"文件 浏览 files tree",
 				format!("[{}]", kc.get_hint(kc.keys.tab_files)),
 				PaletteAction::TabFiles,
 			),
 			PaletteItem::new(
 				"Switch to Stashing tab",
 				"Tab",
+				"储藏 暂存 stashing save",
 				format!("[{}]", kc.get_hint(kc.keys.tab_stashing)),
 				PaletteAction::TabStashing,
 			),
 			PaletteItem::new(
 				"Switch to Stashes tab",
 				"Tab",
+				"储藏列表 stashes list",
 				format!("[{}]", kc.get_hint(kc.keys.tab_stashes)),
 				PaletteAction::TabStashes,
 			),
 			PaletteItem::new(
 				"Commit staged changes",
 				"Git",
+				"提交 commit ai",
 				format!("[{}]", kc.get_hint(kc.keys.open_commit)),
 				PaletteAction::Commit,
 			),
 			PaletteItem::new(
+				"Stage all working tree changes",
+				"Status",
+				"暂存 全部 stage add all",
+				format!(
+					"[{}]",
+					kc.get_hint(kc.keys.status_stage_all)
+				),
+				PaletteAction::StageAll,
+			),
+			PaletteItem::new(
+				"Unstage all staged changes",
+				"Status",
+				"取消暂存 unstage reset",
+				format!(
+					"[{}]",
+					kc.get_hint(kc.keys.status_stage_all)
+				),
+				PaletteAction::UnstageAll,
+			),
+			PaletteItem::new(
 				"Branches (switch / create / view history)",
 				"Git",
+				"分支 切换 branch checkout",
 				format!("[{}]", kc.get_hint(kc.keys.select_branch)),
 				PaletteAction::Branches,
 			),
 			PaletteItem::new(
+				"Create new branch",
+				"Git",
+				"新建分支 创建分支 create branch",
+				format!("[{}]", kc.get_hint(kc.keys.create_branch)),
+				PaletteAction::CreateBranch,
+			),
+			PaletteItem::new(
 				"Tags list",
 				"Git",
+				"标签 tag release",
 				format!("[{}]", kc.get_hint(kc.keys.tags)),
 				PaletteAction::Tags,
 			),
 			PaletteItem::new(
 				"Remotes",
 				"Git",
+				"远程仓库 remote origin",
 				format!("[{}]", kc.get_hint(kc.keys.view_remotes)),
 				PaletteAction::Remotes,
 			),
 			PaletteItem::new(
 				"Submodules",
 				"Git",
+				"子模块 submodule",
 				format!("[{}]", kc.get_hint(kc.keys.view_submodules)),
 				PaletteAction::Submodules,
 			),
 			PaletteItem::new(
 				"Git LFS menu",
 				"Git",
+				"大文件 lfs",
 				format!("[{}]", kc.get_hint(kc.keys.open_lfs)),
 				PaletteAction::Lfs,
 			),
 			PaletteItem::new(
 				"Fetch remotes",
 				"Remote",
+				"抓取 同步 fetch remote",
 				format!("[{}]", kc.get_hint(kc.keys.fetch)),
 				PaletteAction::Fetch,
 			),
 			PaletteItem::new(
 				"Pull current branch",
 				"Remote",
+				"拉取 更新 pull merge",
 				format!("[{}]", kc.get_hint(kc.keys.pull)),
 				PaletteAction::Pull,
 			),
 			PaletteItem::new(
 				"Push current branch",
 				"Remote",
+				"推送 上传 push",
 				format!("[{}]", kc.get_hint(kc.keys.push)),
 				PaletteAction::Push,
 			),
 			PaletteItem::new(
 				"Search commit log",
 				"Log",
+				"搜索提交 查找日志 search log",
 				format!("[{}]", kc.get_hint(kc.keys.log_find)),
 				PaletteAction::SearchLog,
 			),
 			PaletteItem::new(
+				"Copy selected commit hash",
+				"Log",
+				"复制哈希 copy hash sha commit",
+				format!("[{}]", kc.get_hint(kc.keys.copy)),
+				PaletteAction::CopyCommitHash,
+			),
+			PaletteItem::new(
+				"Open external diff tool",
+				"Diff",
+				"外部对比 差异 external diff beyond vscode nvim",
+				format!("[{}]", kc.get_hint(kc.keys.external_diff)),
+				PaletteAction::ExternalDiff,
+			),
+			PaletteItem::new(
+				"Search within current diff / file",
+				"Search",
+				"内容搜索 页内查找 search grep content",
+				"[/]".to_owned(),
+				PaletteAction::ContentSearch,
+			),
+			PaletteItem::new(
+				"Find file in repository",
+				"Search",
+				"查找文件 模糊搜索 find file fuzzy",
+				format!("[{}]", kc.get_hint(kc.keys.file_find)),
+				PaletteAction::FindFile,
+			),
+			PaletteItem::new(
+				"Toggle diff zoom (split / fullscreen)",
+				"View",
+				"缩放 全屏 分栏 zoom fullscreen diff",
+				"[z]".to_owned(),
+				PaletteAction::ToggleDiffZoom,
+			),
+			PaletteItem::new(
 				"Toggle diff mode (delta side-by-side / unified)",
 				"View",
+				"差异模式 双栏 单栏 diff mode delta unified",
 				format!(
 					"[{}]",
 					kc.get_hint(kc.keys.diff_mode_toggle)
@@ -220,30 +308,35 @@ impl CommandPalettePopup {
 			PaletteItem::new(
 				"Widen left pane (+5%)",
 				"Layout",
+				"加宽 分栏 布局 widen split",
 				"[>]".to_owned(),
 				PaletteAction::SplitWider,
 			),
 			PaletteItem::new(
 				"Narrow left pane (-5%)",
 				"Layout",
+				"缩窄 分栏 布局 narrow split",
 				"[<]".to_owned(),
 				PaletteAction::SplitNarrower,
 			),
 			PaletteItem::new(
 				"Toggle mouse support",
 				"Options",
+				"鼠标 开关 mouse toggle",
 				String::new(),
 				PaletteAction::ToggleMouse,
 			),
 			PaletteItem::new(
 				"Global Options",
 				"Options",
+				"设置 选项 配置 options settings",
 				format!("[{}]", kc.get_hint(kc.keys.open_options)),
 				PaletteAction::Options,
 			),
 			PaletteItem::new(
 				"Help & Keybindings",
 				"Help",
+				"帮助 快捷键 help keys",
 				format!("[{}]", kc.get_hint(kc.keys.open_help)),
 				PaletteAction::Help,
 			),
@@ -345,15 +438,19 @@ impl DrawableComponent for CommandPalettePopup {
 			return Ok(());
 		}
 
-		let width = 68_u16.min(area.width.saturating_sub(2));
-		let height = 20_u16.min(area.height.saturating_sub(2));
-		let popup_area =
-			ui::centered_rect_absolute(width, height, area);
+		let popup_area = ui::responsive_popup_rect(
+			72,
+			72,
+			ui::Size::new(48, 12),
+			ui::Size::new(82, 26),
+			area,
+		);
 
 		ui::clear_popup_area(f, popup_area);
 		f.render_widget(
 			Block::default()
 				.borders(Borders::ALL)
+				.border_type(BorderType::Rounded)
 				.border_style(self.theme.block(true))
 				.title(Span::styled(
 					" Command Palette ",
@@ -563,6 +660,23 @@ mod tests {
 			env.queue.pop(),
 			Some(InternalEvent::PaletteAction(
 				PaletteAction::ToggleMouse
+			))
+		));
+	}
+
+	#[test]
+	fn palette_matches_chinese_keywords() {
+		let env = Environment::test_env();
+		let mut palette = CommandPalettePopup::new(&env);
+		palette.open().unwrap();
+		palette.input.set_text("缩放".to_owned());
+		palette.refilter();
+		assert!(!palette.filtered.is_empty());
+		palette.execute_selected();
+		assert!(matches!(
+			env.queue.pop(),
+			Some(InternalEvent::PaletteAction(
+				PaletteAction::ToggleDiffZoom
 			))
 		));
 	}

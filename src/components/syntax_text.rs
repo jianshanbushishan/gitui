@@ -652,6 +652,7 @@ impl DrawableComponent for SyntaxTextComponent {
 				self.theme.title(self.focused()),
 			))
 			.borders(Borders::ALL)
+			.border_type(ratatui::widgets::BorderType::Rounded)
 			.border_style(self.theme.block(self.focused()));
 
 		if self.is_image() {

@@ -18,12 +18,13 @@ use asyncgit::{
 	AsyncCommitFiles, CommitFilesParams,
 };
 use compare_details::CompareDetailsComponent;
-use crossterm::event::Event;
+use crossterm::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use details::{DetailsComponent, DetailsFocus};
 use ratatui::{
-	layout::{Constraint, Direction, Layout, Rect},
+	layout::{Constraint, Direction, Layout, Position, Rect},
 	Frame,
 };
+use std::cell::Cell;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -42,6 +43,8 @@ pub struct CommitDetailsComponent {
 	visible: bool,
 	focus: Focus,
 	key_config: SharedKeyConfig,
+	details_area: Cell<Rect>,
+	files_area: Cell<Rect>,
 }
 
 impl CommitDetailsComponent {
@@ -61,6 +64,8 @@ impl CommitDetailsComponent {
 			focus: Focus::None,
 			commit: None,
 			key_config: env.key_config.clone(),
+			details_area: Cell::new(Rect::default()),
+			files_area: Cell::new(Rect::default()),
 		}
 	}
 
@@ -179,6 +184,44 @@ impl CommitDetailsComponent {
 	fn is_compare(&self) -> bool {
 		self.commit.is_some_and(|p| p.other.is_some())
 	}
+
+	/// Handle mouse clicks and scroll wheels directed at the commit
+	/// details / changed files sub-panes. Returns `true` if handled.
+	pub fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+		if !self.visible {
+			return false;
+		}
+		let pos = Position::new(mouse.column, mouse.row);
+		let in_files = self.files_area.get().contains(pos);
+		let in_details = self.details_area.get().contains(pos);
+		if !in_files && !in_details {
+			return false;
+		}
+		match mouse.kind {
+			MouseEventKind::Down(MouseButton::Left) => {
+				if in_files {
+					self.set_focus(Focus::Files);
+					self.file_tree.select_at_row(mouse.row);
+				} else {
+					self.set_focus(Focus::Message);
+				}
+				true
+			}
+			MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+				let down = matches!(
+					mouse.kind,
+					MouseEventKind::ScrollDown
+				);
+				if in_files {
+					self.file_tree.scroll_mouse(down);
+				} else if !self.is_compare() {
+					self.single_details.scroll_mouse(down);
+				}
+				true
+			}
+			_ => false,
+		}
+	}
 }
 
 impl DrawableComponent for CommitDetailsComponent {
@@ -205,6 +248,9 @@ impl DrawableComponent for CommitDetailsComponent {
 			.direction(Direction::Vertical)
 			.constraints(constraints)
 			.split(rect);
+
+		self.details_area.set(chunks[0]);
+		self.files_area.set(chunks[1]);
 
 		if self.is_compare() {
 			self.compare_details.draw(f, chunks[0])?;

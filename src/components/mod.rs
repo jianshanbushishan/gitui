@@ -303,6 +303,7 @@ fn dialog_paragraph<'a>(
 			Block::default()
 				.title(Span::styled(title, theme.title(focused)))
 				.borders(Borders::ALL)
+				.border_type(ratatui::widgets::BorderType::Rounded)
 				.border_style(theme.block(focused)),
 		)
 		.alignment(Alignment::Left)

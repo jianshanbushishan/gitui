@@ -23,7 +23,7 @@ use asyncgit::{
 	StatusItem, StatusItemType,
 };
 use crossbeam_channel::Sender;
-use crossterm::event::Event;
+use crossterm::event::{Event, KeyCode, KeyModifiers};
 use easy_cast::Cast;
 use ratatui::{
 	layout::{Alignment, Rect},
@@ -95,8 +95,10 @@ pub struct CommitPopup {
 	ai_generation: Arc<AtomicU64>,
 	ai_pending: bool,
 	ai_started: Option<Instant>,
-	ai_last_secs: u64,
+	ai_spinner_idx: usize,
 	ai_overwrite_armed: Option<Instant>,
+	ai_previous_draft: Option<String>,
+	ai_generated_text: Option<String>,
 	commit_pending: bool,
 	commit_result: Arc<Mutex<Option<CommitJobOutcome>>>,
 	has_head: bool,
@@ -105,6 +107,8 @@ pub struct CommitPopup {
 const FIRST_LINE_LIMIT: usize = 50;
 const AI_COMMIT_HISTORY_LENGTH: usize = 5;
 const AI_OVERWRITE_WINDOW: Duration = Duration::from_secs(5);
+const AI_SPINNER_FRAMES: &[char] =
+	&['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 impl CommitPopup {
 	///
@@ -135,8 +139,10 @@ impl CommitPopup {
 			ai_generation: Arc::new(AtomicU64::new(0)),
 			ai_pending: false,
 			ai_started: None,
-			ai_last_secs: 0,
+			ai_spinner_idx: 0,
 			ai_overwrite_armed: None,
+			ai_previous_draft: None,
+			ai_generated_text: None,
 			commit_pending: false,
 			commit_result: Arc::new(Mutex::new(None)),
 			has_head: false,
@@ -151,8 +157,9 @@ impl CommitPopup {
 		self.staged_summary = summary;
 	}
 
-	/// Update the elapsed-seconds indicator in the popup title while AI
-	/// generation is running. Returns `true` when the displayed text changed.
+	/// Update the animated spinner and elapsed-seconds indicator in the
+	/// popup title while AI generation is running. Returns `true` when
+	/// the displayed text changed.
 	pub fn update_ai_indicator(&mut self, now: Instant) -> bool {
 		if !self.ai_pending || !self.is_visible() {
 			return false;
@@ -161,12 +168,11 @@ impl CommitPopup {
 			return false;
 		};
 		let secs = now.saturating_duration_since(started).as_secs();
-		if secs == self.ai_last_secs {
-			return false;
-		}
-		self.ai_last_secs = secs;
+		self.ai_spinner_idx =
+			(self.ai_spinner_idx + 1) % AI_SPINNER_FRAMES.len();
+		let frame = AI_SPINNER_FRAMES[self.ai_spinner_idx];
 		self.input.set_title(format!(
-			"{} · Generating… {secs}s (Esc cancel)",
+			"{} · {frame} Generating… {secs}s (Esc cancel)",
 			strings::commit_title()
 		));
 		true
@@ -176,13 +182,30 @@ impl CommitPopup {
 		self.ai_generation.fetch_add(1, Ordering::Relaxed);
 		self.ai_pending = false;
 		self.ai_started = None;
-		self.ai_last_secs = 0;
+		self.ai_spinner_idx = 0;
 		self.ai_overwrite_armed = None;
 		if let std::result::Result::Ok(mut result) =
 			self.ai_result.lock()
 		{
 			*result = None;
 		}
+	}
+
+	fn undo_ai_replacement(&mut self) -> bool {
+		if self.ai_pending || self.commit_pending {
+			return false;
+		}
+		if let Some(prev) = self.ai_previous_draft.take() {
+			self.ai_generated_text = None;
+			self.ai_overwrite_armed = None;
+			self.input.set_text(prev);
+			self.persist_draft();
+			self.queue.push(InternalEvent::ShowInfoToast(
+				"Restored previous commit draft".to_owned(),
+			));
+			return true;
+		}
+		false
 	}
 
 	fn generate_commit_message(&mut self) -> Result<()> {
@@ -193,7 +216,10 @@ impl CommitPopup {
 			return Ok(());
 		}
 		let initial_input = self.input.get_text().to_owned();
+		let is_ai_generated = self.ai_generated_text.as_deref()
+			== Some(initial_input.as_str());
 		let has_user_draft = !initial_input.trim().is_empty()
+			&& !is_ai_generated
 			&& self.commit_template.as_deref()
 				!= Some(initial_input.as_str());
 		if has_user_draft {
@@ -264,10 +290,11 @@ impl CommitPopup {
 			})?;
 		self.ai_pending = true;
 		self.ai_started = Some(Instant::now());
-		self.ai_last_secs = 0;
+		self.ai_spinner_idx = 0;
 		self.input.set_title(format!(
-			"{} · Generating… (Esc cancel)",
-			strings::commit_title()
+			"{} · {} Generating… 0s (Esc cancel)",
+			strings::commit_title(),
+			AI_SPINNER_FRAMES[0],
 		));
 		Ok(())
 	}
@@ -298,7 +325,7 @@ impl CommitPopup {
 		}
 		self.ai_pending = false;
 		self.ai_started = None;
-		self.ai_last_secs = 0;
+		self.ai_spinner_idx = 0;
 		if !self.is_visible() || !matches!(self.mode, Mode::Normal) {
 			return;
 		}
@@ -318,10 +345,37 @@ impl CommitPopup {
 					std::result::Result::Ok(current)
 						if current == diff =>
 					{
+						let prev_is_ai = self
+							.ai_generated_text
+							.as_deref()
+							== Some(finished.initial_input.as_str());
+						if !finished.initial_input.trim().is_empty()
+							&& !prev_is_ai
+						{
+							self.ai_previous_draft =
+								Some(finished.initial_input);
+						}
+						self.ai_generated_text =
+							Some(message.clone());
 						self.input.set_text(message);
 						self.persist_draft();
+						let gen_hint = self.key_config.get_hint(
+							self.key_config
+								.keys
+								.generate_commit_message,
+						);
+						let toast = if self.ai_previous_draft.is_some()
+						{
+							format!(
+								"AI draft ready · [^z] undo · [{gen_hint}] regen"
+							)
+						} else {
+							format!(
+								"AI draft ready · [{gen_hint}] regenerate"
+							)
+						};
 						self.queue.push(InternalEvent::ShowToast(
-							"AI commit draft ready".to_owned(),
+							toast,
 						));
 					}
 					_ => self.queue.push(
@@ -366,6 +420,8 @@ impl CommitPopup {
 					.push(InternalEvent::Update(NeedsUpdate::ALL));
 				self.queue.push(InternalEvent::StatusLastFileMoved);
 				self.input.clear();
+				self.ai_previous_draft = None;
+				self.ai_generated_text = None;
 				self.options.borrow_mut().set_commit_draft(None);
 				if let Some(err) = post_hook_error {
 					self.queue.push(InternalEvent::ShowErrorMsg(
@@ -728,6 +784,8 @@ impl CommitPopup {
 		if self.can_amend() {
 			let id = sync::get_head(&self.repo.borrow())?;
 			self.invalidate_ai_generation();
+			self.ai_previous_draft = None;
+			self.ai_generated_text = None;
 			self.mode = Mode::Amend(id);
 
 			let details =
@@ -758,6 +816,8 @@ impl CommitPopup {
 	#[allow(clippy::too_many_lines)]
 	pub fn open(&mut self, reword: Option<CommitId>) -> Result<()> {
 		self.invalidate_ai_generation();
+		self.ai_previous_draft = None;
+		self.ai_generated_text = None;
 		// Cursor position to restore once the textarea is shown.
 		// Set when a saved draft is loaded in the Normal branch below.
 		let mut pending_cursor: Option<(u16, u16)> = None;
@@ -997,6 +1057,18 @@ impl Component for CommitPopup {
 				true,
 			));
 
+			if self.ai_previous_draft.is_some() {
+				out.push(CommandInfo::new(
+					crate::components::CommandText::new(
+						"Undo AI [^z]".to_owned(),
+						"restore commit draft from before AI generation",
+						"-- Commit Popup --",
+					),
+					!self.ai_pending && !self.commit_pending,
+					true,
+				));
+			}
+
 			out.push(CommandInfo::new(
 				strings::commands::newline(&self.key_config),
 				true,
@@ -1007,6 +1079,7 @@ impl Component for CommitPopup {
 		visibility_blocking(self)
 	}
 
+	#[allow(clippy::too_many_lines)]
 	fn event(&mut self, ev: &Event) -> Result<EventState> {
 		if self.is_visible() {
 			if let Event::Key(e) = ev {
@@ -1023,6 +1096,11 @@ impl Component for CommitPopup {
 							self.commit()
 						);
 						true
+					} else if e.code == KeyCode::Char('z')
+						&& e.modifiers == KeyModifiers::CONTROL
+						&& self.ai_previous_draft.is_some()
+					{
+						self.undo_ai_replacement()
 					} else if key_match(
 						e,
 						self.key_config.keys.generate_commit_message,
@@ -1204,5 +1282,40 @@ mod ai_tests {
 		popup.input.set_text("My draft".to_owned());
 		finish(&mut popup, diff);
 		assert_eq!(popup.input.get_text(), "My draft");
+	}
+
+	#[test]
+	fn ai_replacement_supports_undo_and_spinner_animation() {
+		let (_dir, _repo, mut popup, diff) = staged_popup();
+		popup.input.set_text("Manual draft".to_owned());
+		popup.ai_generation.store(1, Ordering::Relaxed);
+		popup.ai_pending = true;
+		popup.ai_started = Some(Instant::now());
+		assert!(popup.update_ai_indicator(Instant::now()));
+
+		*popup.ai_result.lock().unwrap() = Some(AiGeneration {
+			id: 1,
+			initial_input: "Manual draft".to_owned(),
+			result: std::result::Result::Ok((
+				diff,
+				"AI generated commit".to_owned(),
+			)),
+		});
+		popup.update_async(AsyncNotification::App(
+			AsyncAppNotification::AiCommitMessage,
+		));
+		assert_eq!(popup.input.get_text(), "AI generated commit");
+		assert_eq!(
+			popup.ai_previous_draft.as_deref(),
+			Some("Manual draft")
+		);
+		assert_eq!(
+			popup.ai_generated_text.as_deref(),
+			Some("AI generated commit")
+		);
+
+		assert!(popup.undo_ai_replacement());
+		assert_eq!(popup.input.get_text(), "Manual draft");
+		assert!(popup.ai_previous_draft.is_none());
 	}
 }

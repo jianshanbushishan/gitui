@@ -54,6 +54,7 @@ pub struct StatusTreeComponent {
 	empty_hint: Option<String>,
 	/// Flattened/folded rows, invalidated only when tree layout changes.
 	draw_cache: RefCell<Option<Vec<TextDrawInfo>>>,
+	area: Cell<Rect>,
 }
 
 impl StatusTreeComponent {
@@ -81,6 +82,7 @@ impl StatusTreeComponent {
 			),
 			empty_hint: None,
 			draw_cache: RefCell::new(None),
+			area: Cell::new(Rect::default()),
 		}
 	}
 
@@ -161,6 +163,42 @@ impl StatusTreeComponent {
 		} else {
 			MoveSelection::Up
 		})
+	}
+
+	/// Select the tree item rendered at terminal `row` (for mouse clicks).
+	/// Returns `true` when the selection changed.
+	pub fn select_at_row(&mut self, row: u16) -> bool {
+		let area = self.area.get();
+		if area.height <= 2 {
+			return false;
+		}
+		let inner_top = area.y.saturating_add(1);
+		let inner_bottom = area.bottom().saturating_sub(1);
+		if row < inner_top || row >= inner_bottom {
+			return false;
+		}
+		if self.draw_cache.borrow().is_none() {
+			*self.draw_cache.borrow_mut() =
+				Some(self.build_vec_text_draw_info_for_drawing());
+		}
+		let visual_idx =
+			self.scroll_top.get() + usize::from(row - inner_top);
+		let target_source = self
+			.draw_cache
+			.borrow()
+			.as_ref()
+			.and_then(|rows| rows.get(visual_idx))
+			.map(|entry| entry.source_index);
+		let Some(source_index) = target_source else {
+			return false;
+		};
+		let changed = self.tree.selection != Some(source_index);
+		self.tree.selection = Some(source_index);
+		if changed {
+			self.queue
+				.push(InternalEvent::Update(NeedsUpdate::DIFF));
+		}
+		changed
 	}
 
 	pub const fn set_commit(&mut self, revision: Option<CommitId>) {
@@ -519,6 +557,7 @@ struct TextDrawInfo {
 
 impl DrawableComponent for StatusTreeComponent {
 	fn draw(&self, f: &mut Frame, r: Rect) -> Result<()> {
+		self.area.set(r);
 		if !self.is_visible() {
 			return Ok(());
 		}

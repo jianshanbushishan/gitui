@@ -167,7 +167,13 @@ impl DrawableComponent for PushTagsPopup {
 					|message| (format!("Pre-push: {message}"), 0),
 				);
 
-			let area = ui::centered_rect_absolute(70, 3, f.area());
+			let area = ui::responsive_popup_rect(
+				60,
+				15,
+				ui::Size::new(40, 3),
+				ui::Size::new(72, 3),
+				f.area(),
+			);
 
 			f.render_widget(Clear, area);
 			f.render_widget(
@@ -180,7 +186,7 @@ impl DrawableComponent for PushTagsPopup {
 								self.theme.title(true),
 							))
 							.borders(Borders::ALL)
-							.border_type(BorderType::Thick)
+							.border_type(BorderType::Rounded)
 							.border_style(self.theme.block(true)),
 					)
 					.gauge_style(self.theme.push_gauge())

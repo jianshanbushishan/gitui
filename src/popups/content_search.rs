@@ -379,12 +379,14 @@ impl ContentSearchPopup {
 impl DrawableComponent for ContentSearchPopup {
 	fn draw(&self, f: &mut Frame, area: Rect) -> Result<()> {
 		if self.is_visible() {
-			const MAX_SIZE: (u16, u16) = (80, 24);
-
 			let any_hits = !self.filtered.is_empty() || self.searching;
 
-			let area = ui::centered_rect_absolute(
-				MAX_SIZE.0, MAX_SIZE.1, area,
+			let area = ui::responsive_popup_rect(
+				75,
+				72,
+				ui::Size::new(46, 12),
+				ui::Size::new(92, 26),
+				area,
 			);
 
 			let area = if any_hits {
@@ -403,6 +405,7 @@ impl DrawableComponent for ContentSearchPopup {
 			f.render_widget(
 				Block::default()
 					.borders(Borders::all())
+					.border_type(ratatui::widgets::BorderType::Rounded)
 					.border_style(self.theme.block(true))
 					.title(Span::styled(
 						strings::POPUP_TITLE_CONTENT_SEARCH,

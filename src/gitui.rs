@@ -325,16 +325,16 @@ mod tests {
 				!line.contains("↑/↓ Move · ⏎ Run · ⎋ Close")
 			})
 			.collect::<Vec<_>>();
-		assert!(footer[0].contains('┃'));
+		assert!(footer[0].contains('│'));
 		let bottom = footer[1]
-			.split_once('┗')
+			.split_once('╰')
 			.unwrap()
 			.1
-			.split_once('┛')
+			.split_once('╯')
 			.unwrap()
 			.0;
 		assert!(
-			!bottom.is_empty() && bottom.chars().all(|ch| ch == '━')
+			!bottom.is_empty() && bottom.chars().all(|ch| ch == '─')
 		);
 		assert!(rendered.contains("› Download checkout"));
 		assert!(rendered.contains("Restore from cache"));
@@ -343,6 +343,10 @@ mod tests {
 			"Fetch LFS objects and restore file contents."
 		));
 		let buffer = terminal.backend().buffer();
+		// Backdrop behind modal popup should be dimmed.
+		assert!(buffer[(1, 3)]
+			.modifier
+			.contains(ratatui::style::Modifier::DIM));
 		let marker = buffer
 			.content
 			.iter()
@@ -354,9 +358,9 @@ mod tests {
 		);
 		let top = rendered
 			.lines()
-			.find(|line| line.contains("┏ Git LFS ━"))
+			.find(|line| line.contains("╭ Git LFS ─"))
 			.unwrap();
-		assert!(top.chars().filter(|&c| c == '━').count() < 60);
+		assert!(top.chars().filter(|&c| c == '─').count() < 60);
 
 		gitui.input_event(
 			key_config.keys.popup_down.code,

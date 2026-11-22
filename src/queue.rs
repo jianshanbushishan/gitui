@@ -107,6 +107,8 @@ pub enum InternalEvent {
 	ShowInfoLabeledMsg(String, String),
 	/// Non-blocking transient notification (auto-dismisses after ~2.5s).
 	ShowToast(String),
+	/// Non-blocking informational toast notification.
+	ShowInfoToast(String),
 	/// Non-blocking warning toast notification.
 	ShowWarningToast(String),
 	/// Execute an action picked from the Command Palette.

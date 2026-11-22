@@ -80,7 +80,7 @@ impl DrawableComponent for BranchListPopup {
 						strings::title_branches(),
 						self.theme.title(true),
 					))
-					.border_type(BorderType::Thick)
+					.border_type(BorderType::Rounded)
 					.border_style(self.theme.block(true))
 					.borders(Borders::ALL),
 				area,

@@ -16,13 +16,13 @@ use asyncgit::{
 	sync::{self, status::StatusType, RepoPathRef},
 	AsyncGitNotification, AsyncStatus, StatusParams,
 };
-use crossterm::event::Event;
+use crossterm::event::{Event, MouseButton, MouseEventKind};
 use ratatui::{
-	layout::{Alignment, Constraint, Direction, Layout},
+	layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
 	text::{Line, Span},
-	widgets::{Block, Borders, Paragraph},
+	widgets::{Block, BorderType, Borders, Paragraph},
 };
-use std::borrow::Cow;
+use std::{borrow::Cow, cell::Cell};
 
 #[derive(Default, Clone, Copy, Debug)]
 pub struct StashingOptions {
@@ -39,6 +39,7 @@ pub struct Stashing {
 	git_status: AsyncStatus,
 	queue: Queue,
 	key_config: SharedKeyConfig,
+	list_area: Cell<Rect>,
 }
 
 impl Stashing {
@@ -65,6 +66,7 @@ impl Stashing {
 			),
 			queue: env.queue.clone(),
 			key_config: env.key_config.clone(),
+			list_area: Cell::new(Rect::default()),
 		}
 	}
 
@@ -154,13 +156,19 @@ impl DrawableComponent for Stashing {
 
 		f.render_widget(
 			Paragraph::new(self.get_option_text())
-				.block(Block::default().borders(Borders::ALL).title(
-					strings::stashing_options_title(&self.key_config),
-				))
+				.block(
+					Block::default()
+						.borders(Borders::ALL)
+						.border_type(BorderType::Rounded)
+						.title(strings::stashing_options_title(
+							&self.key_config,
+						)),
+				)
 				.alignment(Alignment::Left),
 			right_chunks[0],
 		);
 
+		self.list_area.set(chunks[0]);
 		self.index.draw(f, chunks[0])?;
 
 		self.index.draw_popup(f)?;
@@ -214,6 +222,28 @@ impl Component for Stashing {
 				.is_consumed()
 			{
 				return Ok(EventState::Consumed);
+			}
+
+			if let Event::Mouse(mouse) = ev {
+				let pos = Position::new(mouse.column, mouse.row);
+				if self.list_area.get().contains(pos) {
+					match mouse.kind {
+						MouseEventKind::Down(MouseButton::Left) => {
+							self.index.select_at_row(mouse.row);
+							return Ok(EventState::Consumed);
+						}
+						MouseEventKind::ScrollDown
+						| MouseEventKind::ScrollUp => {
+							let down = matches!(
+								mouse.kind,
+								MouseEventKind::ScrollDown
+							);
+							self.index.scroll_mouse(down);
+							return Ok(EventState::Consumed);
+						}
+						_ => {}
+					}
+				}
 			}
 
 			if let Event::Key(k) = ev {

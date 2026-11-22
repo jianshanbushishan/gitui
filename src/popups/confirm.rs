@@ -132,7 +132,7 @@ impl DrawableComponent for ConfirmPopup {
 			let block = Block::default()
 				.title(Span::styled(title, title_style))
 				.borders(Borders::ALL)
-				.border_type(BorderType::Thick)
+				.border_type(BorderType::Rounded)
 				.border_style(border_style)
 				.padding(Padding::horizontal(1));
 			ui::render_block_text(
@@ -526,7 +526,7 @@ mod tests {
 		// glyph, not a CJK char that overflowed from (9, 3).
 		assert_eq!(
 			buf[(10, 3)].symbol(),
-			"┃",
+			"│",
 			"left border must not be stomped by adjacent CJK"
 		);
 		// Also check the cell just outside (9, 3) was cleared so the

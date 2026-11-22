@@ -22,15 +22,15 @@ use asyncgit::{
 	},
 	AsyncGitNotification, AsyncTreeFilesJob,
 };
-use crossterm::event::Event;
+use crossterm::event::{Event, MouseButton, MouseEventKind};
 use filetreelist::{FileTree, FileTreeItem};
 use ratatui::{
-	layout::{Constraint, Direction, Layout, Rect},
+	layout::{Constraint, Direction, Layout, Position, Rect},
 	text::{Line, Span},
-	widgets::{Block, Borders},
+	widgets::{Block, BorderType, Borders},
 	Frame,
 };
-use std::{borrow::Cow, fmt::Write};
+use std::{borrow::Cow, cell::Cell, fmt::Write};
 use std::{
 	collections::BTreeSet,
 	path::{Path, PathBuf},
@@ -71,6 +71,10 @@ pub struct RevisionFilesComponent {
 	select_file: Option<PathBuf>,
 	options: SharedOptions,
 	copy_path_popup: CopyPathPopup,
+	total_area: Cell<Rect>,
+	tree_area: Cell<Rect>,
+	preview_area: Cell<Rect>,
+	dragging_split: bool,
 }
 
 impl RevisionFilesComponent {
@@ -104,6 +108,10 @@ impl RevisionFilesComponent {
 				env.theme.clone(),
 				env.key_config.clone(),
 			),
+			total_area: Cell::new(Rect::default()),
+			tree_area: Cell::new(Rect::default()),
+			preview_area: Cell::new(Rect::default()),
+			dragging_split: false,
 		}
 	}
 
@@ -535,6 +543,7 @@ impl RevisionFilesComponent {
 				self.theme.title(is_tree_focused),
 			))
 			.borders(Borders::ALL)
+			.border_type(BorderType::Rounded)
 			.border_style(self.theme.block(is_tree_focused));
 
 		if self.files.as_ref().is_some_and(|files| !files.is_empty())
@@ -622,6 +631,7 @@ impl RevisionFilesComponent {
 impl DrawableComponent for RevisionFilesComponent {
 	fn draw(&self, f: &mut Frame, area: Rect) -> Result<()> {
 		if self.is_visible() {
+			self.total_area.set(area);
 			let left_ratio =
 				self.options.borrow().detail_left_ratio();
 			let right_ratio = 100 - left_ratio;
@@ -633,6 +643,9 @@ impl DrawableComponent for RevisionFilesComponent {
 					Constraint::Percentage(right_ratio),
 				])
 				.split(area);
+
+			self.tree_area.set(chunks[0]);
+			self.preview_area.set(chunks[1]);
 
 			self.draw_tree(f, chunks[0])?;
 
@@ -754,26 +767,122 @@ impl Component for RevisionFilesComponent {
 		}
 
 		if let Event::Mouse(mouse) = event {
+			let pos = Position::new(mouse.column, mouse.row);
+			let tree_area = self.tree_area.get();
+			let preview_area = self.preview_area.get();
+			let total = self.total_area.get();
+			let split_x = tree_area.right();
 			match mouse.kind {
-				crossterm::event::MouseEventKind::ScrollDown
-				| crossterm::event::MouseEventKind::ScrollUp => {
-					let down = matches!(
-						mouse.kind,
-						crossterm::event::MouseEventKind::ScrollDown
-					);
-					match self.focus {
-						Focus::Tree => {
-							let dir = if down {
-								filetreelist::MoveSelection::Down
-							} else {
-								filetreelist::MoveSelection::Up
-							};
-							if self.tree.move_selection(dir) {
-								self.selection_changed();
+				MouseEventKind::Down(MouseButton::Left) => {
+					if total.contains(pos)
+						&& total.width >= 20
+						&& mouse.column.abs_diff(split_x) <= 1
+					{
+						self.dragging_split = true;
+						return Ok(EventState::Consumed);
+					}
+					if tree_area.contains(pos) {
+						self.focus = Focus::Tree;
+						self.current_file.focus(false);
+						self.focus(true);
+						if tree_area.height > 2
+							&& mouse.row > tree_area.y
+							&& mouse.row
+								< tree_area.bottom().saturating_sub(1)
+						{
+							let target_visual = self.scroll.get_top()
+								+ usize::from(
+									mouse.row - (tree_area.y + 1),
+								);
+							if let Some(sel) =
+								self.tree.visual_selection()
+							{
+								if target_visual < sel.count {
+									let (dir, steps) =
+										if target_visual >= sel.index {
+											(
+												filetreelist::MoveSelection::Down,
+												target_visual - sel.index,
+											)
+										} else {
+											(
+												filetreelist::MoveSelection::Up,
+												sel.index - target_visual,
+											)
+										};
+									let mut changed = false;
+									for _ in 0..steps {
+										changed |=
+											self.tree.move_selection(dir);
+									}
+									if changed {
+										self.selection_changed();
+									}
+								}
 							}
 						}
-						Focus::File => {
-							self.current_file.scroll_mouse(down);
+						return Ok(EventState::Consumed);
+					}
+					if preview_area.contains(pos) {
+						self.focus = Focus::File;
+						self.current_file.focus(true);
+						self.focus(true);
+						return Ok(EventState::Consumed);
+					}
+				}
+				MouseEventKind::Drag(MouseButton::Left)
+					if self.dragging_split && total.width > 0 =>
+				{
+					let rel =
+						mouse.column.saturating_sub(total.x);
+					let ratio = u16::try_from(
+						u32::from(rel) * 100 / u32::from(total.width),
+					)
+					.unwrap_or(50);
+					self.options
+						.borrow_mut()
+						.set_detail_left_ratio_preview(ratio);
+					return Ok(EventState::Consumed);
+				}
+				MouseEventKind::Up(MouseButton::Left)
+					if self.dragging_split =>
+				{
+					self.dragging_split = false;
+					self.options.borrow_mut().save_preferences_now();
+					return Ok(EventState::Consumed);
+				}
+				MouseEventKind::ScrollDown
+				| MouseEventKind::ScrollUp => {
+					let down = matches!(
+						mouse.kind,
+						MouseEventKind::ScrollDown
+					);
+					if preview_area.contains(pos) {
+						self.current_file.scroll_mouse(down);
+					} else if tree_area.contains(pos) {
+						let dir = if down {
+							filetreelist::MoveSelection::Down
+						} else {
+							filetreelist::MoveSelection::Up
+						};
+						if self.tree.move_selection(dir) {
+							self.selection_changed();
+						}
+					} else {
+						match self.focus {
+							Focus::Tree => {
+								let dir = if down {
+									filetreelist::MoveSelection::Down
+								} else {
+									filetreelist::MoveSelection::Up
+								};
+								if self.tree.move_selection(dir) {
+									self.selection_changed();
+								}
+							}
+							Focus::File => {
+								self.current_file.scroll_mouse(down);
+							}
 						}
 					}
 					return Ok(EventState::Consumed);

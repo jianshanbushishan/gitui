@@ -13,7 +13,7 @@ use crossterm::event::Event;
 use ratatui::{
 	layout::Rect,
 	text::{Line, Span},
-	widgets::{Block, Borders, Clear},
+	widgets::{Block, Borders},
 	Frame,
 };
 use std::path::Path;
@@ -220,13 +220,18 @@ impl CopyPathPopup {
 impl DrawableComponent for CopyPathPopup {
 	fn draw(&self, f: &mut Frame, _area: Rect) -> Result<()> {
 		if self.is_visible() {
-			const SIZE: (u16, u16) = (80, 8);
-			let area =
-				ui::centered_rect_absolute(SIZE.0, SIZE.1, f.area());
+			let area = ui::responsive_popup_rect(
+				70,
+				30,
+				ui::Size::new(40, 8),
+				ui::Size::new(84, 8),
+				f.area(),
+			);
 
-			f.render_widget(Clear, area);
+			ui::clear_popup_area(f, area);
 			let block = Block::default()
 				.borders(Borders::ALL)
+				.border_type(ratatui::widgets::BorderType::Rounded)
 				.title(Span::styled(
 					strings::POPUP_TITLE_COPY_PATH,
 					self.theme.title(true),

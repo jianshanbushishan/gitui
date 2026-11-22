@@ -26,7 +26,7 @@ use crossterm::event::Event;
 use ratatui::{
 	layout::Rect,
 	text::Span,
-	widgets::{Block, BorderType, Borders, Clear, Gauge},
+	widgets::{Block, BorderType, Borders, Gauge},
 	Frame,
 };
 
@@ -110,6 +110,8 @@ impl FetchPopup {
 			self.hide();
 			self.queue
 				.push(InternalEvent::Update(NeedsUpdate::BRANCHES));
+			self.queue
+				.push(InternalEvent::ShowToast("Fetch complete".to_owned()));
 		}
 	}
 }
@@ -141,9 +143,15 @@ impl DrawableComponent for FetchPopup {
 				)
 			};
 
-			let area = ui::centered_rect_absolute(48, 3, f.area());
+			let area = ui::responsive_popup_rect(
+				50,
+				15,
+				ui::Size::new(34, 3),
+				ui::Size::new(56, 3),
+				f.area(),
+			);
 
-			f.render_widget(Clear, area);
+			ui::clear_popup_area(f, area);
 			f.render_widget(
 				Gauge::default()
 					.label(format!("{stage} {}%", progress.percent))
@@ -154,7 +162,7 @@ impl DrawableComponent for FetchPopup {
 								self.theme.title(true),
 							))
 							.borders(Borders::ALL)
-							.border_type(BorderType::Thick)
+							.border_type(BorderType::Rounded)
 							.border_style(self.theme.block(true)),
 					)
 					.gauge_style(self.theme.push_gauge())

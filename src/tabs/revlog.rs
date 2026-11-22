@@ -25,15 +25,16 @@ use asyncgit::{
 	ProgressPercent,
 };
 use crossbeam_channel::Sender;
-use crossterm::event::Event;
+use crossterm::event::{Event, MouseButton, MouseEventKind};
 use indexmap::IndexSet;
 use ratatui::{
-	layout::{Alignment, Constraint, Direction, Layout, Rect},
+	layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
 	text::Span,
-	widgets::{Block, Borders, Paragraph},
+	widgets::{Block, BorderType, Borders, Paragraph},
 	Frame,
 };
 use std::{
+	cell::Cell,
 	rc::Rc,
 	sync::{
 		atomic::{AtomicBool, Ordering},
@@ -77,6 +78,10 @@ pub struct Revlog {
 	sender: Sender<AsyncGitNotification>,
 	theme: SharedTheme,
 	options: SharedOptions,
+	total_area: Cell<Rect>,
+	list_area: Cell<Rect>,
+	details_area: Cell<Rect>,
+	dragging_split: bool,
 }
 
 impl Revlog {
@@ -112,7 +117,15 @@ impl Revlog {
 			sender: env.sender_git.clone(),
 			theme: env.theme.clone(),
 			options: env.options.clone(),
+			total_area: Cell::new(Rect::default()),
+			list_area: Cell::new(Rect::default()),
+			details_area: Cell::new(Rect::default()),
+			dragging_split: false,
 		}
+	}
+
+	pub fn copy_selected_commit_hash(&self) -> Result<()> {
+		self.list.copy_commit_hash()
 	}
 
 	///
@@ -474,6 +487,7 @@ impl Revlog {
 							self.theme.title(true),
 						))
 						.borders(Borders::ALL)
+						.border_type(BorderType::Rounded)
 						.border_style(Theme::attention_block()),
 				)
 				.alignment(Alignment::Left),
@@ -532,6 +546,7 @@ impl DrawableComponent for Revlog {
 			Rc::new([area])
 		};
 
+		self.total_area.set(area[0]);
 		let left_ratio = self.options.borrow().log_left_ratio();
 		let right_ratio = 100 - left_ratio;
 
@@ -544,10 +559,14 @@ impl DrawableComponent for Revlog {
 			.split(area[0]);
 
 		if self.commit_details.is_visible() {
+			self.list_area.set(chunks[0]);
+			self.details_area.set(chunks[1]);
 			self.list.draw(f, chunks[0])?;
 			self.commit_details.draw(f, chunks[1])?;
 			self.commit_details.files().draw_popup(f)?;
 		} else {
+			self.list_area.set(area[0]);
+			self.details_area.set(Rect::default());
 			self.list.draw(f, area[0])?;
 		}
 
@@ -566,15 +585,72 @@ impl Component for Revlog {
 		if self.visible {
 			// CommitList handles checkout directly; intercept it before routing.
 			if let Event::Mouse(mouse) = ev {
+				let pos = Position::new(mouse.column, mouse.row);
+				let total = self.total_area.get();
+				let list_area = self.list_area.get();
+				let details_area = self.details_area.get();
 				match mouse.kind {
-					crossterm::event::MouseEventKind::ScrollDown => {
-						if self.list.scroll_mouse(true)? {
-							self.update_selection()?;
+					MouseEventKind::Down(MouseButton::Left) => {
+						if self.commit_details.is_visible()
+							&& total.contains(pos)
+							&& total.width >= 20
+							&& mouse.column.abs_diff(details_area.x) <= 1
+						{
+							self.dragging_split = true;
+							return Ok(EventState::Consumed);
 						}
+						if self.commit_details.is_visible()
+							&& details_area.contains(pos)
+							&& self.commit_details.handle_mouse(*mouse)
+						{
+							return Ok(EventState::Consumed);
+						}
+						if list_area.contains(pos) {
+							if self.commit_details.is_visible() {
+								self.commit_details.focus_details();
+							}
+							if self.list.select_at_row(mouse.row) {
+								self.update_selection()?;
+							}
+							return Ok(EventState::Consumed);
+						}
+					}
+					MouseEventKind::Drag(MouseButton::Left)
+						if self.dragging_split && total.width > 0 =>
+					{
+						let rel = mouse.column.saturating_sub(total.x);
+						let ratio = u16::try_from(
+							u32::from(rel) * 100
+								/ u32::from(total.width),
+						)
+						.unwrap_or(60);
+						self.options
+							.borrow_mut()
+							.set_log_left_ratio_preview(ratio);
 						return Ok(EventState::Consumed);
 					}
-					crossterm::event::MouseEventKind::ScrollUp => {
-						if self.list.scroll_mouse(false)? {
+					MouseEventKind::Up(MouseButton::Left)
+						if self.dragging_split =>
+					{
+						self.dragging_split = false;
+						self.options
+							.borrow_mut()
+							.save_preferences_now();
+						return Ok(EventState::Consumed);
+					}
+					MouseEventKind::ScrollDown
+					| MouseEventKind::ScrollUp => {
+						if self.commit_details.is_visible()
+							&& details_area.contains(pos)
+							&& self.commit_details.handle_mouse(*mouse)
+						{
+							return Ok(EventState::Consumed);
+						}
+						let down = matches!(
+							mouse.kind,
+							MouseEventKind::ScrollDown
+						);
+						if self.list.scroll_mouse(down)? {
 							self.update_selection()?;
 						}
 						return Ok(EventState::Consumed);

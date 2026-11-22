@@ -4,7 +4,7 @@ use ratatui::{
 	layout::Rect,
 	style::Style,
 	text::{Span, Text},
-	widgets::{Block, Borders, List, ListItem, Widget},
+	widgets::{Block, BorderType, Borders, List, ListItem, Widget},
 	Frame,
 };
 
@@ -69,6 +69,7 @@ pub fn draw_list<'b, L, S>(
 		Block::default()
 			.title(Span::styled(title, theme.title(selected)))
 			.borders(Borders::ALL)
+			.border_type(BorderType::Rounded)
 			.border_style(theme.block(selected)),
 	);
 	f.render_widget(list, r);

@@ -75,11 +75,7 @@ impl Theme {
 		}
 		.fg(self.branch_fg);
 
-		if selected {
-			branch.patch(Style::default().bg(self.selection_bg))
-		} else {
-			branch
-		}
+		self.apply_select(branch, selected)
 	}
 
 	pub fn tab(&self, selected: bool) -> Style {
@@ -93,14 +89,12 @@ impl Theme {
 	}
 
 	pub fn tags(&self, selected: bool) -> Style {
-		Style::default()
-			.fg(self.tag_fg)
-			.add_modifier(Modifier::BOLD)
-			.bg(if selected {
-				self.selection_bg
-			} else {
-				Color::Reset
-			})
+		self.apply_select(
+			Style::default()
+				.fg(self.tag_fg)
+				.add_modifier(Modifier::BOLD),
+			selected,
+		)
 	}
 
 	pub fn text(&self, enabled: bool, selected: bool) -> Style {
@@ -216,10 +210,11 @@ impl Theme {
 		self.line_break.clone()
 	}
 
-	/// Action label style in the command bar (cleaner, lower visual weight
-	/// than the key badge so shortcuts are easy to scan).
+	/// Action label style in the command bar (regular foreground so
+	/// labels stay readable while keycaps carry the accent highlight).
+	#[allow(clippy::unused_self)]
 	pub fn commandbar_label(&self) -> Style {
-		Style::default().fg(self.disabled_fg)
+		Style::default()
 	}
 
 	/// Highlighted key-hint badge in the command bar.
@@ -229,10 +224,22 @@ impl Theme {
 			.add_modifier(Modifier::BOLD)
 	}
 
-	/// Style for non-blocking toast notifications.
+	/// Low-contrast separator between command bar entries.
+	pub fn commandbar_splitter(&self) -> Style {
+		Style::default().fg(self.disabled_fg)
+	}
+
+	/// Style for non-blocking success toast notifications.
 	pub fn toast(&self) -> Style {
 		Style::default()
 			.fg(self.diff_line_add)
+			.add_modifier(Modifier::BOLD)
+	}
+
+	/// Style for non-blocking info toast notifications.
+	pub fn toast_info(&self) -> Style {
+		Style::default()
+			.fg(self.block_title_focused)
 			.add_modifier(Modifier::BOLD)
 	}
 
@@ -241,11 +248,7 @@ impl Theme {
 		let base = Style::default()
 			.fg(self.branch_fg)
 			.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
-		if row_selected {
-			base.bg(self.selection_bg)
-		} else {
-			base
-		}
+		self.apply_select(base, row_selected)
 	}
 
 	pub fn commit_hash(&self, selected: bool) -> Style {
@@ -343,7 +346,7 @@ impl Theme {
 		Self {
 			selected_tab: Color::Blue,
 			command_fg: Color::White,
-			selection_bg: Color::Blue,
+			selection_bg: Color::Rgb(37, 99, 235),
 			selection_fg: Color::White,
 			use_selection_fg: true,
 			cmdbar_bg: Color::Blue,
@@ -403,7 +406,7 @@ impl Default for Theme {
 		Self {
 			selected_tab: Color::Cyan,
 			command_fg: Color::White,
-			selection_bg: Color::Blue,
+			selection_bg: Color::Rgb(38, 79, 120),
 			selection_fg: Color::White,
 			use_selection_fg: true,
 			cmdbar_bg: Color::Blue,
@@ -469,5 +472,34 @@ mod tests {
 		assert_eq!(theme.selection_bg, Color::Black);
 		assert_eq!(theme.selection_fg, Color::Rgb(255, 255, 255));
 		assert_eq!(theme.syntax, "InspiredGitHub");
+	}
+
+	#[test]
+	fn test_light_theme_selected_styles_contrast() {
+		let theme = Theme::default_light();
+		assert_ne!(theme.branch_fg, theme.selection_fg);
+
+		for head in [false, true] {
+			let selected_branch = theme.branch(true, head);
+			assert_eq!(selected_branch.bg, Some(theme.selection_bg));
+			assert_eq!(selected_branch.fg, Some(theme.selection_fg));
+
+			let unselected_branch = theme.branch(false, head);
+			assert_eq!(unselected_branch.fg, Some(theme.branch_fg));
+		}
+
+		let selected_tag = theme.tags(true);
+		assert_eq!(selected_tag.bg, Some(theme.selection_bg));
+		assert_eq!(selected_tag.fg, Some(theme.selection_fg));
+
+		let selected_match = theme.search_match(true);
+		assert_eq!(selected_match.bg, Some(theme.selection_bg));
+		assert_eq!(selected_match.fg, Some(theme.selection_fg));
+
+		let mut custom = theme;
+		custom.use_selection_fg = false;
+		let custom_selected_branch = custom.branch(true, true);
+		assert_eq!(custom_selected_branch.bg, Some(custom.selection_bg));
+		assert_eq!(custom_selected_branch.fg, Some(custom.branch_fg));
 	}
 }

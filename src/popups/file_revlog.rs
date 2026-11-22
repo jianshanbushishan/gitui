@@ -445,6 +445,7 @@ impl FileRevlogPopup {
 							self.theme.title(true),
 						))
 						.borders(Borders::ALL)
+						.border_type(ratatui::widgets::BorderType::Rounded)
 						.border_style(Theme::attention_block()),
 				)
 				.alignment(Alignment::Left),
@@ -620,6 +621,7 @@ impl FileRevlogPopup {
 			.block(
 				Block::default()
 					.borders(Borders::ALL)
+					.border_type(ratatui::widgets::BorderType::Rounded)
 					.title(Span::styled(
 						title,
 						self.theme.title(true),

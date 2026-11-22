@@ -2,15 +2,15 @@
 source: src/gitui.rs
 expression: terminal.backend()
 ---
-"  Status [1]  |  Log [2]  |  Files [3]  |  Stashing [4]  |  Stashes [5]          Quit [q] "
+"  Status [1]  |  Log [2]  |  Files [3]  |  Stashing [4]  |  Stashes [5]          (master) "
 " ──────────────────────────────────────────────────────────────────────────────────────── "
-"┌Unstaged Changes───────────────────(master)┐┌Diff: ─────────────────────────────────────┐"
+"╭Unstaged Changes───────────────────────────╮╭Diff: ─────────────────────────────────────╮"
 "│Working tree clean · [b] branches  [f] pull││No delta output available.                 │"
 "│                                           ││                                           │"
 "│                                           ││                                           │"
-"└───────────────────────────────────────────┘│                                           │"
-"┌Staged Changes─────────────────────────────┐│                                           │"
+"╰───────────────────────────────────────────╯│                                           │"
+"╭Staged Changes─────────────────────────────╮│                                           │"
 "│No staged changes                          ││                                           │"
 "│                                           ││                                           │"
-"└───────────────────────────────────────────┘└───────────────────────────────────────────┘"
-"Branches [b] Undo Commit [⇧U] Submodules [⇧S] To stage [w]                                "
+"╰───────────────────────────────────────────╯╰───────────────────────────────────────────╯"
+"Branches [b] · Undo Commit [⇧U] · Submodules [⇧S] · To stage [w]                          "

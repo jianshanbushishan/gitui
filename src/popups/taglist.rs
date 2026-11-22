@@ -117,7 +117,7 @@ impl DrawableComponent for TagListPopup {
 							self.theme.title(true),
 						))
 						.border_style(self.theme.block(true))
-						.border_type(BorderType::Thick),
+						.border_type(BorderType::Rounded),
 				);
 
 			let mut view_state = TableState::default()

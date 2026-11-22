@@ -404,6 +404,14 @@ impl Options {
 		next
 	}
 
+	/// Update the status split ratio in-memory (for live mouse drag
+	/// without writing to disk on every pointer event).
+	pub fn set_status_left_ratio_preview(&mut self, ratio: u16) -> u16 {
+		let clamped = ratio.clamp(15, 75);
+		self.preferences.status_left_ratio = Some(clamped);
+		clamped
+	}
+
 	pub fn log_left_ratio(&self) -> u16 {
 		self.preferences
 			.log_left_ratio
@@ -420,6 +428,12 @@ impl Options {
 		next
 	}
 
+	pub fn set_log_left_ratio_preview(&mut self, ratio: u16) -> u16 {
+		let clamped = ratio.clamp(15, 75);
+		self.preferences.log_left_ratio = Some(clamped);
+		clamped
+	}
+
 	pub fn detail_left_ratio(&self) -> u16 {
 		self.preferences
 			.detail_left_ratio
@@ -434,6 +448,21 @@ impl Options {
 			preferences.detail_left_ratio = Some(next);
 		});
 		next
+	}
+
+	pub fn set_detail_left_ratio_preview(&mut self, ratio: u16) -> u16 {
+		let clamped = ratio.clamp(15, 75);
+		self.preferences.detail_left_ratio = Some(clamped);
+		clamped
+	}
+
+	/// Persist the current global preferences to disk (used after a
+	/// live mouse-drag resize completes).
+	pub fn save_preferences_now(&mut self) {
+		let current = self.preferences.clone();
+		self.update_preferences(|preferences| {
+			*preferences = current;
+		});
 	}
 
 	/// Recursion depth for the directory tree shown in the Files preview
@@ -1109,5 +1138,41 @@ mod tests {
 			Some((0, 3)),
 			"reopen in same session should restore cached cursor"
 		);
+	}
+
+	#[test]
+	fn save_preferences_now_persists_preview_ratios() {
+		let td = TempDir::new().unwrap();
+		init_repo(&td);
+		let repo =
+			RefCell::new(RepoPath::Path(td.path().to_path_buf()));
+		let config_dir = Some(td.path().join("config"));
+		let opts = Options::with_config_dir(
+			repo.clone(),
+			config_dir.clone(),
+		);
+
+		// Seed initial persisted ratios on disk
+		opts.borrow_mut().adjust_status_left_ratio(0);
+		opts.borrow_mut().adjust_log_left_ratio(0);
+		opts.borrow_mut().adjust_detail_left_ratio(0);
+
+		// Simulate live mouse drag updates followed by MouseUp -> save_preferences_now
+		{
+			let mut o = opts.borrow_mut();
+			assert_eq!(o.set_status_left_ratio_preview(35), 35);
+			assert_eq!(o.set_log_left_ratio_preview(42), 42);
+			assert_eq!(o.set_detail_left_ratio_preview(28), 28);
+			o.save_preferences_now();
+			assert_eq!(o.status_left_ratio(), 35);
+			assert_eq!(o.log_left_ratio(), 42);
+			assert_eq!(o.detail_left_ratio(), 28);
+		}
+
+		// Reload from disk to verify persistence
+		let reloaded = Options::with_config_dir(repo, config_dir);
+		assert_eq!(reloaded.borrow().status_left_ratio(), 35);
+		assert_eq!(reloaded.borrow().log_left_ratio(), 42);
+		assert_eq!(reloaded.borrow().detail_left_ratio(), 28);
 	}
 }

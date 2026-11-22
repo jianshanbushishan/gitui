@@ -43,6 +43,47 @@ pub fn clear_popup_area(
 	f.render_widget(ratatui::widgets::Clear, clear_area);
 }
 
+/// Dim all cells in `area` to establish visual Z-index depth behind
+/// modal popups without altering underlying text or layout.
+pub fn dim_buffer(buf: &mut ratatui::buffer::Buffer, area: Rect) {
+	let area = area.intersection(buf.area);
+	for y in area.top()..area.bottom() {
+		for x in area.left()..area.right() {
+			if let Some(cell) = buf.cell_mut((x, y)) {
+				cell.modifier.insert(ratatui::style::Modifier::DIM);
+			}
+		}
+	}
+}
+
+/// Compute a centered popup rect sized by percentages of `area`,
+/// clamped within `[min, max]` and guaranteed to fit inside `area`.
+pub fn responsive_popup_rect(
+	percent_x: u16,
+	percent_y: u16,
+	min: Size,
+	max: Size,
+	area: Rect,
+) -> Rect {
+	let max_w = max.width.min(area.width);
+	let min_w = min.width.min(max_w);
+	let target_w = u16::try_from(
+		u32::from(area.width) * u32::from(percent_x) / 100,
+	)
+	.unwrap_or(max_w);
+	let width = target_w.clamp(min_w, max_w);
+
+	let max_h = max.height.min(area.height);
+	let min_h = min.height.min(max_h);
+	let target_h = u16::try_from(
+		u32::from(area.height) * u32::from(percent_y) / 100,
+	)
+	.unwrap_or(max_h);
+	let height = target_h.clamp(min_h, max_h);
+
+	centered_rect_absolute(width, height, area)
+}
+
 use crate::keys::{key_match, SharedKeyConfig};
 
 /// return the scroll position (line) necessary to have the `selection` in view if it is not already
@@ -292,5 +333,47 @@ mod test {
 				height: 2
 			}
 		);
+	}
+
+	#[test]
+	fn test_dim_buffer_applies_dim_modifier() {
+		let area = Rect::new(0, 0, 10, 4);
+		let mut buf = ratatui::buffer::Buffer::empty(area);
+		super::dim_buffer(&mut buf, Rect::new(2, 1, 4, 2));
+		assert!(!buf[(0, 0)]
+			.modifier
+			.contains(ratatui::style::Modifier::DIM));
+		assert!(buf[(2, 1)]
+			.modifier
+			.contains(ratatui::style::Modifier::DIM));
+		assert!(buf[(5, 2)]
+			.modifier
+			.contains(ratatui::style::Modifier::DIM));
+		assert!(!buf[(6, 2)]
+			.modifier
+			.contains(ratatui::style::Modifier::DIM));
+	}
+
+	#[test]
+	fn test_responsive_popup_rect_clamps_to_bounds() {
+		let wide = super::responsive_popup_rect(
+			60,
+			50,
+			Size::new(30, 8),
+			Size::new(70, 20),
+			Rect::new(0, 0, 160, 50),
+		);
+		assert_eq!(wide.width, 70);
+		assert_eq!(wide.height, 20);
+
+		let tiny = super::responsive_popup_rect(
+			60,
+			50,
+			Size::new(30, 8),
+			Size::new(70, 20),
+			Rect::new(0, 0, 20, 6),
+		);
+		assert_eq!(tiny.width, 20);
+		assert_eq!(tiny.height, 6);
 	}
 }

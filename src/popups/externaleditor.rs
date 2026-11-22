@@ -204,11 +204,17 @@ impl DrawableComponent for ExternalEditorPopup {
 					.collect::<Vec<Span>>(),
 			);
 
-			let area = ui::centered_rect_absolute(25, 3, f.area());
+			let area = ui::responsive_popup_rect(
+				35,
+				15,
+				ui::Size::new(25, 3),
+				ui::Size::new(36, 3),
+				f.area(),
+			);
 			f.render_widget(Clear, area);
 			let block = Block::default()
 				.borders(Borders::ALL)
-				.border_type(BorderType::Thick)
+				.border_type(BorderType::Rounded)
 				.border_style(self.theme.block(true))
 				.style(self.theme.block(true));
 			ui::render_block_text(

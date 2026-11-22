@@ -495,13 +495,19 @@ impl LogSearchPopupPopup {
 		f: &mut Frame,
 		area: Rect,
 	) -> Result<()> {
-		const SIZE: (u16, u16) = (60, 12);
-		let area = ui::centered_rect_absolute(SIZE.0, SIZE.1, area);
+		let area = ui::responsive_popup_rect(
+			60,
+			45,
+			ui::Size::new(42, 12),
+			ui::Size::new(68, 14),
+			area,
+		);
 
 		ui::clear_popup_area(f, area);
 		f.render_widget(
 			Block::default()
 				.borders(Borders::all())
+				.border_type(ratatui::widgets::BorderType::Rounded)
 				.border_style(self.theme.block(true))
 				.title(Span::styled(
 					strings::POPUP_TITLE_LOG_SEARCH,
@@ -542,8 +548,13 @@ impl LogSearchPopupPopup {
 		f: &mut Frame,
 		area: Rect,
 	) -> Result<()> {
-		const SIZE: (u16, u16) = (60, 3);
-		let area = ui::centered_rect_absolute(SIZE.0, SIZE.1, area);
+		let area = ui::responsive_popup_rect(
+			60,
+			15,
+			ui::Size::new(40, 3),
+			ui::Size::new(68, 3),
+			area,
+		);
 
 		let mut block_style = self.theme.block(true);
 
@@ -558,6 +569,7 @@ impl LogSearchPopupPopup {
 		f.render_widget(
 			Block::default()
 				.borders(Borders::all())
+				.border_type(ratatui::widgets::BorderType::Rounded)
 				.border_style(block_style)
 				.title(Span::styled(
 					strings::POPUP_TITLE_LOG_SEARCH,

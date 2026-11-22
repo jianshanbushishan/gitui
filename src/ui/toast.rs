@@ -2,13 +2,20 @@ use crate::ui::{self, style::Theme};
 use ratatui::{
 	layout::Rect,
 	text::{Line, Span},
-	widgets::{Block, Borders, Clear},
+	widgets::{Block, BorderType, Borders, Clear},
 	Frame,
 };
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
 const DEFAULT_TOAST_DURATION: Duration = Duration::from_millis(2500);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToastKind {
+	Info,
+	Success,
+	Warning,
+}
 
 /// Non-blocking transient notification rendered in the bottom-right corner
 /// above the command bar. Auto-dismisses after a short timeout without
@@ -21,7 +28,7 @@ pub struct Toast {
 struct ToastEntry {
 	text: String,
 	expires_at: Instant,
-	is_warning: bool,
+	kind: ToastKind,
 }
 
 impl Toast {
@@ -29,7 +36,15 @@ impl Toast {
 		self.show_with_duration(
 			text.as_ref(),
 			DEFAULT_TOAST_DURATION,
-			false,
+			ToastKind::Success,
+		);
+	}
+
+	pub fn show_info(&mut self, text: impl AsRef<str>) {
+		self.show_with_duration(
+			text.as_ref(),
+			DEFAULT_TOAST_DURATION,
+			ToastKind::Info,
 		);
 	}
 
@@ -37,7 +52,7 @@ impl Toast {
 		self.show_with_duration(
 			text.as_ref(),
 			DEFAULT_TOAST_DURATION,
-			true,
+			ToastKind::Warning,
 		);
 	}
 
@@ -45,7 +60,7 @@ impl Toast {
 		&mut self,
 		text: &str,
 		duration: Duration,
-		is_warning: bool,
+		kind: ToastKind,
 	) {
 		let sanitized = text
 			.lines()
@@ -59,7 +74,7 @@ impl Toast {
 		self.message = Some(ToastEntry {
 			text: sanitized,
 			expires_at: Instant::now() + duration,
-			is_warning,
+			kind,
 		});
 	}
 
@@ -89,7 +104,11 @@ impl Toast {
 			return;
 		}
 
-		let prefix = if entry.is_warning { "! " } else { "✓ " };
+		let prefix = match entry.kind {
+			ToastKind::Info => "ℹ ",
+			ToastKind::Success => "✓ ",
+			ToastKind::Warning => "! ",
+		};
 		let full = format!("{prefix}{}", entry.text);
 		let max_inner_width =
 			usize::from(area.width.saturating_sub(6)).max(4);
@@ -116,19 +135,19 @@ impl Toast {
 		);
 		f.render_widget(Clear, clear_area);
 
-		let border_style = if entry.is_warning {
-			Theme::attention_block()
-		} else {
-			theme.block(true)
+		let border_style = match entry.kind {
+			ToastKind::Warning => Theme::attention_block(),
+			ToastKind::Info | ToastKind::Success => theme.block(true),
 		};
-		let text_style = if entry.is_warning {
-			Theme::attention_block()
-		} else {
-			theme.toast()
+		let text_style = match entry.kind {
+			ToastKind::Warning => Theme::attention_block(),
+			ToastKind::Info => theme.toast_info(),
+			ToastKind::Success => theme.toast(),
 		};
 
 		let block = Block::default()
 			.borders(Borders::ALL)
+			.border_type(BorderType::Rounded)
 			.border_style(border_style);
 		let line = Line::from(vec![
 			Span::raw(" "),
@@ -186,5 +205,22 @@ mod tests {
 			.unwrap();
 		let rendered = terminal.backend().to_string();
 		assert!(rendered.contains("✓ 已复制"));
+		assert!(rendered.contains('╭'));
+	}
+
+	#[test]
+	fn toast_info_and_warning_prefixes() {
+		let theme = Theme::default();
+		let mut toast = Toast::default();
+		toast.show_info("Opened external diff");
+		let mut terminal =
+			Terminal::new(TestBackend::new(60, 12)).unwrap();
+		terminal
+			.draw(|f| toast.draw(f, f.area(), &theme))
+			.unwrap();
+		assert!(terminal
+			.backend()
+			.to_string()
+			.contains("ℹ Opened external diff"));
 	}
 }

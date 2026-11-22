@@ -17,7 +17,7 @@ use crossterm::event::Event;
 use ratatui::{
 	layout::Rect,
 	text::{Line, Span},
-	widgets::{Block, Borders, Clear},
+	widgets::{Block, Borders},
 	Frame,
 };
 
@@ -108,15 +108,20 @@ impl CheckoutOptionPopup {
 impl DrawableComponent for CheckoutOptionPopup {
 	fn draw(&self, f: &mut Frame, area: Rect) -> Result<()> {
 		if self.is_visible() {
-			const SIZE: (u16, u16) = (55, 4);
-			let area =
-				ui::centered_rect_absolute(SIZE.0, SIZE.1, area);
+			let area = ui::responsive_popup_rect(
+				55,
+				20,
+				ui::Size::new(36, 4),
+				ui::Size::new(60, 4),
+				area,
+			);
 
 			let width = area.width;
 
-			f.render_widget(Clear, area);
+			ui::clear_popup_area(f, area);
 			let block = Block::default()
 				.borders(Borders::ALL)
+				.border_type(ratatui::widgets::BorderType::Rounded)
 				.title(Span::styled(
 					"Checkout options",
 					self.theme.title(true),

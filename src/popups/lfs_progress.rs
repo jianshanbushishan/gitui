@@ -14,11 +14,17 @@ pub fn draw_lfs_progress(
 	title: &str,
 	progress: DownloadProgress,
 ) {
-	let area = ui::centered_rect_absolute(48, 4, f.area());
+	let area = ui::responsive_popup_rect(
+		52,
+		20,
+		ui::Size::new(34, 4),
+		ui::Size::new(56, 4),
+		f.area(),
+	);
 	let block = Block::default()
 		.title(Span::styled(title, theme.title(true)))
 		.borders(Borders::ALL)
-		.border_type(BorderType::Thick)
+		.border_type(BorderType::Rounded)
 		.border_style(theme.block(true));
 	let inner = block.inner(area);
 	f.render_widget(Clear, area);
@@ -117,7 +123,17 @@ mod tests {
 			} else {
 				assert!(!row(4).contains('%'));
 			}
-			assert_eq!(row(6), format!("┗{}┛", "━".repeat(46)));
+			let bottom = row(6);
+			let trimmed = bottom.trim();
+			assert!(
+				trimmed.starts_with('╰')
+					&& trimmed.ends_with('╯')
+					&& trimmed
+						.trim_start_matches('╰')
+						.trim_end_matches('╯')
+						.chars()
+						.all(|ch| ch == '─')
+			);
 		}
 	}
 }

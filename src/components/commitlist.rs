@@ -22,7 +22,7 @@ use itertools::Itertools;
 use ratatui::{
 	layout::{Alignment, Rect},
 	text::{Line, Span},
-	widgets::{Block, Borders, Paragraph},
+	widgets::{Block, BorderType, Borders, Paragraph},
 	Frame,
 };
 use std::{
@@ -54,6 +54,7 @@ pub struct CommitList {
 	remote_branches: BTreeMap<CommitId, Vec<BranchInfo>>,
 	highlight_positions: Vec<usize>,
 	current_size: Cell<Option<(u16, u16)>>,
+	area: Cell<Rect>,
 	scroll_top: Cell<usize>,
 	/// When set, the next draw centers the selection in the viewport
 	/// instead of just scrolling it into view. Used by highlight jumps
@@ -83,6 +84,7 @@ impl CommitList {
 			remote_branches: BTreeMap::default(),
 			highlight_positions: Vec::new(),
 			current_size: Cell::new(None),
+			area: Cell::new(Rect::default()),
 			scroll_top: Cell::new(0),
 			center_next_scroll: Cell::new(false),
 			theme: env.theme.clone(),
@@ -407,6 +409,30 @@ impl CommitList {
 			})?;
 		}
 		Ok(changed)
+	}
+
+	/// Select the commit rendered at terminal `row` (for mouse clicks).
+	/// Returns `true` when the selection changed.
+	pub fn select_at_row(&mut self, row: u16) -> bool {
+		let area = self.area.get();
+		if area.height <= 2 || self.commits.is_empty() {
+			return false;
+		}
+		let inner_top = area.y.saturating_add(1);
+		let inner_bottom = area.bottom().saturating_sub(1);
+		if row < inner_top || row >= inner_bottom {
+			return false;
+		}
+		let relative =
+			self.scroll_top.get() + usize::from(row - inner_top);
+		let target = self.items.index_offset().saturating_add(relative);
+		if target >= self.commits.len() {
+			return false;
+		}
+		let changed = target != self.selection;
+		self.selection = target;
+		self.set_highlighted_selection_index();
+		changed
 	}
 
 	fn move_selection(&mut self, scroll: ScrollType) -> Result<bool> {
@@ -896,6 +922,7 @@ impl CommitList {
 
 impl DrawableComponent for CommitList {
 	fn draw(&self, f: &mut Frame, area: Rect) -> Result<()> {
+		self.area.set(area);
 		let current_size = (
 			area.width.saturating_sub(2),
 			area.height.saturating_sub(2),
@@ -933,6 +960,7 @@ impl DrawableComponent for CommitList {
 			.block(
 				Block::default()
 					.borders(Borders::ALL)
+					.border_type(BorderType::Rounded)
 					.title(Span::styled(
 						title.as_str(),
 						self.theme.title(true),
@@ -1060,6 +1088,7 @@ mod tests {
 				key_config: SharedKeyConfig::default(),
 				scroll_state: (Instant::now(), 0.0),
 				current_size: Cell::default(),
+				area: Cell::default(),
 				repo: RepoPathRef::new(sync::RepoPath::Path(
 					std::path::PathBuf::default(),
 				)),

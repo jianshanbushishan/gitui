@@ -54,7 +54,7 @@ impl DrawableComponent for RemoteListPopup {
 			f.render_widget(
 				Block::default()
 					.title(strings::POPUP_TITLE_REMOTES)
-					.border_type(BorderType::Thick)
+					.border_type(BorderType::Rounded)
 					.borders(Borders::ALL),
 				area,
 			);
@@ -320,7 +320,7 @@ impl RemoteListPopup {
 		f.render_widget(
 			Block::default()
 				.title(strings::POPUP_SUBTITLE_REMOTES)
-				.border_type(BorderType::Plain)
+				.border_type(BorderType::Rounded)
 				.borders(Borders::TOP),
 			r,
 		);

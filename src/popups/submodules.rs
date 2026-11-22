@@ -62,7 +62,7 @@ impl DrawableComponent for SubmodulesListPopup {
 			f.render_widget(
 				Block::default()
 					.title(strings::POPUP_TITLE_SUBMODULES)
-					.border_type(ratatui::widgets::BorderType::Thick)
+					.border_type(ratatui::widgets::BorderType::Rounded)
 					.borders(Borders::ALL),
 				area,
 			);

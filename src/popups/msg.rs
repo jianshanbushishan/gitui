@@ -240,7 +240,7 @@ impl MsgPopup {
 	) -> Result<(Rect, Block<'_>, usize)> {
 		let mut block = Block::default()
 			.borders(Borders::ALL)
-			.border_type(BorderType::Thick);
+			.border_type(BorderType::Rounded);
 		let padding = u16::from(self.compact && viewport.width >= 6);
 		let horizontal_inset = BORDER_WIDTH + 2 * padding;
 		let min_width = if self.compact {
@@ -393,11 +393,11 @@ mod tests {
 		terminal.draw(|f| popup.draw(f, f.area()).unwrap()).unwrap();
 
 		let rendered = terminal.backend().to_string();
-		assert!(rendered.contains("┏ LFS download complete ━"));
+		assert!(rendered.contains("╭ LFS download complete ─"));
 		assert!(rendered.contains("Processed the current checkout."));
-		assert!(rendered.contains("┃ ⎋ Close"));
-		assert!(rendered.contains("┗━━━━━━━━"));
-		assert_eq!(rendered.matches('┃').count(), 4);
+		assert!(rendered.contains("│ ⎋ Close"));
+		assert!(rendered.contains("╰────────"));
+		assert_eq!(rendered.matches('│').count(), 4);
 		let title = terminal
 			.backend()
 			.buffer()
@@ -449,7 +449,7 @@ mod tests {
 		// border glyph, not a CJK char that overflowed from x=19.
 		assert_eq!(
 			buf[(20, 14)].symbol(),
-			"┃",
+			"│",
 			"left border must not be stomped by adjacent CJK"
 		);
 		// The cell just outside the popup (x=19) must be cleared so the
@@ -462,7 +462,7 @@ mod tests {
 		// Right border must also survive.
 		assert_eq!(
 			buf[(79, 14)].symbol(),
-			"┃",
+			"│",
 			"right border must not be stomped by CJK content"
 		);
 	}
