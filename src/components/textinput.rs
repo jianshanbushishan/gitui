@@ -136,6 +136,16 @@ impl TextInputComponent {
 		self.current_area.get()
 	}
 
+	/// Current block title.
+	pub fn title(&self) -> &str {
+		&self.title
+	}
+
+	/// Toggle built-in bottom-right character count indicator.
+	pub const fn set_show_char_count(&mut self, show: bool) {
+		self.show_char_count = show;
+	}
+
 	/// embed into parent draw area
 	pub const fn embed(&mut self) {
 		self.embed = true;
@@ -345,6 +355,9 @@ impl TextInputComponent {
 				alt: false,
 				..
 			} => {
+				if ta.is_selecting() {
+					ta.cut();
+				}
 				ta.insert_char(*c);
 				true
 			}
@@ -354,6 +367,9 @@ impl TextInputComponent {
 				alt: false,
 				..
 			} => {
+				if ta.is_selecting() {
+					ta.cut();
+				}
 				ta.insert_tab();
 				true
 			}
@@ -369,7 +385,9 @@ impl TextInputComponent {
 				alt: false,
 				..
 			} => {
-				ta.delete_char();
+				if !ta.cut() {
+					ta.delete_char();
+				}
 				true
 			}
 			Input {
@@ -384,7 +402,9 @@ impl TextInputComponent {
 				alt: false,
 				..
 			} => {
-				ta.delete_next_char();
+				if !ta.cut() {
+					ta.delete_next_char();
+				}
 				true
 			}
 			Input {
@@ -700,9 +720,9 @@ impl DrawableComponent for TextInputComponent {
 			let area = if self.embed {
 				rect
 			} else if self.input_type == InputType::Multiline {
-				let area = ui::centered_rect(60, 20, f.area());
+				let area = ui::centered_rect(64, 40, f.area());
 				ui::rect_inside(
-					Size::new(10, 3),
+					Size::new(20, 6),
 					f.area().into(),
 					area,
 				)
@@ -777,24 +797,42 @@ impl Component for TextInputComponent {
 					| Key::Home | Key::End | Key::PageUp
 					| Key::PageDown
 			);
-			let modified = if let Event::Key(e) = ev {
-				if key_match(e, self.key_config.keys.exit_popup) {
-					self.hide();
-					return Ok(EventState::Consumed);
-				}
-
-				if self.input_type == InputType::Multiline
-					&& is_newline_key(
-						e,
-						&self.key_config.keys.newline,
-					) {
-					ta.insert_newline();
+			let modified = match ev {
+				Event::Paste(text) => {
+					if ta.is_selecting() {
+						ta.cut();
+					}
+					if self.input_type == InputType::Multiline {
+						ta.insert_str(text);
+					} else {
+						let single_line = text
+							.replace("\r\n", " ")
+							.replace(['\r', '\n'], " ");
+						ta.insert_str(single_line);
+					}
 					true
-				} else {
-					Self::process_inputs(ta, &input)
 				}
-			} else {
-				false
+				Event::Key(e) => {
+					if key_match(e, self.key_config.keys.exit_popup) {
+						self.hide();
+						return Ok(EventState::Consumed);
+					}
+
+					if self.input_type == InputType::Multiline
+						&& is_newline_key(
+							e,
+							&self.key_config.keys.newline,
+						) {
+						if ta.is_selecting() {
+							ta.cut();
+						}
+						ta.insert_newline();
+						true
+					} else {
+						Self::process_inputs(ta, &input)
+					}
+				}
+				_ => false,
 			};
 
 			if self.select_state

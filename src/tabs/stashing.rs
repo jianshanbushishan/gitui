@@ -47,13 +47,15 @@ impl Stashing {
 
 	///
 	pub fn new(env: &Environment) -> Self {
+		let mut index = StatusTreeComponent::new(
+			env,
+			&strings::stashing_files_title(&env.key_config),
+			true,
+		);
+		index.set_empty_hint("Working tree clean · nothing to stash");
 		Self {
 			repo: env.repo.clone(),
-			index: StatusTreeComponent::new(
-				env,
-				&strings::stashing_files_title(&env.key_config),
-				true,
-			),
+			index,
 			visible: false,
 			options: StashingOptions {
 				keep_index: false,

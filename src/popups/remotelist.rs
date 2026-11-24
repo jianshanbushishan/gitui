@@ -3,13 +3,15 @@ use std::cell::Cell;
 use asyncgit::sync::{get_remote_url, get_remotes, RepoPathRef};
 use ratatui::{
 	layout::{
-		Alignment, Constraint, Direction, Layout, Margin, Rect,
+		Alignment, Constraint, Direction, Layout, Margin, Position,
+		Rect,
 	},
 	text::{Line, Span, Text},
-	widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
+	widgets::{Block, BorderType, Borders, Paragraph, Wrap},
 	Frame,
 };
 use unicode_truncate::UnicodeTruncateStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
 	app::Environment,
@@ -23,7 +25,9 @@ use crate::{
 	ui::{self, style::SharedTheme, Size},
 };
 use anyhow::Result;
-use crossterm::event::{Event, KeyEvent};
+use crossterm::event::{
+	Event, KeyEvent, MouseButton, MouseEventKind,
+};
 
 pub struct RemoteListPopup {
 	remote_names: Vec<String>,
@@ -31,6 +35,8 @@ pub struct RemoteListPopup {
 	repo: RepoPathRef,
 	visible: bool,
 	current_height: Cell<u16>,
+	last_area: Cell<Rect>,
+	list_area: Cell<Rect>,
 	queue: Queue,
 	selection: u16,
 	scroll: VerticalScroll,
@@ -50,11 +56,16 @@ impl DrawableComponent for RemoteListPopup {
 			);
 			let area = ui::rect_inside(MIN_SIZE, rect.into(), area);
 			let area = area.intersection(rect);
-			f.render_widget(Clear, area);
+			self.last_area.set(area);
+			ui::clear_popup_area(f, area);
 			f.render_widget(
 				Block::default()
-					.title(strings::POPUP_TITLE_REMOTES)
+					.title(Span::styled(
+						strings::POPUP_TITLE_REMOTES,
+						self.theme.title(true),
+					))
 					.border_type(BorderType::Rounded)
+					.border_style(self.theme.block(true))
 					.borders(Borders::ALL),
 				area,
 			);
@@ -116,7 +127,7 @@ impl Component for RemoteListPopup {
 			out.push(CommandInfo::new(
 				strings::commands::create_remote(&self.key_config),
 				true,
-				self.valid_selection(),
+				true,
 			));
 
 			out.push(CommandInfo::new(
@@ -133,6 +144,39 @@ impl Component for RemoteListPopup {
 	fn event(&mut self, ev: &Event) -> Result<EventState> {
 		if !self.visible {
 			return Ok(EventState::NotConsumed);
+		}
+
+		if let Event::Mouse(mouse) = ev {
+			let pos = Position::new(mouse.column, mouse.row);
+			let area = self.last_area.get();
+			let list_area = self.list_area.get();
+			match mouse.kind {
+				MouseEventKind::Down(MouseButton::Left) => {
+					if !area.is_empty() && !area.contains(pos) {
+						self.hide();
+						return Ok(EventState::Consumed);
+					}
+					if list_area.contains(pos) {
+						let rel_row =
+							usize::from(mouse.row - list_area.y);
+						let target = self.scroll.get_top() + rel_row;
+						if target < self.remote_names.len() {
+							let _ = self.set_selection(
+								u16::try_from(target)
+									.unwrap_or(u16::MAX),
+							);
+						}
+					}
+				}
+				MouseEventKind::ScrollUp => {
+					let _ = self.move_selection(ScrollType::Up);
+				}
+				MouseEventKind::ScrollDown => {
+					let _ = self.move_selection(ScrollType::Down);
+				}
+				_ => {}
+			}
+			return Ok(EventState::Consumed);
 		}
 
 		if let Event::Key(e) = ev {
@@ -187,6 +231,8 @@ impl RemoteListPopup {
 			key_config: env.key_config.clone(),
 			queue: env.queue.clone(),
 			current_height: Cell::new(0),
+			last_area: Cell::new(Rect::default()),
+			list_area: Cell::new(Rect::default()),
 			selection: 0,
 		}
 	}
@@ -198,13 +244,13 @@ impl RemoteListPopup {
 			|| key_match(e, self.key_config.keys.popup_down)
 		{
 			return self
-				.move_selection(ScrollType::Up)
+				.move_selection(ScrollType::Down)
 				.map(Into::into);
 		} else if key_match(e, self.key_config.keys.move_up)
 			|| key_match(e, self.key_config.keys.popup_up)
 		{
 			return self
-				.move_selection(ScrollType::Down)
+				.move_selection(ScrollType::Up)
 				.map(Into::into);
 		} else if key_match(e, self.key_config.keys.page_down) {
 			return self
@@ -233,51 +279,52 @@ impl RemoteListPopup {
 		Ok(())
 	}
 
-	fn get_text(
+	fn get_lines(
 		&self,
 		theme: &SharedTheme,
 		width_available: u16,
 		height: usize,
-	) -> Text<'_> {
+	) -> Vec<Line<'_>> {
 		const THREE_DOTS: &str = "...";
 		const THREE_DOTS_LENGTH: usize = THREE_DOTS.len(); // "..."
+
+		if self.remote_names.is_empty() {
+			return vec![Line::from(Span::styled(
+				"No remotes configured",
+				theme.text(false, false),
+			))];
+		}
 
 		let name_length: usize = (width_available as usize)
 			.saturating_sub(THREE_DOTS_LENGTH);
 
-		Text::from(
-			self.remote_names
-				.iter()
-				.skip(self.scroll.get_top())
-				.take(height)
-				.enumerate()
-				.map(|(i, remote)| {
-					let selected = (self.selection as usize
-						- self.scroll.get_top())
-						== i;
-					let mut remote_name = remote.clone();
-					if remote_name.len()
-						> name_length
-							.saturating_sub(THREE_DOTS_LENGTH)
-					{
-						remote_name = remote_name
-							.unicode_truncate(
-								name_length.saturating_sub(
-									THREE_DOTS_LENGTH,
-								),
-							)
-							.0
-							.to_string();
-						remote_name += THREE_DOTS;
-					}
-					let span_name = Span::styled(
-						format!("{remote_name:name_length$}"),
-						theme.text(true, selected),
-					);
-					Line::from(vec![span_name])
-				})
-				.collect::<Vec<_>>(),
-		)
+		self.remote_names
+			.iter()
+			.skip(self.scroll.get_top())
+			.take(height)
+			.enumerate()
+			.map(|(i, remote)| {
+				let selected = (self.selection as usize
+					- self.scroll.get_top())
+					== i;
+				let mut remote_name = remote.clone();
+				let max_name_w =
+					name_length.saturating_sub(THREE_DOTS_LENGTH);
+				if remote_name.width() > max_name_w {
+					remote_name = remote_name
+						.unicode_truncate(max_name_w)
+						.0
+						.to_string();
+					remote_name += THREE_DOTS;
+				}
+				let pad = name_length.saturating_sub(remote_name.width());
+				let span_name = Span::styled(
+					format!("{remote_name}{}", " ".repeat(pad)),
+					theme.text(true, selected),
+				);
+				Line::from(vec![span_name])
+			})
+			.collect()
 	}
 
 	fn draw_remotes_list(
@@ -285,6 +332,7 @@ impl RemoteListPopup {
 		f: &mut Frame,
 		r: Rect,
 	) -> Result<()> {
+		self.list_area.set(r);
 		let height_in_lines = r.height as usize;
 		self.current_height.set(height_in_lines.try_into()?);
 
@@ -294,15 +342,12 @@ impl RemoteListPopup {
 			height_in_lines,
 		);
 
-		f.render_widget(
-			Paragraph::new(self.get_text(
-				&self.theme,
-				r.width.saturating_add(1),
-				height_in_lines,
-			))
-			.alignment(Alignment::Left),
-			r,
+		let lines = self.get_lines(
+			&self.theme,
+			r.width.saturating_add(1),
+			height_in_lines,
 		);
+		ui::render_lines(f.buffer_mut(), r, &lines);
 
 		let mut r = r;
 		r.width += 1;
@@ -315,11 +360,13 @@ impl RemoteListPopup {
 	}
 
 	fn draw_separator(&self, f: &mut Frame, r: Rect) {
-		// Discard self argument because it is not needed.
-		let _ = self;
 		f.render_widget(
 			Block::default()
-				.title(strings::POPUP_SUBTITLE_REMOTES)
+				.title(Span::styled(
+					strings::POPUP_SUBTITLE_REMOTES,
+					self.theme.title(false),
+				))
+				.border_style(self.theme.block(false))
 				.border_type(BorderType::Rounded)
 				.borders(Borders::TOP),
 			r,
@@ -344,21 +391,22 @@ impl RemoteListPopup {
 			self.remote_names.get(usize::from(self.selection));
 		if let Some(remote) = remote {
 			let mut remote_name = remote.clone();
-			if remote_name.len()
-				> name_length.saturating_sub(THREE_DOTS_LENGTH)
-			{
+			let max_name_w =
+				name_length.saturating_sub(THREE_DOTS_LENGTH);
+			if remote_name.width() > max_name_w {
 				remote_name = remote_name
-					.unicode_truncate(
-						name_length.saturating_sub(THREE_DOTS_LENGTH),
-					)
+					.unicode_truncate(max_name_w)
 					.0
 					.to_string();
 				remote_name += THREE_DOTS;
 			}
+			let name_pad =
+				name_length.saturating_sub(remote_name.width());
 			let mut lines = Vec::<Line>::new();
 			lines.push(Line::from(Span::styled(
 				format!(
-					"{REMOTE_NAME_LABEL}{remote_name:name_length$}"
+					"{REMOTE_NAME_LABEL}{remote_name}{}",
+					" ".repeat(name_pad)
 				),
 				self.theme.text(true, false),
 			)));
@@ -367,23 +415,29 @@ impl RemoteListPopup {
 				.get(usize::from(self.selection))
 				.and_then(Clone::clone);
 			if let Some(mut remote_url) = remote_url {
-				if remote_url.len()
-					> url_length.saturating_sub(THREE_DOTS_LENGTH)
-				{
-					remote_url = remote_url
-						.chars()
-						.skip(
-							remote_url.len()
-								- url_length.saturating_sub(
-									THREE_DOTS_LENGTH,
-								),
-						)
-						.collect::<String>();
-					remote_url = format!("{THREE_DOTS}{remote_url}");
+				let max_url_w =
+					url_length.saturating_sub(THREE_DOTS_LENGTH);
+				if remote_url.width() > max_url_w {
+					let mut tail_chars = Vec::new();
+					let mut tail_w = 0_usize;
+					for ch in remote_url.chars().rev() {
+						let cw = ch.width().unwrap_or(0);
+						if tail_w + cw > max_url_w {
+							break;
+						}
+						tail_w += cw;
+						tail_chars.push(ch);
+					}
+					let tail: String =
+						tail_chars.into_iter().rev().collect();
+					remote_url = format!("{THREE_DOTS}{tail}");
 				}
+				let url_pad =
+					url_length.saturating_sub(remote_url.width());
 				lines.push(Line::from(Span::styled(
 					format!(
-						"{REMOTE_URL_LABEL}{remote_url:url_length$}"
+						"{REMOTE_URL_LABEL}{remote_url}{}",
+						" ".repeat(url_pad)
 					),
 					self.theme.text(true, false),
 				)));
@@ -400,8 +454,8 @@ impl RemoteListPopup {
 	///
 	fn move_selection(&mut self, scroll: ScrollType) -> Result<bool> {
 		let new_selection = match scroll {
-			ScrollType::Up => self.selection.saturating_add(1),
-			ScrollType::Down => self.selection.saturating_sub(1),
+			ScrollType::Up => self.selection.saturating_sub(1),
+			ScrollType::Down => self.selection.saturating_add(1),
 			ScrollType::PageDown => self
 				.selection
 				.saturating_add(self.current_height.get()),
@@ -423,7 +477,7 @@ impl RemoteListPopup {
 
 	const fn valid_selection(&self) -> bool {
 		!self.remote_names.is_empty()
-			&& self.remote_names.len() >= self.selection as usize
+			&& self.remote_names.len() > self.selection as usize
 	}
 
 	fn set_selection(&mut self, selection: u16) -> Result<()> {
@@ -493,5 +547,20 @@ impl RemoteListPopup {
 				url,
 			));
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn valid_selection_rejects_out_of_bounds_index() {
+		let env = Environment::test_env();
+		let mut popup = RemoteListPopup::new(&env);
+		popup.remote_names = vec!["origin".to_owned()];
+		assert!(popup.valid_selection());
+		popup.selection = 1;
+		assert!(!popup.valid_selection());
 	}
 }

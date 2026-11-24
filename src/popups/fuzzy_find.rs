@@ -14,10 +14,12 @@ use crate::{
 	AsyncAppNotification, AsyncNotification,
 };
 use anyhow::Result;
-use crossterm::event::{Event, KeyCode, KeyModifiers};
+use crossterm::event::{
+	Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind,
+};
 use fuzzy_matcher::FuzzyMatcher;
 use ratatui::{
-	layout::{Constraint, Direction, Layout, Margin, Rect},
+	layout::{Constraint, Direction, Layout, Margin, Position, Rect},
 	text::{Line, Span},
 	widgets::{Block, Borders},
 	Frame,
@@ -58,6 +60,8 @@ pub struct FuzzyFindPopup {
 	search_result: SearchResult,
 	searching: bool,
 	list_height: Cell<usize>,
+	last_area: Cell<Rect>,
+	list_area: Cell<Rect>,
 	matcher: fuzzy_matcher::skim::SkimMatcherV2,
 	app_sender: crossbeam_channel::Sender<AsyncAppNotification>,
 }
@@ -87,6 +91,8 @@ impl FuzzyFindPopup {
 			search_result: Arc::new(Mutex::new(None)),
 			searching: false,
 			list_height: Cell::new(15),
+			last_area: Cell::new(Rect::default()),
+			list_area: Cell::new(Rect::default()),
 			matcher: fuzzy_matcher::skim::SkimMatcherV2::default(),
 			app_sender: env.sender_app.clone(),
 		}
@@ -290,8 +296,8 @@ impl FuzzyFindPopup {
 	#[inline]
 	fn draw_matches_list(&self, f: &mut Frame, mut area: Rect) {
 		{
-			// Block has two lines up and down which need to be considered
-			const HEIGHT_BLOCK_MARGIN: usize = 2;
+			// Block has one top border line which needs to be considered
+			const HEIGHT_BLOCK_MARGIN: usize = 1;
 
 			let title = if self.searching {
 				format!("Hits: {} (searching…)", self.filtered.len())
@@ -304,18 +310,18 @@ impl FuzzyFindPopup {
 			let text_width = width.saturating_sub(2);
 
 			let list_height =
-				height.saturating_sub(HEIGHT_BLOCK_MARGIN);
-			self.list_height.set(list_height.max(1));
+				height.saturating_sub(HEIGHT_BLOCK_MARGIN).max(1);
+			self.list_height.set(list_height);
 
 			let scroll_skip =
-				self.selection.saturating_sub(list_height);
+				self.selection.saturating_sub(list_height.saturating_sub(1));
 
 			let active_query = self.filtered_query.as_deref();
 			let items = self
 				.filtered
 				.iter()
 				.skip(scroll_skip)
-				.take(height)
+				.take(list_height)
 				.map(|&idx| {
 					let selected = self
 						.selected_index
@@ -400,6 +406,7 @@ impl FuzzyFindPopup {
 impl DrawableComponent for FuzzyFindPopup {
 	fn draw(&self, f: &mut Frame, area: Rect) -> Result<()> {
 		if self.is_visible() {
+			let has_query = !self.find_text.get_text().trim().is_empty();
 			let any_hits = !self.filtered.is_empty() || self.searching;
 
 			let area = ui::responsive_popup_rect(
@@ -412,6 +419,14 @@ impl DrawableComponent for FuzzyFindPopup {
 
 			let area = if any_hits {
 				area
+			} else if has_query {
+				Layout::default()
+					.direction(Direction::Vertical)
+					.constraints([
+						Constraint::Length(5),
+						Constraint::Percentage(100),
+					])
+					.split(area)[0]
 			} else {
 				Layout::default()
 					.direction(Direction::Vertical)
@@ -423,6 +438,7 @@ impl DrawableComponent for FuzzyFindPopup {
 			};
 
 			ui::clear_popup_area(f, area);
+			self.last_area.set(area);
 			f.render_widget(
 				Block::default()
 					.borders(Borders::all())
@@ -449,7 +465,27 @@ impl DrawableComponent for FuzzyFindPopup {
 			self.find_text.draw(f, chunks[0])?;
 
 			if any_hits {
+				self.list_area.set(chunks[1]);
 				self.draw_matches_list(f, chunks[1]);
+			} else {
+				self.list_area.set(Rect::default());
+				if has_query {
+					ui::draw_list_block(
+						f,
+						chunks[1],
+						Block::default()
+							.title(Span::styled(
+								"Hits: 0",
+								self.theme.title(false),
+							))
+							.borders(Borders::TOP)
+							.border_style(self.theme.block(false)),
+						std::iter::once(Line::from(Span::styled(
+							"  No matching items.",
+							self.theme.text(false, false),
+						))),
+					);
+				}
 			}
 		}
 		Ok(())
@@ -486,6 +522,51 @@ impl Component for FuzzyFindPopup {
 		event: &crossterm::event::Event,
 	) -> Result<EventState> {
 		if self.is_visible() {
+			if let Event::Mouse(mouse) = event {
+				let pos = Position::new(mouse.column, mouse.row);
+				match mouse.kind {
+					MouseEventKind::Down(MouseButton::Left) => {
+						if !self.last_area.get().contains(pos) {
+							self.hide();
+							return Ok(EventState::Consumed);
+						}
+						let list_area = self.list_area.get();
+						let rows_area = Rect::new(
+							list_area.x,
+							list_area.y.saturating_add(1),
+							list_area.width,
+							list_area.height.saturating_sub(1),
+						);
+						if rows_area.contains(pos) {
+							let list_height =
+								self.list_height.get().max(1);
+							let scroll_skip = self
+								.selection
+								.saturating_sub(
+									list_height.saturating_sub(1),
+								);
+							let target = scroll_skip
+								+ usize::from(mouse.row - rows_area.y);
+							if target < self.filtered.len() {
+								if self.selection == target {
+									self.hide();
+								} else {
+									self.selection = target;
+									self.refresh_selection();
+								}
+							}
+						}
+					}
+					MouseEventKind::ScrollUp => {
+						self.move_selection(ScrollType::Up);
+					}
+					MouseEventKind::ScrollDown => {
+						self.move_selection(ScrollType::Down);
+					}
+					_ => {}
+				}
+				return Ok(EventState::Consumed);
+			}
 			if let Event::Key(key) = event {
 				if key_match(key, self.key_config.keys.exit_popup)
 					|| key_match(key, self.key_config.keys.enter)
@@ -519,6 +600,12 @@ impl Component for FuzzyFindPopup {
 				} else if key_match(key, self.key_config.keys.page_up)
 				{
 					self.move_selection(ScrollType::PageUp);
+					return Ok(EventState::Consumed);
+				} else if key_match(key, self.key_config.keys.home) {
+					self.move_selection(ScrollType::Home);
+					return Ok(EventState::Consumed);
+				} else if key_match(key, self.key_config.keys.end) {
+					self.move_selection(ScrollType::End);
 					return Ok(EventState::Consumed);
 				}
 			}

@@ -3,18 +3,18 @@ use super::{
 	utils::scroll_vertical::VerticalScroll, CommandBlocking,
 	Direction, DrawableComponent, HorizontalScrollType, ScrollType,
 };
+use crate::string_utils::tabs_to_spaces;
 use crate::{
 	app::Environment,
 	components::{
 		async_delta::{AsyncDelta, DeltaParams, ProcessedDelta},
+		syntax_text::highlight_line_matches,
 		CommandInfo, Component, EventState,
 	},
 	keys::{key_match, GituiKeyEvent, SharedKeyConfig},
 	options::SharedOptions,
 	queue::{Action, InternalEvent, NeedsUpdate, Queue, ResetItem},
 	repo_operation::RepoOperation,
-	string_utils::tabs_to_spaces,
-	string_utils::trim_offset,
 	strings, try_or_popup,
 	ui::{self, style::SharedTheme},
 };
@@ -28,7 +28,7 @@ use bytesize::ByteSize;
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 use ratatui::{
 	layout::Rect,
-	style::Color,
+	style::{Color, Modifier, Style},
 	symbols,
 	text::{Line, Span},
 	widgets::{Block, BorderType, Borders},
@@ -161,6 +161,7 @@ pub struct DiffComponent {
 	delta_line_positions: RefCell<Arc<[Option<DiffLinePosition>]>>,
 	last_delta_width: Cell<u16>,
 	delta_display_lines: RefCell<Arc<[Line<'static>]>>,
+	delta_longest_line: Cell<usize>,
 	async_delta: AsyncDelta,
 	/// Cached aggregate additions/deletions for the current diff.
 	line_stats: (usize, usize),
@@ -202,6 +203,7 @@ impl DiffComponent {
 			delta_line_positions: RefCell::new(Arc::default()),
 			last_delta_width: Cell::new(0),
 			delta_display_lines: RefCell::new(Arc::default()),
+			delta_longest_line: Cell::new(0),
 			async_delta: AsyncDelta::new(&env.sender_git),
 			line_stats: (0, 0),
 			line_num_width: 1,
@@ -337,6 +339,7 @@ impl DiffComponent {
 		*self.delta_line_positions.borrow_mut() = Arc::default();
 		*self.delta_display_lines.borrow_mut() = Arc::default();
 		self.longest_line.set(0);
+		self.delta_longest_line.set(0);
 		self.line_stats = (0, 0);
 		self.line_num_width = 1;
 		self.hunk_offsets.clear();
@@ -573,6 +576,13 @@ impl DiffComponent {
 	}
 
 	fn max_scroll_right(&self) -> usize {
+		if self.is_delta_preview() {
+			let available_width = usize::from(self.current_size.get().0);
+			return self
+				.delta_longest_line
+				.get()
+				.saturating_sub(available_width);
+		}
 		let line_num_width: u16 =
 			self.get_line_num_width().try_into().unwrap_or(u16::MAX);
 		// In unified mode, we have two line number columns
@@ -594,41 +604,110 @@ impl DiffComponent {
 	}
 
 	fn copy_selection(&self) {
-		if let Some(diff) = &self.diff {
-			let lines_to_copy: Vec<&str> =
-				diff.hunks
-					.iter()
-					.flat_map(|hunk| hunk.lines.iter())
-					.enumerate()
-					.filter_map(|(i, line)| {
-						if self.selection.contains(i) {
-							Some(line.content.trim_matches(|c| {
-								c == '\n' || c == '\r'
-							}))
-						} else {
-							None
-						}
-					})
-					.collect();
+		let lines_to_copy: Vec<String> = if self.is_delta_preview() {
+			let display = self.delta_display_lines.borrow();
+			let positions = self.delta_line_positions.borrow();
+			let top = self.selection.get_top();
+			let bottom = self.selection.get_bottom();
 
-			let copied_count = lines_to_copy.len();
-			match crate::clipboard::copy_string(
-				&lines_to_copy.join("\n"),
-			) {
-				Ok(()) => {
-					self.queue.push(InternalEvent::ShowToast(
-						format!(
-							"Copied {copied_count} line{}",
-							if copied_count == 1 { "" } else { "s" }
-						),
-					));
+			let mut from_diff = Vec::new();
+			if let Some(diff) = &self.diff {
+				let ready = self.delta_selection_ready();
+				if ready && !positions.is_empty() && top <= bottom {
+					let end =
+						bottom.min(positions.len().saturating_sub(1));
+					if top <= end {
+						let mut seen_positions = Vec::new();
+						for pos in positions[top..=end].iter().flatten()
+						{
+							if seen_positions.last() != Some(pos) {
+								seen_positions.push(*pos);
+							}
+						}
+						if !seen_positions.is_empty() {
+							for hunk in &diff.hunks {
+								for line in &hunk.lines {
+									if seen_positions
+										.contains(&line.position)
+									{
+										from_diff.push(
+											line.content
+												.trim_matches(|c| {
+													c == '\n'
+														|| c == '\r'
+												})
+												.to_owned(),
+										);
+									}
+								}
+							}
+						}
+					}
 				}
-				Err(e) => {
-					log::error!("copy to clipboard error: {e}");
-					self.queue.push(InternalEvent::ShowErrorMsg(
-						format!("copy to clipboard error:\n{e}"),
-					));
+			}
+
+			if !from_diff.is_empty() {
+				from_diff
+			} else if !display.is_empty() && top <= bottom {
+				let end = bottom.min(display.len().saturating_sub(1));
+				if top <= end {
+					display[top..=end]
+						.iter()
+						.map(|line| {
+							line.spans
+								.iter()
+								.map(|s| s.content.as_ref())
+								.collect::<String>()
+								.trim_end()
+								.to_owned()
+						})
+						.collect()
+				} else {
+					Vec::new()
 				}
+			} else {
+				Vec::new()
+			}
+		} else if let Some(diff) = &self.diff {
+			diff.hunks
+				.iter()
+				.flat_map(|hunk| hunk.lines.iter())
+				.enumerate()
+				.filter_map(|(i, line)| {
+					if self.selection.contains(i) {
+						Some(
+							line.content
+								.trim_matches(|c| {
+									c == '\n' || c == '\r'
+								})
+								.to_owned(),
+						)
+					} else {
+						None
+					}
+				})
+				.collect()
+		} else {
+			Vec::new()
+		};
+
+		if lines_to_copy.is_empty() && self.diff.is_none() {
+			return;
+		}
+
+		let copied_count = lines_to_copy.len();
+		match crate::clipboard::copy_string(&lines_to_copy.join("\n")) {
+			Ok(()) => {
+				self.queue.push(InternalEvent::ShowToast(format!(
+					"Copied {copied_count} line{}",
+					if copied_count == 1 { "" } else { "s" }
+				)));
+			}
+			Err(e) => {
+				log::error!("copy to clipboard error: {e}");
+				self.queue.push(InternalEvent::ShowErrorMsg(
+					format!("copy to clipboard error:\n{e}"),
+				));
 			}
 		}
 	}
@@ -664,6 +743,15 @@ impl DiffComponent {
 		None
 	}
 
+	fn active_search_params(&self) -> (Option<String>, Option<usize>) {
+		let search_needle = (!self.search_query.is_empty())
+			.then(|| self.search_query.to_lowercase());
+		let active_match_row = (!self.search_matches.is_empty())
+			.then(|| self.search_matches.get(self.search_cursor).copied())
+			.flatten();
+		(search_needle, active_match_row)
+	}
+
 	fn get_text(&self, width: u16, height: u16) -> Vec<Line<'_>> {
 		if let Some(diff) = &self.diff {
 			return if diff.hunks.is_empty() {
@@ -676,6 +764,8 @@ impl DiffComponent {
 				let max = min + height as usize;
 
 				let line_num_width = self.get_line_num_width();
+				let (search_needle, active_match_row) =
+					self.active_search_params();
 				let first = self
 					.hunk_offsets
 					.partition_point(|offset| *offset <= min)
@@ -694,22 +784,31 @@ impl DiffComponent {
 						min.saturating_sub(hunk_min).min(hunk_len);
 					let end =
 						max.saturating_sub(hunk_min).min(hunk_len);
+					let word_diffs =
+						Self::compute_hunk_word_diffs(&hunk.lines, start, end);
 					for (local, line) in
 						hunk.lines[start..end].iter().enumerate()
 					{
 						let line_index = start + local;
+						let abs_line_idx = hunk_min + line_index;
+						let is_active_search =
+							active_match_row == Some(abs_line_idx);
 						res.push(Self::get_line_to_add(
 							width,
 							line,
 							self.focused()
-								&& self
-									.selection
-									.contains(hunk_min + line_index),
+								&& self.selection.contains(abs_line_idx),
 							hunk_selected,
 							line_index == hunk_len - 1,
 							&self.theme,
 							self.horizontal_scroll.get_right(),
 							line_num_width,
+							word_diffs
+								.get(local)
+								.map_or(&[][..], Vec::as_slice),
+							search_needle
+								.as_deref()
+								.map(|n| (n, is_active_search)),
 						));
 					}
 				}
@@ -753,7 +852,7 @@ impl DiffComponent {
 		])]
 	}
 
-	#[allow(clippy::too_many_arguments)]
+	#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 	fn get_line_to_add<'a>(
 		width: u16,
 		line: &'a DiffLine,
@@ -763,6 +862,8 @@ impl DiffComponent {
 		theme: &SharedTheme,
 		scrolled_right: usize,
 		line_num_width: usize,
+		word_diff: &[std::ops::Range<usize>],
+		search: Option<(&str, bool)>,
 	) -> Line<'a> {
 		let style = theme.diff_hunk_marker(selected_hunk);
 
@@ -801,11 +902,58 @@ impl DiffComponent {
 
 		let content =
 			if !is_content_line && line.content.as_ref().is_empty() {
-				theme.line_break()
+				format!("{}\n", theme.line_break())
 			} else {
 				tabs_to_spaces(line.content.as_ref().to_string())
 			};
-		let content = trim_offset(&content, scrolled_right);
+
+		let base_style = theme.diff_line(line.line_type, selected);
+		let word_style =
+			base_style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+
+		let mut content_spans: Vec<Span<'static>> = Vec::new();
+		if word_diff.is_empty() {
+			content_spans.push(Span::styled(content, base_style));
+		} else {
+			let mut cursor = 0_usize;
+			for range in word_diff {
+				let start = range.start.min(content.len());
+				let end = range.end.min(content.len());
+				if start > cursor && content.is_char_boundary(cursor)
+					&& content.is_char_boundary(start)
+				{
+					content_spans.push(Span::styled(
+						content[cursor..start].to_owned(),
+						base_style,
+					));
+				}
+				if end > start
+					&& content.is_char_boundary(start)
+					&& content.is_char_boundary(end)
+				{
+					content_spans.push(Span::styled(
+						content[start..end].to_owned(),
+						word_style,
+					));
+					cursor = end;
+				}
+			}
+			if cursor < content.len() && content.is_char_boundary(cursor) {
+				content_spans.push(Span::styled(
+					content[cursor..].to_owned(),
+					base_style,
+				));
+			}
+		}
+
+		if let Some((needle, is_active_search)) = search {
+			let mut tmp = Line::from(content_spans);
+			highlight_line_matches(&mut tmp, needle, is_active_search);
+			content_spans = tmp.spans;
+		}
+
+		let mut content_spans =
+			Self::trim_spans_horizontal(content_spans, scrolled_right);
 
 		// Adjust width to account for line numbers
 		let line_num_overhead: u16 = (line_num_width * 2 + 2) // Two line numbers + space separator
@@ -814,25 +962,246 @@ impl DiffComponent {
 		let content_width: usize =
 			width.saturating_sub(line_num_overhead).into();
 
-		let filled = if selected {
-			// selected line
-			format!("{content:content_width$}\n")
-		} else {
-			// weird eof missing eol line
-			format!("{content}\n")
-		};
+		if selected {
+			let used_w: usize = content_spans
+				.iter()
+				.map(|s| {
+					unicode_width::UnicodeWidthStr::width(
+						s.content.as_ref(),
+					)
+				})
+				.sum();
+			if used_w < content_width {
+				content_spans.push(Span::styled(
+					" ".repeat(content_width - used_w),
+					base_style,
+				));
+			}
+		}
 
-		Line::from(vec![
-			left_side_of_line,
-			Span::styled(
-				Cow::from(line_numbers),
-				theme.text(false, false),
-			),
-			Span::styled(
-				Cow::from(filled),
-				theme.diff_line(line.line_type, selected),
-			),
-		])
+		let mut spans = Vec::with_capacity(2 + content_spans.len());
+		spans.push(left_side_of_line);
+		spans.push(Span::styled(
+			Cow::from(line_numbers),
+			theme.text(false, false),
+		));
+		spans.extend(content_spans);
+		Line::from(spans)
+	}
+
+	fn compute_hunk_word_diffs(
+		lines: &[DiffLine],
+		vis_start: usize,
+		vis_end: usize,
+	) -> Vec<Vec<std::ops::Range<usize>>> {
+		let vis_len = vis_end.saturating_sub(vis_start);
+		let mut out = vec![Vec::new(); vis_len];
+		let mut i = 0;
+		while i < lines.len() {
+			if lines[i].line_type != DiffLineType::Delete {
+				i += 1;
+				continue;
+			}
+			let del_start = i;
+			while i < lines.len()
+				&& lines[i].line_type == DiffLineType::Delete
+			{
+				i += 1;
+			}
+			let del_end = i;
+			let add_start = i;
+			while i < lines.len() && lines[i].line_type == DiffLineType::Add
+			{
+				i += 1;
+			}
+			let add_end = i;
+			let del_count = del_end - del_start;
+			let add_count = add_end - add_start;
+			if del_count > 0 && del_count == add_count {
+				for offset in 0..del_count {
+					let d_idx = del_start + offset;
+					let a_idx = add_start + offset;
+					let d_vis =
+						d_idx >= vis_start && d_idx < vis_end;
+					let a_vis =
+						a_idx >= vis_start && a_idx < vis_end;
+					if !d_vis && !a_vis {
+						continue;
+					}
+					let old_s = tabs_to_spaces(
+						lines[d_idx].content.as_ref().to_owned(),
+					);
+					let new_s = tabs_to_spaces(
+						lines[a_idx].content.as_ref().to_owned(),
+					);
+					let (old_ranges, new_ranges) =
+						Self::word_diff_ranges(&old_s, &new_s);
+					if d_vis {
+						out[d_idx - vis_start] = old_ranges;
+					}
+					if a_vis {
+						out[a_idx - vis_start] = new_ranges;
+					}
+				}
+			}
+		}
+		out
+	}
+
+	fn tokenize_for_word_diff(s: &str) -> Vec<std::ops::Range<usize>> {
+		let mut tokens = Vec::new();
+		let mut start = None;
+		for (idx, ch) in s.char_indices() {
+			let is_word = ch.is_alphanumeric() || ch == '_';
+			if is_word {
+				if start.is_none() {
+					start = Some(idx);
+				}
+			} else {
+				if let Some(st) = start.take() {
+					tokens.push(st..idx);
+				}
+				tokens.push(idx..idx + ch.len_utf8());
+			}
+		}
+		if let Some(st) = start {
+			tokens.push(st..s.len());
+		}
+		tokens
+	}
+
+	fn word_diff_ranges(
+		old_s: &str,
+		new_s: &str,
+	) -> (
+		Vec<std::ops::Range<usize>>,
+		Vec<std::ops::Range<usize>>,
+	) {
+		let old_tokens = Self::tokenize_for_word_diff(old_s);
+		let new_tokens = Self::tokenize_for_word_diff(new_s);
+		let n = old_tokens.len();
+		let m = new_tokens.len();
+		if n == 0 || m == 0 || n.saturating_mul(m) > 4096 {
+			// Fallback to common prefix/suffix at char boundaries.
+			let prefix = old_s
+				.char_indices()
+				.zip(new_s.char_indices())
+				.take_while(|((_, a), (_, b))| a == b)
+				.map(|((idx, ch), _)| idx + ch.len_utf8())
+				.last()
+				.unwrap_or(0);
+			let suffix = old_s[prefix..]
+				.chars()
+				.rev()
+				.zip(new_s[prefix..].chars().rev())
+				.take_while(|(a, b)| a == b)
+				.map(|(ch, _)| ch.len_utf8())
+				.sum::<usize>();
+			let old_end = old_s.len().saturating_sub(suffix);
+			let new_end = new_s.len().saturating_sub(suffix);
+			let mut r_old = Vec::new();
+			if old_end > prefix {
+				r_old.push(prefix..old_end);
+			}
+			let mut r_new = Vec::new();
+			if new_end > prefix {
+				r_new.push(prefix..new_end);
+			}
+			return (r_old, r_new);
+		}
+
+		let mut dp = vec![0_u16; (n + 1) * (m + 1)];
+		let stride = m + 1;
+		for i in (0..n).rev() {
+			for j in (0..m).rev() {
+				dp[i * stride + j] =
+					if old_s[old_tokens[i].clone()]
+						== new_s[new_tokens[j].clone()]
+					{
+						dp[(i + 1) * stride + (j + 1)] + 1
+					} else {
+						dp[(i + 1) * stride + j]
+							.max(dp[i * stride + (j + 1)])
+					};
+			}
+		}
+
+		let mut old_changed: Vec<std::ops::Range<usize>> = Vec::new();
+		let mut new_changed: Vec<std::ops::Range<usize>> = Vec::new();
+		let (mut i, mut j) = (0_usize, 0_usize);
+		let push_merged =
+			|list: &mut Vec<std::ops::Range<usize>>,
+			 range: std::ops::Range<usize>| {
+				if let Some(last) = list.last_mut() {
+					if last.end == range.start {
+						last.end = range.end;
+						return;
+					}
+				}
+				list.push(range);
+			};
+		while i < n && j < m {
+			if old_s[old_tokens[i].clone()]
+				== new_s[new_tokens[j].clone()]
+			{
+				i += 1;
+				j += 1;
+			} else if dp[(i + 1) * stride + j]
+				>= dp[i * stride + (j + 1)]
+			{
+				push_merged(&mut old_changed, old_tokens[i].clone());
+				i += 1;
+			} else {
+				push_merged(&mut new_changed, new_tokens[j].clone());
+				j += 1;
+			}
+		}
+		while i < n {
+			push_merged(&mut old_changed, old_tokens[i].clone());
+			i += 1;
+		}
+		while j < m {
+			push_merged(&mut new_changed, new_tokens[j].clone());
+			j += 1;
+		}
+		(old_changed, new_changed)
+	}
+
+	fn trim_spans_horizontal(
+		spans: Vec<Span<'static>>,
+		mut offset: usize,
+	) -> Vec<Span<'static>> {
+		if offset == 0 {
+			return spans;
+		}
+		let mut out = Vec::with_capacity(spans.len());
+		for span in spans {
+			if offset == 0 {
+				out.push(span);
+				continue;
+			}
+			let text = span.content.as_ref();
+			let mut byte_skip = 0_usize;
+			for g in unicode_segmentation::UnicodeSegmentation::graphemes(
+				text, true,
+			) {
+				let w = unicode_width::UnicodeWidthStr::width(g);
+				if w <= offset {
+					offset -= w;
+					byte_skip += g.len();
+				} else {
+					offset = 0;
+					break;
+				}
+			}
+			if byte_skip < text.len() {
+				out.push(Span::styled(
+					text[byte_skip..].to_owned(),
+					span.style,
+				));
+			}
+		}
+		out
 	}
 
 	fn unstage_hunk(&self) -> Result<()> {
@@ -1218,6 +1587,21 @@ impl DiffComponent {
 			display_positions,
 			line_level_bgs,
 		} = result;
+		let max_w = display_lines
+			.iter()
+			.map(|line| {
+				line.spans
+					.iter()
+					.map(|s| {
+						unicode_width::UnicodeWidthStr::width(
+							s.content.as_ref(),
+						)
+					})
+					.sum::<usize>()
+			})
+			.max()
+			.unwrap_or(0);
+		self.delta_longest_line.set(max_w);
 		*self.delta_line_level_bgs.borrow_mut() = line_level_bgs;
 		*self.delta_line_hunks.borrow_mut() = display_hunks;
 		*self.delta_line_positions.borrow_mut() = display_positions;
@@ -1351,10 +1735,11 @@ impl DiffComponent {
 		height: u16,
 	) {
 		let display = self.delta_display_lines.borrow();
-		let panel_width = usize::from(self.current_size.get().0);
 		let scroll = self.vertical_scroll.get_top();
-		let cursor = self.selection.get_end().saturating_sub(scroll);
-		let sel_style = self.theme.text(true, true);
+		let scrolled_right = self.horizontal_scroll.get_right();
+		let sel_bg = self.theme.selection_bg();
+		let (search_needle, active_match_row) =
+			self.active_search_params();
 
 		let block = Block::default()
 			.title(Span::styled(
@@ -1367,6 +1752,7 @@ impl DiffComponent {
 		let inner = block.inner(r);
 		f.render_widget(block, r);
 
+		let panel_width = usize::from(inner.width);
 		let buf = f.buffer_mut();
 		if display.is_empty() {
 			let empty_line = Line::from(vec![Span::styled(
@@ -1388,34 +1774,55 @@ impl DiffComponent {
 				if y >= inner.bottom() {
 					break;
 				}
-				if i == cursor {
-					let mut cursor_line = line.clone();
-					for span in &mut cursor_line.spans {
-						span.style = sel_style;
+				let abs_idx = scroll.saturating_add(i);
+				let selected =
+					self.focused() && self.selection.contains(abs_idx);
+				let has_search = search_needle.is_some();
+				if selected || scrolled_right > 0 || has_search {
+					let mut work_line = line.clone();
+					if let Some(needle) = &search_needle {
+						let is_active =
+							active_match_row == Some(abs_idx);
+						highlight_line_matches(
+							&mut work_line,
+							needle,
+							is_active,
+						);
 					}
-					let content_width: usize = cursor_line
-						.spans
-						.iter()
-						.map(|s| {
-							unicode_width::UnicodeWidthStr::width(
-								s.content.as_ref(),
-							)
-						})
-						.sum();
-					if content_width < panel_width {
-						cursor_line.spans.push(Span::styled(
-							Cow::Owned(
-								" ".repeat(
-									panel_width - content_width,
+					if scrolled_right > 0 {
+						work_line.spans = Self::trim_spans_horizontal(
+							work_line.spans,
+							scrolled_right,
+						);
+					}
+					if selected {
+						for span in &mut work_line.spans {
+							span.style = span.style.bg(sel_bg);
+						}
+						let content_width: usize = work_line
+							.spans
+							.iter()
+							.map(|s| {
+								unicode_width::UnicodeWidthStr::width(
+									s.content.as_ref(),
+								)
+							})
+							.sum();
+						if content_width < panel_width {
+							work_line.spans.push(Span::styled(
+								Cow::Owned(
+									" ".repeat(
+										panel_width - content_width,
+									),
 								),
-							),
-							sel_style,
-						));
+								Style::default().bg(sel_bg),
+							));
+						}
 					}
 					buf.set_line(
 						inner.left(),
 						y,
-						&cursor_line,
+						&work_line,
 						inner.width,
 					);
 				} else {
@@ -1426,6 +1833,9 @@ impl DiffComponent {
 
 		if self.focused() {
 			self.vertical_scroll.draw(f, r, &self.theme);
+			if self.max_scroll_right() > 0 {
+				self.horizontal_scroll.draw(f, r, &self.theme);
+			}
 		}
 	}
 
@@ -1460,8 +1870,13 @@ impl DrawableComponent for DiffComponent {
 			usize::from(current_height),
 		);
 
-		// Calculate content width for horizontal scroll (unified mode only)
-		if !self.is_delta_preview() {
+		// Calculate content width for horizontal scroll
+		if self.is_delta_preview() {
+			self.horizontal_scroll.update_no_selection(
+				self.delta_longest_line.get(),
+				usize::from(current_width),
+			);
+		} else {
 			let line_num_width: u16 = self
 				.get_line_num_width()
 				.try_into()
@@ -1546,7 +1961,10 @@ impl DrawableComponent for DiffComponent {
 			&& self.is_delta_pending()
 			&& self.delta_display_lines.borrow().is_empty();
 
-		if self.is_delta_preview() && !self.pending && !delta_pending
+		if self.is_delta_preview()
+			&& !self.pending
+			&& !delta_pending
+			&& !self.current.path.is_empty()
 		{
 			self.draw_delta(f, r, &title, current_height);
 		} else {
@@ -1555,6 +1973,13 @@ impl DrawableComponent for DiffComponent {
 					Cow::from(strings::loading_text(
 						&self.key_config,
 					)),
+					self.theme.text(false, false),
+				)])]
+			} else if self.diff.is_none()
+				&& self.current.path.is_empty()
+			{
+				vec![Line::from(vec![Span::styled(
+					Cow::from("Select a file to view diff."),
 					self.theme.text(false, false),
 				)])]
 			} else {
@@ -1739,37 +2164,31 @@ impl Component for DiffComponent {
 				{
 					self.move_selection(ScrollType::PageDown);
 					Ok(EventState::Consumed)
-				} else if !self.is_delta_preview()
-					&& key_match(e, self.key_config.keys.move_right)
-				{
+				} else if key_match(e, self.key_config.keys.move_right) {
 					self.horizontal_scroll
 						.move_right(HorizontalScrollType::Right);
 					Ok(EventState::Consumed)
-				} else if !self.is_delta_preview()
-					&& key_match(e, self.key_config.keys.move_left)
-				{
+				} else if key_match(e, self.key_config.keys.move_left) {
 					self.horizontal_scroll
 						.move_right(HorizontalScrollType::Left);
 					Ok(EventState::Consumed)
-				} else if !self.is_delta_preview()
-					&& (key_match(
-						e,
-						self.key_config.keys.diff_line_start,
-					) || key_match(
-						e,
-						GituiKeyEvent::new(
-							KeyCode::Char('_'),
-							KeyModifiers::empty(),
-						),
-					)) {
+				} else if key_match(
+					e,
+					self.key_config.keys.diff_line_start,
+				) || key_match(
+					e,
+					GituiKeyEvent::new(
+						KeyCode::Char('_'),
+						KeyModifiers::empty(),
+					),
+				) {
 					self.horizontal_scroll
 						.move_right(HorizontalScrollType::Home);
 					Ok(EventState::Consumed)
-				} else if !self.is_delta_preview()
-					&& key_match(
-						e,
-						self.key_config.keys.diff_line_end,
-					) {
+				} else if key_match(
+					e,
+					self.key_config.keys.diff_line_end,
+				) {
 					self.horizontal_scroll
 						.move_right(HorizontalScrollType::End);
 					Ok(EventState::Consumed)
@@ -2220,7 +2639,9 @@ mod tests {
 					false,
 					&default_theme,
 					0,
-					1
+					1,
+					&[],
+					None,
 				)
 				.spans
 				.last()
@@ -2251,7 +2672,16 @@ mod tests {
 
 			assert_eq!(
 				DiffComponent::get_line_to_add(
-					4, &diff_line, false, false, false, &theme, 0, 1
+					4,
+					&diff_line,
+					false,
+					false,
+					false,
+					&theme,
+					0,
+					1,
+					&[],
+					None,
 				)
 				.spans
 				.last()
@@ -3115,5 +3545,101 @@ mod tests {
 		diff.diff_mode = DiffMode::Unified;
 		diff.current_size.set((78, 20));
 		assert!(!diff.is_auto_unified());
+	}
+
+	#[test]
+	fn test_word_diff_ranges_highlights_changed_tokens() {
+		let (del_ranges, add_ranges) = DiffComponent::word_diff_ranges(
+			"let value = foo_old + 1;",
+			"let value = bar_new + 1;",
+		);
+		assert_eq!(del_ranges.len(), 1);
+		assert_eq!(add_ranges.len(), 1);
+		assert_eq!(&"let value = foo_old + 1;"[del_ranges[0].clone()], "foo_old");
+		assert_eq!(&"let value = bar_new + 1;"[add_ranges[0].clone()], "bar_new");
+	}
+
+	#[test]
+	fn test_trim_spans_horizontal_offsets_utf8() {
+		let trimmed = DiffComponent::trim_spans_horizontal(
+			vec![
+				ratatui::text::Span::raw("abc"),
+				ratatui::text::Span::raw("defghi"),
+			],
+			4,
+		);
+		let combined: String =
+			trimmed.iter().map(|s| s.content.as_ref()).collect();
+		assert_eq!(combined, "efghi");
+	}
+
+	#[test]
+	fn test_unified_diff_search_highlight_marks_active_match() {
+		let theme = Rc::new(Theme::default());
+		let diff_line = DiffLine {
+			content: "hello needle world".into(),
+			line_type: DiffLineType::None,
+			position: Default::default(),
+		};
+		let line = DiffComponent::get_line_to_add(
+			40,
+			&diff_line,
+			false,
+			false,
+			false,
+			&theme,
+			0,
+			1,
+			&[],
+			Some(("needle", true)),
+		);
+		let needle_span = line
+			.spans
+			.iter()
+			.find(|s| s.content.as_ref() == "needle")
+			.expect("needle span should be split out");
+		assert!(needle_span.style.add_modifier.contains(Modifier::REVERSED));
+		assert!(needle_span.style.add_modifier.contains(Modifier::BOLD));
+	}
+
+	#[test]
+	fn test_unified_diff_search_highlight_survives_horizontal_scroll() {
+		let theme = Rc::new(Theme::default());
+		let diff_line = DiffLine {
+			content: "hello needle world".into(),
+			line_type: DiffLineType::None,
+			position: Default::default(),
+		};
+		// Scroll past "hello nee" (9 cols), leaving "dle world"
+		let line = DiffComponent::get_line_to_add(
+			40,
+			&diff_line,
+			false,
+			false,
+			false,
+			&theme,
+			9,
+			1,
+			&[],
+			Some(("needle", false)),
+		);
+		let dle_span = line
+			.spans
+			.iter()
+			.find(|s| s.content.as_ref() == "dle")
+			.expect("remaining portion of match should stay highlighted");
+		assert!(dle_span.style.add_modifier.contains(Modifier::REVERSED));
+	}
+
+	#[test]
+	fn test_delta_copy_selection_out_of_bounds_does_not_panic() {
+		let env = Environment::test_env();
+		let mut diff = DiffComponent::new(&env, false);
+		diff.diff_mode = DiffMode::DeltaSideBySide;
+		diff.current.path = "test.rs".into();
+		*diff.delta_display_lines.borrow_mut() =
+			vec![Line::from("only one line")].into();
+		diff.selection = Selection::Multiple(5, 10);
+		diff.copy_selection();
 	}
 }

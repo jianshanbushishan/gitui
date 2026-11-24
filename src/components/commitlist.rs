@@ -29,6 +29,7 @@ use std::{
 	borrow::Cow, cell::Cell, cmp, collections::BTreeMap, rc::Rc,
 	time::Instant,
 };
+use unicode_width::UnicodeWidthStr;
 
 const ELEMENTS_PER_LINE: usize = 9;
 const SLICE_SIZE: usize = 1200;
@@ -63,6 +64,7 @@ pub struct CommitList {
 	theme: SharedTheme,
 	queue: Queue,
 	key_config: SharedKeyConfig,
+	empty_hint: String,
 }
 
 impl CommitList {
@@ -91,7 +93,12 @@ impl CommitList {
 			queue: env.queue.clone(),
 			key_config: env.key_config.clone(),
 			title: title.into(),
+			empty_hint: "No commits".to_owned(),
 		}
+	}
+
+	pub fn set_empty_hint(&mut self, hint: impl Into<String>) {
+		self.empty_hint = hint.into();
 	}
 
 	///
@@ -588,7 +595,7 @@ impl CommitList {
 		}
 	}
 
-	#[allow(clippy::too_many_arguments)]
+	#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 	fn get_entry_to_add<'a>(
 		&self,
 		e: &'a LogEntry,
@@ -680,32 +687,73 @@ impl CommitList {
 
 		txt.push(splitter.clone());
 
-		// commit tags
-		if let Some(tags) = tags {
-			txt.push(splitter.clone());
-			txt.push(Span::styled(tags, style_tags));
-		}
+		// commit tags / branches (budgeted so commit message stays visible)
+		let refs_budget = width / 2;
+		let mut refs_used = 0_usize;
+		let mut push_ref_pill =
+			|pill: String, style: ratatui::style::Style| {
+				if refs_used >= refs_budget {
+					return;
+				}
+				let avail =
+					refs_budget.saturating_sub(refs_used).saturating_sub(1);
+				let w = pill.width();
+				let display = if w <= avail {
+					pill
+				} else if avail >= 4 {
+					let mut out = String::new();
+					let mut used = 0;
+					for ch in pill.chars() {
+						let cw = unicode_width::UnicodeWidthChar::width(ch)
+							.unwrap_or(0);
+						if used + cw + 1 > avail {
+							break;
+						}
+						out.push(ch);
+						used += cw;
+					}
+					out.push('…');
+					out
+				} else {
+					return;
+				};
+				refs_used += display.width() + 1;
+				txt.push(splitter.clone());
+				txt.push(Span::styled(display, style));
+			};
 
+		if let Some(tags) = tags {
+			push_ref_pill(tags, style_tags);
+		}
 		if let Some(local_branches) = local_branches {
-			txt.push(splitter.clone());
-			txt.push(Span::styled(local_branches, style_branches));
+			push_ref_pill(local_branches, style_branches);
 		}
 		if let Some(remote_branches) = remote_branches {
-			txt.push(splitter.clone());
-			txt.push(Span::styled(remote_branches, style_branches));
+			push_ref_pill(remote_branches, style_branches);
 		}
 
 		txt.push(splitter);
 
 		// commit msg: only pad full row width when selected (to paint selection bg)
 		if selected {
-			let message_width = width.saturating_sub(
-				txt.iter().map(|span| span.content.len()).sum(),
-			);
+			let prefix_width: usize = txt
+				.iter()
+				.map(|span| span.content.as_ref().width())
+				.sum();
+			let msg_w = e.msg.width();
+			let pad = width
+				.saturating_sub(prefix_width)
+				.saturating_sub(msg_w);
 			txt.push(Span::styled(
-				format!("{:message_width$}", e.msg),
+				Cow::Borrowed(&*e.msg),
 				style_msg,
 			));
+			if pad > 0 {
+				txt.push(Span::styled(
+					" ".repeat(pad),
+					style_msg,
+				));
+			}
 		} else {
 			txt.push(Span::styled(
 				Cow::Borrowed(&*e.msg),
@@ -950,24 +998,33 @@ impl DrawableComponent for CommitList {
 			self.commits.len(),
 		);
 
+		let lines = if self.commits.is_empty() {
+			let hint = if self.filter.is_some() {
+				"No matching commits"
+			} else {
+				self.empty_hint.as_str()
+			};
+			vec![Line::from(Span::styled(
+				hint,
+				self.theme.text(false, false),
+			))]
+		} else {
+			self.get_text(height_in_lines, current_size.0 as usize)
+		};
+
 		f.render_widget(
-			Paragraph::new(
-				self.get_text(
-					height_in_lines,
-					current_size.0 as usize,
-				),
-			)
-			.block(
-				Block::default()
-					.borders(Borders::ALL)
-					.border_type(BorderType::Rounded)
-					.title(Span::styled(
-						title.as_str(),
-						self.theme.title(true),
-					))
-					.border_style(self.theme.block(true)),
-			)
-			.alignment(Alignment::Left),
+			Paragraph::new(lines)
+				.block(
+					Block::default()
+						.borders(Borders::ALL)
+						.border_type(BorderType::Rounded)
+						.title(Span::styled(
+							title.as_str(),
+							self.theme.title(true),
+						))
+						.border_style(self.theme.block(true)),
+				)
+				.alignment(Alignment::Left),
 			area,
 		);
 
@@ -1093,6 +1150,7 @@ mod tests {
 					std::path::PathBuf::default(),
 				)),
 				queue: Queue::default(),
+				empty_hint: "No commits".to_owned(),
 			}
 		}
 	}

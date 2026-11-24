@@ -11,7 +11,7 @@ use crate::{
 	queue::{Action, InternalEvent, Queue, StackablePopupOpen},
 	strings::{self, order},
 	try_or_popup,
-	ui::style::{SharedTheme, Theme},
+	ui::style::SharedTheme,
 };
 use anyhow::Result;
 use asyncgit::{
@@ -25,7 +25,9 @@ use asyncgit::{
 	ProgressPercent,
 };
 use crossbeam_channel::Sender;
-use crossterm::event::{Event, MouseButton, MouseEventKind};
+use crossterm::event::{
+	Event, KeyCode, MouseButton, MouseEventKind,
+};
 use indexmap::IndexSet;
 use ratatui::{
 	layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
@@ -62,6 +64,7 @@ enum LogSearch {
 }
 
 ///
+#[allow(clippy::struct_excessive_bools)]
 pub struct Revlog {
 	repo: RepoPathRef,
 	commit_details: CommitDetailsComponent,
@@ -82,6 +85,8 @@ pub struct Revlog {
 	list_area: Cell<Rect>,
 	details_area: Cell<Rect>,
 	dragging_split: bool,
+	hover_split: bool,
+	details_zoomed: bool,
 }
 
 impl Revlog {
@@ -121,6 +126,8 @@ impl Revlog {
 			list_area: Cell::new(Rect::default()),
 			details_area: Cell::new(Rect::default()),
 			dragging_split: false,
+			hover_split: false,
+			details_zoomed: false,
 		}
 	}
 
@@ -488,7 +495,7 @@ impl Revlog {
 						))
 						.borders(Borders::ALL)
 						.border_type(BorderType::Rounded)
-						.border_style(Theme::attention_block()),
+						.border_style(self.theme.warning()),
 				)
 				.alignment(Alignment::Left),
 			area,
@@ -559,10 +566,29 @@ impl DrawableComponent for Revlog {
 			.split(area[0]);
 
 		if self.commit_details.is_visible() {
-			self.list_area.set(chunks[0]);
-			self.details_area.set(chunks[1]);
-			self.list.draw(f, chunks[0])?;
-			self.commit_details.draw(f, chunks[1])?;
+			if self.details_zoomed {
+				self.list_area.set(Rect::default());
+				self.details_area.set(area[0]);
+				self.commit_details.draw(f, area[0])?;
+			} else {
+				self.list_area.set(chunks[0]);
+				self.details_area.set(chunks[1]);
+				self.list.draw(f, chunks[0])?;
+				self.commit_details.draw(f, chunks[1])?;
+				if self.options.borrow().mouse_support()
+					|| self.dragging_split
+					|| self.hover_split
+				{
+					crate::ui::draw_split_handle(
+						f.buffer_mut(),
+						chunks[1].x,
+						area[0].y,
+						area[0].height,
+						self.dragging_split || self.hover_split,
+						&self.theme,
+					);
+				}
+			}
 			self.commit_details.files().draw_popup(f)?;
 		} else {
 			self.list_area.set(area[0]);
@@ -591,7 +617,8 @@ impl Component for Revlog {
 				let details_area = self.details_area.get();
 				match mouse.kind {
 					MouseEventKind::Down(MouseButton::Left) => {
-						if self.commit_details.is_visible()
+						if !self.details_zoomed
+							&& self.commit_details.is_visible()
 							&& total.contains(pos)
 							&& total.width >= 20
 							&& mouse.column.abs_diff(details_area.x) <= 1
@@ -628,6 +655,14 @@ impl Component for Revlog {
 							.borrow_mut()
 							.set_log_left_ratio_preview(ratio);
 						return Ok(EventState::Consumed);
+					}
+					MouseEventKind::Moved => {
+						let hovering = self.commit_details.is_visible()
+							&& !self.details_zoomed
+							&& total.contains(pos)
+							&& total.width >= 20
+							&& mouse.column.abs_diff(details_area.x) <= 1;
+						self.hover_split = hovering;
 					}
 					MouseEventKind::Up(MouseButton::Left)
 						if self.dragging_split =>
@@ -702,10 +737,22 @@ impl Component for Revlog {
 				{
 					return Ok(EventState::Consumed);
 				}
+				if k.modifiers.is_empty()
+					&& k.code == KeyCode::Char('z')
+					&& self.commit_details.is_visible()
+				{
+					self.details_zoomed = !self.details_zoomed;
+					if self.details_zoomed {
+						self.commit_details.focus_details();
+					}
+					return Ok(EventState::Consumed);
+				}
 				if key_match(k, self.key_config.keys.enter) {
 					self.commit_details.toggle_visible()?;
 					if self.commit_details.is_visible() {
 						self.commit_details.focus_details();
+					} else {
+						self.details_zoomed = false;
 					}
 					self.update()?;
 					return Ok(EventState::Consumed);

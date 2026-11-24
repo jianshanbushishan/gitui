@@ -27,7 +27,7 @@ use crossterm::event::Event;
 use ratatui::{
 	layout::{Alignment, Constraint, Layout, Rect},
 	text::Span,
-	widgets::{Block, BorderType, Borders, Clear, Gauge, Paragraph},
+	widgets::{Block, BorderType, Borders, Gauge, Paragraph},
 	Frame,
 };
 use std::time::Instant;
@@ -378,7 +378,7 @@ impl DrawableComponent for PushPopup {
 				.border_style(self.theme.block(true));
 
 			let inner = block.inner(area);
-			f.render_widget(Clear, area);
+			ui::clear_popup_area(f, area);
 			f.render_widget(block, area);
 
 			let rows = Layout::default()

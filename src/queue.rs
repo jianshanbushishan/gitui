@@ -9,7 +9,8 @@ use crate::{
 };
 use asyncgit::{
 	sync::{
-		diff::DiffLinePosition, CommitId, LogFilterSearchOptions,
+		diff::DiffLinePosition, BranchType, CommitId,
+		LogFilterSearchOptions,
 	},
 	PushType,
 };
@@ -51,6 +52,8 @@ pub enum Action {
 	StashApply(CommitId),
 	DeleteLocalBranch(String),
 	DeleteRemoteBranch(String),
+	MergeBranch(String, BranchType),
+	RebaseBranch(String, BranchType),
 	DeleteTag(String),
 	DeleteRemoteTag(String, String),
 	DeleteRemote(String),

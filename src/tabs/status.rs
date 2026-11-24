@@ -10,7 +10,6 @@ use crate::{
 	options::SharedOptions,
 	queue::{Action, InternalEvent, NeedsUpdate, Queue},
 	strings, try_or_popup,
-	ui::style::Theme,
 	AsyncAppNotification, AsyncNotification,
 };
 use anyhow::Result;
@@ -156,6 +155,7 @@ pub struct Status {
 	total_area: Cell<Rect>,
 	diff_zoomed: bool,
 	dragging_split: bool,
+	hover_split: bool,
 }
 
 impl DrawableComponent for Status {
@@ -256,6 +256,11 @@ impl DrawableComponent for Status {
 			}
 		}
 		self.draw_branch_state(f, &left_chunks);
+		self.draw_split_handle_if_needed(
+			f,
+			rects[0],
+			chunks[1].x,
+		);
 
 		if repo_unclean {
 			self.draw_repo_state(f, rects[1]);
@@ -268,6 +273,29 @@ impl DrawableComponent for Status {
 }
 
 impl Status {
+	fn draw_split_handle_if_needed(
+		&self,
+		f: &mut ratatui::Frame,
+		area: Rect,
+		split_x: u16,
+	) {
+		let show_handle =
+			!(self.focus == Focus::Diff && self.diff_zoomed)
+				&& (self.options.borrow().mouse_support()
+					|| self.dragging_split
+					|| self.hover_split);
+		if show_handle {
+			crate::ui::draw_split_handle(
+				f.buffer_mut(),
+				split_x,
+				area.y,
+				area.height,
+				self.dragging_split || self.hover_split,
+				&self.theme,
+			);
+		}
+	}
+
 	fn components(&self) -> Vec<&dyn Component> {
 		let mut components: Vec<&dyn Component> =
 			vec![&self.index, &self.index_wd];
@@ -387,6 +415,7 @@ impl Status {
 			total_area: Cell::new(Rect::default()),
 			diff_zoomed: false,
 			dragging_split: false,
+			hover_split: false,
 		}
 	}
 
@@ -426,6 +455,11 @@ impl Status {
 
 	pub const fn repo_state(&self) -> &RepoState {
 		&self.git_state
+	}
+
+	/// Returns `(staged_count, unstaged_count)` for the global header.
+	pub const fn dirty_counts(&self) -> (usize, usize) {
+		(self.index.file_count(), self.index_wd.file_count())
 	}
 
 	/// Refresh lightweight global repository context (branch name,
@@ -691,10 +725,10 @@ impl Status {
 					Block::default()
 						.border_type(BorderType::Rounded)
 						.borders(Borders::all())
-						.border_style(Theme::attention_block())
+						.border_style(self.theme.warning())
 						.title(Span::styled(
 							format!("Pending {:?}", self.git_state),
-							Theme::attention_block(),
+							self.theme.warning(),
 						)),
 				)
 				.alignment(Alignment::Left);
@@ -2360,6 +2394,15 @@ impl Component for Status {
 							.borrow_mut()
 							.set_status_left_ratio_preview(ratio);
 						return Ok(EventState::Consumed);
+					}
+					MouseEventKind::Moved => {
+						let hovering = split_visible
+							&& total.contains(pos)
+							&& total.width >= 20
+							&& mouse.column.abs_diff(right_area.x) <= 1;
+						if hovering != self.hover_split {
+							self.hover_split = hovering;
+						}
 					}
 					MouseEventKind::Up(MouseButton::Left)
 						if self.dragging_split =>

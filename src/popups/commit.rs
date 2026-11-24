@@ -24,10 +24,11 @@ use asyncgit::{
 };
 use crossbeam_channel::Sender;
 use crossterm::event::{Event, KeyCode, KeyModifiers};
-use easy_cast::Cast;
 use ratatui::{
 	layout::{Alignment, Rect},
-	widgets::Paragraph,
+	style::Modifier,
+	text::{Line, Span},
+	widgets::{Block, BorderType, Borders, Paragraph},
 	Frame,
 };
 
@@ -102,9 +103,25 @@ pub struct CommitPopup {
 	commit_pending: bool,
 	commit_result: Arc<Mutex<Option<CommitJobOutcome>>>,
 	has_head: bool,
+	conventional_picker_open: bool,
+	conventional_selection: usize,
 }
 
 const FIRST_LINE_LIMIT: usize = 50;
+const BODY_LINE_LIMIT: usize = 72;
+const CONVENTIONAL_TYPES: &[(&str, &str)] = &[
+	("feat", "A new feature"),
+	("fix", "A bug fix"),
+	("docs", "Documentation only changes"),
+	("style", "Formatting / whitespace change"),
+	("refactor", "Code change (neither fix nor feat)"),
+	("perf", "Performance improvement"),
+	("test", "Adding or updating tests"),
+	("build", "Build system or dependency changes"),
+	("ci", "CI configuration and scripts"),
+	("chore", "Other maintenance tasks"),
+	("revert", "Reverts a previous commit"),
+];
 const AI_COMMIT_HISTORY_LENGTH: usize = 5;
 const AI_OVERWRITE_WINDOW: Duration = Duration::from_secs(5);
 const AI_SPINNER_FRAMES: &[char] =
@@ -113,16 +130,18 @@ const AI_SPINNER_FRAMES: &[char] =
 impl CommitPopup {
 	///
 	pub fn new(env: &Environment) -> Self {
+		let mut input = TextInputComponent::new(
+			env,
+			"",
+			&strings::commit_msg(&env.key_config),
+			true,
+		);
+		input.set_show_char_count(false);
 		Self {
 			queue: env.queue.clone(),
 			mode: Mode::Normal,
 			merge_ids: Vec::new(),
-			input: TextInputComponent::new(
-				env,
-				"",
-				&strings::commit_msg(&env.key_config),
-				true,
-			),
+			input,
 			key_config: env.key_config.clone(),
 			git_branch_name: cached::BranchName::new(
 				env.repo.clone(),
@@ -146,6 +165,8 @@ impl CommitPopup {
 			commit_pending: false,
 			commit_result: Arc::new(Mutex::new(None)),
 			has_head: false,
+			conventional_picker_open: false,
+			conventional_selection: 0,
 		}
 	}
 
@@ -209,10 +230,14 @@ impl CommitPopup {
 	}
 
 	fn generate_commit_message(&mut self) -> Result<()> {
-		if !matches!(self.mode, Mode::Normal)
-			|| self.ai_pending
-			|| self.commit_pending
-		{
+		if !matches!(self.mode, Mode::Normal) {
+			self.queue.push(InternalEvent::ShowInfoToast(
+				"AI generation is only available for new commits"
+					.to_owned(),
+			));
+			return Ok(());
+		}
+		if self.ai_pending || self.commit_pending {
 			return Ok(());
 		}
 		let initial_input = self.input.get_text().to_owned();
@@ -490,69 +515,192 @@ impl CommitPopup {
 	}
 
 	fn draw_branch_name(&self, f: &mut Frame) {
-		if let Some(name) = self.git_branch_name.last() {
-			let w = Paragraph::new(format!("{{{name}}}"))
-				.alignment(Alignment::Right);
-
-			let rect = {
-				let mut rect = self.input.get_area();
-				rect.height = 1;
-				rect.width = rect.width.saturating_sub(1);
-				rect
-			};
-
-			f.render_widget(w, rect);
-		}
-	}
-
-	fn draw_staged_summary(&self, f: &mut Frame) {
-		let Some(summary) = &self.staged_summary else {
+		let Some(name) = self.git_branch_name.last() else {
 			return;
 		};
+		let area = self.input.get_area();
+		if area.width < 12 {
+			return;
+		}
+		let title_width = self.input.title().width();
+		let left_reserved = u16::try_from(title_width)
+			.unwrap_or(u16::MAX)
+			.saturating_add(3);
+		let available = area.width.saturating_sub(left_reserved).saturating_sub(1);
+		if available < 4 {
+			return;
+		}
+		let label = format!("{{{name}}}");
+		let display = if label.width() <= usize::from(available) {
+			label
+		} else {
+			let inner_budget = usize::from(available.saturating_sub(2));
+			let mut trimmed = String::new();
+			let mut used = 0;
+			for ch in name.chars() {
+				let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+				if used + w + 1 > inner_budget {
+					break;
+				}
+				trimmed.push(ch);
+				used += w;
+			}
+			format!("{{{trimmed}…}}")
+		};
+		let disp_w = u16::try_from(display.width()).unwrap_or(available);
+		let rect = Rect::new(
+			area.x + area.width.saturating_sub(disp_w + 1),
+			area.y,
+			disp_w,
+			1,
+		);
+		let w = Paragraph::new(display).alignment(Alignment::Right);
+		f.render_widget(w, rect);
+	}
+
+	fn draw_bottom_border(&self, f: &mut Frame) {
 		let area = self.input.get_area();
 		if area.width < 12 || area.height < 3 {
 			return;
 		}
-		let rect = Rect::new(
-			area.x + 1,
-			area.y + area.height.saturating_sub(1),
-			area.width.saturating_sub(2),
-			1,
-		);
-		let w = Paragraph::new(format!("[{summary}]"))
-			.style(self.theme.text(false, false))
-			.alignment(Alignment::Left);
-		f.render_widget(w, rect);
+		let y = area.y + area.height.saturating_sub(1);
+		let inner_x = area.x + 1;
+		let inner_w = area.width.saturating_sub(2);
+		let right_u16 = self.draw_bottom_right(f, inner_x, y, inner_w);
+		self.draw_bottom_left(f, inner_x, y, inner_w, right_u16);
 	}
 
-	fn draw_warnings(&self, f: &mut Frame) {
-		let first_line = self
-			.input
-			.get_text()
+	fn draw_bottom_right(
+		&self,
+		f: &mut Frame,
+		inner_x: u16,
+		y: u16,
+		inner_w: u16,
+	) -> u16 {
+		let text = self.input.get_text();
+		let count = text.chars().count();
+		let first_line = text
 			.lines()
 			.next()
 			.map(|line| line.chars().count())
 			.unwrap_or_default();
+		let count_str = if count > 0 {
+			format!("[{count} chars]")
+		} else {
+			String::new()
+		};
+		let warning_str = if first_line > FIRST_LINE_LIMIT {
+			strings::commit_first_line_warning(first_line)
+		} else {
+			String::new()
+		};
 
-		if first_line > FIRST_LINE_LIMIT {
-			let msg = strings::commit_first_line_warning(first_line);
-			let msg_length: u16 = msg.width().cast();
-			let w =
-				Paragraph::new(msg).style(self.theme.text_danger());
+		let mut right_spans: Vec<ratatui::text::Span<'_>> = Vec::new();
+		if !warning_str.is_empty() {
+			right_spans.push(ratatui::text::Span::styled(
+				warning_str,
+				self.theme.text_danger(),
+			));
+		}
+		if !count_str.is_empty() {
+			if !right_spans.is_empty() {
+				right_spans.push(ratatui::text::Span::raw(" "));
+			}
+			right_spans.push(ratatui::text::Span::raw(count_str));
+		}
+		let right_width: usize =
+			right_spans.iter().map(|s| s.content.width()).sum();
+		let right_u16 = u16::try_from(right_width)
+			.unwrap_or(inner_w)
+			.min(inner_w);
+		if right_u16 > 0 {
+			let right_rect = Rect::new(
+				inner_x + inner_w.saturating_sub(right_u16),
+				y,
+				right_u16,
+				1,
+			);
+			f.render_widget(
+				Paragraph::new(ratatui::text::Line::from(right_spans))
+					.alignment(Alignment::Right),
+				right_rect,
+			);
+		}
+		right_u16
+	}
 
-			let rect = {
-				let mut rect = self.input.get_area();
-				rect.y += rect.height.saturating_sub(1);
-				rect.height = 1;
-				let offset =
-					rect.width.saturating_sub(msg_length + 1);
-				rect.width = rect.width.saturating_sub(offset + 1);
-				rect.x += offset;
-
-				rect
-			};
-
-			f.render_widget(w, rect);
+	fn draw_bottom_left(
+		&self,
+		f: &mut Frame,
+		inner_x: u16,
+		y: u16,
+		inner_w: u16,
+		right_u16: u16,
+	) {
+		let left_budget = usize::from(
+			inner_w.saturating_sub(right_u16.saturating_add(1)),
+		);
+		if left_budget < 4 {
+			return;
+		}
+		let mut left_spans: Vec<ratatui::text::Span<'_>> = Vec::new();
+		let mut used = 0;
+		if !self.verify {
+			let badge = "[--no-verify]";
+			if badge.width() <= left_budget {
+				used += badge.width();
+				left_spans.push(ratatui::text::Span::styled(
+					badge,
+					self.theme.text_danger(),
+				));
+			}
+		}
+		if let Some(summary) = &self.staged_summary {
+			let sep = if used > 0 { " " } else { "" };
+			let remaining = left_budget.saturating_sub(used + sep.len());
+			if remaining >= 5 {
+				let full = format!("[{summary}]");
+				let display = if full.width() <= remaining {
+					full
+				} else {
+					let mut out = String::new();
+					let mut w = 0;
+					let budget = remaining.saturating_sub(3);
+					for ch in summary.chars() {
+						let cw = unicode_width::UnicodeWidthChar::width(ch)
+							.unwrap_or(0);
+						if w + cw > budget {
+							break;
+						}
+						out.push(ch);
+						w += cw;
+					}
+					format!("[{out}…]")
+				};
+				if !sep.is_empty() {
+					left_spans.push(ratatui::text::Span::raw(sep));
+				}
+				left_spans.push(ratatui::text::Span::styled(
+					display,
+					self.theme.text(false, false),
+				));
+			}
+		}
+		if !left_spans.is_empty() {
+			let left_w = u16::try_from(
+				left_spans
+					.iter()
+					.map(|s| s.content.width())
+					.sum::<usize>(),
+			)
+			.unwrap_or(inner_w)
+			.min(inner_w.saturating_sub(right_u16));
+			let left_rect = Rect::new(inner_x, y, left_w, 1);
+			f.render_widget(
+				Paragraph::new(ratatui::text::Line::from(left_spans))
+					.alignment(Alignment::Left),
+				left_rect,
+			);
 		}
 	}
 
@@ -633,10 +781,14 @@ impl CommitPopup {
 		let sender = self.ai_sender.clone();
 
 		self.commit_pending = true;
-		self.input.set_title(format!(
-			"{} · Committing…",
-			strings::commit_title()
-		));
+		let base_title = match mode {
+			Mode::Normal => strings::commit_title(),
+			Mode::Amend(_) => strings::commit_title_amend(),
+			Mode::Merge => strings::commit_title_merge(),
+			Mode::Revert => strings::commit_title_revert(),
+			Mode::Reword(_) => strings::commit_reword_title(),
+		};
+		self.input.set_title(format!("{base_title} · Committing…"));
 
 		thread::Builder::new()
 			.name("gitui-commit".to_owned())
@@ -818,6 +970,8 @@ impl CommitPopup {
 		self.invalidate_ai_generation();
 		self.ai_previous_draft = None;
 		self.ai_generated_text = None;
+		self.conventional_picker_open = false;
+		self.conventional_selection = 0;
 		// Cursor position to restore once the textarea is shown.
 		// Set when a saved draft is loaded in the Normal branch below.
 		let mut pending_cursor: Option<(u16, u16)> = None;
@@ -944,6 +1098,9 @@ impl CommitPopup {
 			&mut msg,
 		)? {
 			log::error!("prepare-commit-msg hook rejection: {e}");
+			self.queue.push(InternalEvent::ShowWarningToast(
+				format!("prepare-commit-msg hook failed: {e}"),
+			));
 		}
 		self.input.set_text(msg);
 
@@ -976,20 +1133,301 @@ impl CommitPopup {
 
 		let mut msg = msg.to_owned();
 		if let (Some(user), Some(mail)) = (user, mail) {
-			let _ = write!(msg, "\n\nSigned-off-by: {user} <{mail}>");
+			let signoff = format!("Signed-off-by: {user} <{mail}>");
+			if !msg.lines().any(|line| line.trim() == signoff) {
+				let _ = write!(msg, "\n\n{signoff}");
+			}
+		} else {
+			self.queue.push(InternalEvent::ShowWarningToast(
+				"Set git user.name and user.email to add Signed-off-by"
+					.to_owned(),
+			));
 		}
 
 		Ok(msg)
 	}
+
+	fn draw_column_guides(&self, f: &mut Frame) {
+		let area = self.input.get_area();
+		if area.width < 4 || area.height < 3 {
+			return;
+		}
+		let inner_x = area.x.saturating_add(1);
+		let inner_y = area.y.saturating_add(1);
+		let inner_w = area.width.saturating_sub(2);
+		let inner_h = area.height.saturating_sub(2);
+		let text = self.input.get_text();
+		let first_line_len =
+			text.split('\n').next().map_or(0, |l| l.chars().count());
+		let any_body_too_long = text
+			.split('\n')
+			.skip(1)
+			.any(|l| l.chars().count() > BODY_LINE_LIMIT);
+
+		let dim =
+			self.theme.text(false, false).add_modifier(Modifier::DIM);
+		let style_50 = if first_line_len > FIRST_LINE_LIMIT {
+			self.theme.text_danger()
+		} else {
+			dim
+		};
+		let style_72 = if any_body_too_long {
+			self.theme.text_danger()
+		} else {
+			dim
+		};
+		let cursor = self.input.cursor();
+		let buf = f.buffer_mut();
+
+		if let std::result::Result::Ok(limit_50) =
+			u16::try_from(FIRST_LINE_LIMIT)
+		{
+			if inner_w > limit_50 {
+				let gx = inner_x.saturating_add(limit_50);
+				if let Some(cell) = buf.cell_mut((gx, area.y)) {
+					if cell.symbol() == "─" {
+						cell.set_symbol("┬");
+						cell.set_style(style_50);
+					}
+				}
+				if cursor != Some((0, limit_50)) {
+					if let Some(cell) = buf.cell_mut((gx, inner_y)) {
+						if cell.symbol() == " " {
+							cell.set_symbol("┆");
+							cell.set_style(style_50);
+						}
+					}
+				}
+			}
+		}
+
+		if let std::result::Result::Ok(limit_72) =
+			u16::try_from(BODY_LINE_LIMIT)
+		{
+			if inner_w > limit_72 {
+				let gx = inner_x.saturating_add(limit_72);
+				if let Some(cell) = buf.cell_mut((gx, area.y)) {
+					if cell.symbol() == "─" {
+						cell.set_symbol("┬");
+						cell.set_style(style_72);
+					}
+				}
+				for row in 1..inner_h {
+					if cursor != Some((row, limit_72)) {
+						if let Some(cell) = buf.cell_mut((
+							gx,
+							inner_y.saturating_add(row),
+						)) {
+							if cell.symbol() == " " {
+								cell.set_symbol("┆");
+								cell.set_style(style_72);
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	fn draw_conventional_picker(&self, f: &mut Frame, rect: Rect) {
+		let height = u16::try_from(CONVENTIONAL_TYPES.len() + 2)
+			.unwrap_or(13)
+			.min(rect.height.max(3));
+		let width = 56_u16.min(rect.width.max(20));
+		let area =
+			crate::ui::centered_rect_absolute(width, height, rect);
+		crate::ui::clear_popup_area(f, area);
+
+		let lines: Vec<Line<'_>> = CONVENTIONAL_TYPES
+			.iter()
+			.enumerate()
+			.map(|(idx, (kind, desc))| {
+				let selected = idx == self.conventional_selection;
+				let style = self.theme.text(true, selected);
+				let num_hint = if idx < 9 {
+					format!("{} ", idx + 1)
+				} else {
+					"  ".to_owned()
+				};
+				Line::from(vec![
+					Span::styled(
+						num_hint,
+						dim_hint_style(&self.theme, selected),
+					),
+					Span::styled(
+						format!("{kind:<9} "),
+						style.add_modifier(Modifier::BOLD),
+					),
+					Span::styled(*desc, style),
+				])
+			})
+			.collect();
+
+		let block = Block::default()
+			.title(Span::styled(
+				"Conventional Commit Type (Enter / 1-9 / Esc)",
+				self.theme.title(true),
+			))
+			.borders(Borders::ALL)
+			.border_type(BorderType::Rounded)
+			.border_style(self.theme.block(true));
+
+		f.render_widget(Paragraph::new(lines).block(block), area);
+	}
+
+	fn open_conventional_picker(&mut self) {
+		let first_line = self
+			.input
+			.get_text()
+			.split('\n')
+			.next()
+			.unwrap_or_default();
+		let detected_idx = detect_conventional_type(first_line)
+			.and_then(|kind| {
+				CONVENTIONAL_TYPES
+					.iter()
+					.position(|(t, _)| t.eq_ignore_ascii_case(kind))
+			})
+			.unwrap_or(0);
+		self.conventional_selection = detected_idx;
+		self.conventional_picker_open = true;
+	}
+
+	fn handle_conventional_picker_key(
+		&mut self,
+		e: &crossterm::event::KeyEvent,
+	) {
+		if e.code == KeyCode::Esc
+			|| (e.code == KeyCode::Char('t')
+				&& e.modifiers == KeyModifiers::CONTROL)
+			|| key_match(e, self.key_config.keys.exit_popup)
+		{
+			self.conventional_picker_open = false;
+			return;
+		}
+		if key_match(e, self.key_config.keys.move_up)
+			|| key_match(e, self.key_config.keys.popup_up)
+		{
+			self.conventional_selection =
+				self.conventional_selection.saturating_sub(1);
+		} else if key_match(e, self.key_config.keys.move_down)
+			|| key_match(e, self.key_config.keys.popup_down)
+		{
+			let max = CONVENTIONAL_TYPES.len().saturating_sub(1);
+			if self.conventional_selection < max {
+				self.conventional_selection += 1;
+			}
+		} else if key_match(e, self.key_config.keys.enter) {
+			let kind = CONVENTIONAL_TYPES[self.conventional_selection].0;
+			self.apply_conventional_type(kind);
+			self.conventional_picker_open = false;
+		} else if let KeyCode::Char(c @ '1'..='9') = e.code {
+			if e.modifiers.is_empty() {
+				let idx = usize::from((c as u8) - b'1');
+				if let Some((kind, _)) = CONVENTIONAL_TYPES.get(idx) {
+					self.conventional_selection = idx;
+					self.apply_conventional_type(kind);
+					self.conventional_picker_open = false;
+				}
+			}
+		}
+	}
+
+	fn apply_conventional_type(&mut self, commit_type: &str) {
+		let (updated, cursor_col) = apply_conventional_prefix(
+			self.input.get_text(),
+			commit_type,
+		);
+		self.input.set_text(updated);
+		self.input
+			.set_cursor(0, u16::try_from(cursor_col).unwrap_or(u16::MAX));
+	}
+}
+
+fn dim_hint_style(
+	theme: &SharedTheme,
+	selected: bool,
+) -> ratatui::style::Style {
+	if selected {
+		theme.text(true, true)
+	} else {
+		theme.text(false, false).add_modifier(Modifier::DIM)
+	}
+}
+
+fn detect_conventional_type(first_line: &str) -> Option<&str> {
+	let (before_colon, _) = first_line.split_once(':')?;
+	let base = before_colon.strip_suffix('!').unwrap_or(before_colon);
+	let kind = base.find('(').map_or(base, |idx| {
+		if base.ends_with(')') {
+			&base[..idx]
+		} else {
+			""
+		}
+	});
+	CONVENTIONAL_TYPES
+		.iter()
+		.any(|(t, _)| t.eq_ignore_ascii_case(kind))
+		.then_some(kind)
+}
+
+fn apply_conventional_prefix(
+	current: &str,
+	commit_type: &str,
+) -> (String, usize) {
+	let (first_line, rest) =
+		current.split_once('\n').map_or((current, None), |(f, r)| {
+			(f, Some(r))
+		});
+
+	let (prefix, remainder) =
+		if let Some((before_colon, after_colon)) = first_line.split_once(':') {
+			let (base, bang) = before_colon
+				.strip_suffix('!')
+				.map_or((before_colon, ""), |s| (s, "!"));
+			let (kind, scope) = base.find('(').map_or((base, ""), |idx| {
+				if base.ends_with(')') {
+					(&base[..idx], &base[idx..])
+				} else {
+					("", "")
+				}
+			});
+			if !kind.is_empty()
+				&& CONVENTIONAL_TYPES
+					.iter()
+					.any(|(t, _)| t.eq_ignore_ascii_case(kind))
+			{
+				(
+					format!("{commit_type}{scope}{bang}: "),
+					after_colon.strip_prefix(' ').unwrap_or(after_colon),
+				)
+			} else {
+				(format!("{commit_type}: "), first_line)
+			}
+		} else {
+			(format!("{commit_type}: "), first_line)
+		};
+
+	let cursor_col = prefix.chars().count();
+	let new_first = format!("{prefix}{remainder}");
+	let full = if let Some(r) = rest {
+		format!("{new_first}\n{r}")
+	} else {
+		new_first
+	};
+	(full, cursor_col)
 }
 
 impl DrawableComponent for CommitPopup {
 	fn draw(&self, f: &mut Frame, rect: Rect) -> Result<()> {
 		if self.is_visible() {
 			self.input.draw(f, rect)?;
+			self.draw_column_guides(f);
 			self.draw_branch_name(f);
-			self.draw_staged_summary(f);
-			self.draw_warnings(f);
+			self.draw_bottom_border(f);
+			if self.conventional_picker_open {
+				self.draw_conventional_picker(f, rect);
+			}
 		}
 
 		Ok(())
@@ -1070,6 +1508,16 @@ impl Component for CommitPopup {
 			}
 
 			out.push(CommandInfo::new(
+				crate::components::CommandText::new(
+					"Type [^t]".to_owned(),
+					"insert or replace Conventional Commit type prefix",
+					"-- Commit Popup --",
+				),
+				!self.commit_pending,
+				true,
+			));
+
+			out.push(CommandInfo::new(
 				strings::commands::newline(&self.key_config),
 				true,
 				true,
@@ -1083,6 +1531,21 @@ impl Component for CommitPopup {
 	fn event(&mut self, ev: &Event) -> Result<EventState> {
 		if self.is_visible() {
 			if let Event::Key(e) = ev {
+				if self.conventional_picker_open {
+					let input_before = self
+						.ai_pending
+						.then(|| self.input.get_text().to_owned());
+					self.handle_conventional_picker_key(e);
+					if self.ai_pending
+						&& input_before.as_deref().is_some_and(|before| {
+							before != self.input.get_text()
+						}) {
+						self.invalidate_ai_generation();
+						self.input.set_title(strings::commit_title());
+					}
+					return Ok(EventState::Consumed);
+				}
+
 				let input_before = self
 					.ai_pending
 					.then(|| self.input.get_text().to_owned());
@@ -1095,6 +1558,12 @@ impl Component for CommitPopup {
 							"commit error:",
 							self.commit()
 						);
+						true
+					} else if e.code == KeyCode::Char('t')
+						&& e.modifiers == KeyModifiers::CONTROL
+						&& !self.commit_pending
+					{
+						self.open_conventional_picker();
 						true
 					} else if e.code == KeyCode::Char('z')
 						&& e.modifiers == KeyModifiers::CONTROL
@@ -1195,11 +1664,13 @@ impl Component for CommitPopup {
 	}
 
 	fn is_input_mode(&self) -> bool {
-		self.input.is_input_mode()
+		self.input.is_input_mode() && !self.conventional_picker_open
 	}
 
 	fn hide(&mut self) {
 		self.invalidate_ai_generation();
+		self.conventional_picker_open = false;
+		self.conventional_selection = 0;
 		self.input.hide();
 	}
 
@@ -1317,5 +1788,94 @@ mod ai_tests {
 		assert!(popup.undo_ai_replacement());
 		assert_eq!(popup.input.get_text(), "Manual draft");
 		assert!(popup.ai_previous_draft.is_none());
+	}
+
+	#[test]
+	fn conventional_commit_picker_inserts_and_preserves_scope_and_body() {
+		let (_dir, _repo, mut popup, _diff) = staged_popup();
+
+		// Open picker via Ctrl+t and select '2' (fix)
+		popup
+			.event(&Event::Key(crossterm::event::KeyEvent::new(
+				KeyCode::Char('t'),
+				KeyModifiers::CONTROL,
+			)))
+			.unwrap();
+		assert!(popup.conventional_picker_open);
+		assert!(!popup.is_input_mode());
+
+		popup
+			.event(&Event::Key(crossterm::event::KeyEvent::new(
+				KeyCode::Char('2'),
+				KeyModifiers::NONE,
+			)))
+			.unwrap();
+		assert!(!popup.conventional_picker_open);
+		assert_eq!(popup.input.get_text(), "fix: ");
+		assert_eq!(popup.input.cursor(), Some((0, 5)));
+
+		// Replace existing feat(ui)! prefix while keeping scope, bang, and body
+		popup.input.set_text(
+			"feat(ui)!: tighten spacing\n\nLonger explanation body"
+				.to_owned(),
+		);
+		popup
+			.event(&Event::Key(crossterm::event::KeyEvent::new(
+				KeyCode::Char('t'),
+				KeyModifiers::CONTROL,
+			)))
+			.unwrap();
+		assert_eq!(popup.conventional_selection, 0);
+		popup
+			.event(&Event::Key(crossterm::event::KeyEvent::new(
+				KeyCode::Char('5'),
+				KeyModifiers::NONE,
+			)))
+			.unwrap();
+		assert_eq!(
+			popup.input.get_text(),
+			"refactor(ui)!: tighten spacing\n\nLonger explanation body"
+		);
+		assert_eq!(popup.input.cursor(), Some((0, 15)));
+	}
+
+	#[test]
+	fn commit_column_guides_draw_at_50_and_72() {
+		let (_dir, _repo, mut popup, _diff) = staged_popup();
+		popup.input.set_text("short subject\n\nbody line".to_owned());
+
+		let backend = ratatui::backend::TestBackend::new(140, 20);
+		let mut terminal = ratatui::Terminal::new(backend).unwrap();
+		terminal
+			.draw(|f| {
+				popup.draw(f, f.area()).unwrap();
+			})
+			.unwrap();
+
+		let area = popup.input.get_area();
+		let buf = terminal.backend().buffer();
+		let x50 = area.x + 1 + 50;
+		let x72 = area.x + 1 + 72;
+		let rendered = terminal.backend().to_string();
+		assert_eq!(
+			buf[(x50, area.y)].symbol(),
+			"┬",
+			"area={area:?}\n{rendered}"
+		);
+		assert_eq!(
+			buf[(x50, area.y + 1)].symbol(),
+			"┆",
+			"area={area:?}\n{rendered}"
+		);
+		assert_eq!(
+			buf[(x72, area.y)].symbol(),
+			"┬",
+			"area={area:?}\n{rendered}"
+		);
+		assert_eq!(
+			buf[(x72, area.y + 2)].symbol(),
+			"┆",
+			"area={area:?}\n{rendered}"
+		);
 	}
 }

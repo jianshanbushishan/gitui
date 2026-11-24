@@ -9,9 +9,11 @@ use crate::{
 	strings, ui,
 };
 use anyhow::Result;
-use crossterm::event::{Event, KeyCode, KeyModifiers};
+use crossterm::event::{
+	Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind,
+};
 use ratatui::{
-	layout::Rect,
+	layout::{Position, Rect},
 	text::{Line, Span},
 	widgets::{Block, BorderType, Borders, Padding},
 	Frame,
@@ -31,6 +33,7 @@ pub struct ConfirmPopup {
 	queue: Queue,
 	theme: SharedTheme,
 	key_config: SharedKeyConfig,
+	last_area: std::cell::Cell<Rect>,
 }
 
 impl ConfirmPopup {
@@ -44,6 +47,7 @@ impl ConfirmPopup {
 				| Action::StashDrop(_)
 				| Action::DeleteLocalBranch(_)
 				| Action::DeleteRemoteBranch(_)
+				| Action::RebaseBranch(_, _)
 				| Action::DeleteTag(_)
 				| Action::DeleteRemoteTag(_, _)
 				| Action::DeleteRemote(_)
@@ -127,6 +131,7 @@ impl DrawableComponent for ConfirmPopup {
 				.min(viewport.height);
 			let area =
 				ui::centered_rect_absolute(width, height, viewport);
+			self.last_area.set(area);
 
 			ui::clear_popup_area(f, area);
 			let block = Block::default()
@@ -169,6 +174,18 @@ impl Component for ConfirmPopup {
 
 	fn event(&mut self, ev: &Event) -> Result<EventState> {
 		if self.visible {
+			if let Event::Mouse(mouse) = ev {
+				if matches!(
+					mouse.kind,
+					MouseEventKind::Down(MouseButton::Left)
+				) && !self.last_area.get().contains(Position::new(
+					mouse.column,
+					mouse.row,
+				)) {
+					self.hide();
+				}
+				return Ok(EventState::Consumed);
+			}
 			if let Event::Key(e) = ev {
 				let is_yes = e.modifiers.is_empty()
 					&& matches!(
@@ -193,7 +210,6 @@ impl Component for ConfirmPopup {
 				} else if key_match(e, self.key_config.keys.enter)
 					|| is_yes
 					|| is_yes_shifted
-					|| key_match(e, self.key_config.keys.copy)
 				{
 					self.confirm();
 				}
@@ -229,6 +245,7 @@ impl ConfirmPopup {
 			queue: env.queue.clone(),
 			theme: env.theme.clone(),
 			key_config: env.key_config.clone(),
+			last_area: std::cell::Cell::new(Rect::default()),
 		}
 	}
 	///
@@ -303,6 +320,18 @@ impl ConfirmPopup {
 					strings::confirm_msg_delete_remote_branch(
 						&self.key_config,
 						branch_ref,
+					),
+				),
+				Action::MergeBranch(branch, _) => (
+					"Merge Branch".to_owned(),
+					format!(
+						"Merge branch '{branch}' into the current branch?"
+					),
+				),
+				Action::RebaseBranch(branch, _) => (
+					"Rebase Branch".to_owned(),
+					format!(
+						"Rebase the current branch onto '{branch}'? This rewrites local commit history."
 					),
 				),
 				Action::DeleteRemote(remote_name) => (
@@ -438,6 +467,24 @@ mod tests {
 				true
 			)))
 		));
+	}
+
+	#[test]
+	fn copy_key_does_not_confirm_destructive_action() {
+		let mut env = Environment::test_env();
+		let mut custom_keys = (*env.key_config).clone();
+		custom_keys.keys.copy = crate::keys::GituiKeyEvent::new(
+			KeyCode::Char('c'),
+			KeyModifiers::empty(),
+		);
+		env.key_config = std::rc::Rc::new(custom_keys);
+		let mut popup = ConfirmPopup::new(&env);
+		popup.open(Action::ResetAll).unwrap();
+		popup
+			.event(&Event::Key((&env.key_config.keys.copy).into()))
+			.unwrap();
+		assert!(popup.is_visible());
+		assert!(env.queue.pop().is_none());
 	}
 
 	#[test]

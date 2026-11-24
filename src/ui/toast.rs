@@ -1,11 +1,15 @@
 use crate::ui::{self, style::Theme};
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
-	layout::Rect,
+	layout::{Position, Rect},
 	text::{Line, Span},
 	widgets::{Block, BorderType, Borders, Clear},
 	Frame,
 };
-use std::time::{Duration, Instant};
+use std::{
+	cell::Cell,
+	time::{Duration, Instant},
+};
 use unicode_width::UnicodeWidthStr;
 
 const DEFAULT_TOAST_DURATION: Duration = Duration::from_millis(2500);
@@ -23,6 +27,7 @@ pub enum ToastKind {
 #[derive(Default)]
 pub struct Toast {
 	message: Option<ToastEntry>,
+	last_rect: Cell<Option<Rect>>,
 }
 
 struct ToastEntry {
@@ -82,6 +87,24 @@ impl Toast {
 		self.message.is_some()
 	}
 
+	pub fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+		if self.message.is_none() {
+			return false;
+		}
+		if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+		{
+			if let Some(rect) = self.last_rect.get() {
+				if rect.contains(Position::new(mouse.column, mouse.row))
+				{
+					self.message = None;
+					self.last_rect.set(None);
+					return true;
+				}
+			}
+		}
+		false
+	}
+
 	/// Expire the toast if its deadline has passed. Returns `true` when the
 	/// toast was just dismissed so the caller can trigger a redraw.
 	pub fn tick(&mut self, now: Instant) -> bool {
@@ -91,6 +114,7 @@ impl Toast {
 			.is_some_and(|entry| now >= entry.expires_at)
 		{
 			self.message = None;
+			self.last_rect.set(None);
 			return true;
 		}
 		false
@@ -98,9 +122,11 @@ impl Toast {
 
 	pub fn draw(&self, f: &mut Frame, area: Rect, theme: &Theme) {
 		let Some(entry) = &self.message else {
+			self.last_rect.set(None);
 			return;
 		};
 		if area.width < 12 || area.height < 4 {
+			self.last_rect.set(None);
 			return;
 		}
 
@@ -126,6 +152,7 @@ impl Toast {
 			.bottom()
 			.saturating_sub(box_height.saturating_add(1));
 		let rect = Rect::new(x, y, box_width, box_height);
+		self.last_rect.set(Some(rect));
 
 		let clear_area = Rect::new(
 			rect.x.saturating_sub(1),
@@ -136,11 +163,11 @@ impl Toast {
 		f.render_widget(Clear, clear_area);
 
 		let border_style = match entry.kind {
-			ToastKind::Warning => Theme::attention_block(),
+			ToastKind::Warning => theme.warning(),
 			ToastKind::Info | ToastKind::Success => theme.block(true),
 		};
 		let text_style = match entry.kind {
-			ToastKind::Warning => Theme::attention_block(),
+			ToastKind::Warning => theme.warning(),
 			ToastKind::Info => theme.toast_info(),
 			ToastKind::Success => theme.toast(),
 		};
@@ -222,5 +249,25 @@ mod tests {
 			.backend()
 			.to_string()
 			.contains("ℹ Opened external diff"));
+	}
+
+	#[test]
+	fn toast_dismisses_on_mouse_click() {
+		let theme = Theme::default();
+		let mut toast = Toast::default();
+		toast.show("Saved");
+		let mut terminal =
+			Terminal::new(TestBackend::new(60, 12)).unwrap();
+		terminal
+			.draw(|f| toast.draw(f, f.area(), &theme))
+			.unwrap();
+		let rect = toast.last_rect.get().unwrap();
+		assert!(toast.handle_mouse(MouseEvent {
+			kind: MouseEventKind::Down(MouseButton::Left),
+			column: rect.x + 1,
+			row: rect.y + 1,
+			modifiers: crossterm::event::KeyModifiers::NONE,
+		}));
+		assert!(!toast.is_active());
 	}
 }

@@ -5,19 +5,21 @@ use crate::components::{
 use crate::strings::order;
 use crate::{
 	app::Environment,
+	clipboard::copy_string,
 	keys::{key_match, SharedKeyConfig},
+	queue::{InternalEvent, Queue},
 	strings, ui,
 };
 use anyhow::Result;
-use crossterm::event::Event;
+use crossterm::event::{Event, MouseButton, MouseEventKind};
 use ratatui::text::Line;
 use ratatui::{
-	layout::Rect,
+	layout::{Position, Rect},
 	text::Span,
 	widgets::{Block, BorderType, Borders, Clear, Padding},
 	Frame,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use ui::style::SharedTheme;
 use unicode_width::UnicodeWidthStr;
 
@@ -40,7 +42,9 @@ pub struct MsgPopup {
 	visible: bool,
 	theme: SharedTheme,
 	key_config: SharedKeyConfig,
+	queue: Queue,
 	scroll: VerticalScroll,
+	last_area: Cell<Rect>,
 }
 
 const POPUP_HEIGHT: u16 = 25;
@@ -56,7 +60,8 @@ impl DrawableComponent for MsgPopup {
 		let viewport = if self.compact { rect } else { f.area() };
 		let (area, block, wrapped_line_count) =
 			self.layout(viewport)?;
-		let footer = self.compact && area.height >= BORDER_WIDTH + 2;
+		self.last_area.set(area);
+		let footer = area.height >= BORDER_WIDTH + 2;
 		let height = block
 			.inner(area)
 			.height
@@ -139,6 +144,11 @@ impl Component for MsgPopup {
 			true,
 			self.visible,
 		));
+		out.push(CommandInfo::new(
+			strings::commands::copy(&self.key_config),
+			!self.msg.is_empty(),
+			self.visible,
+		));
 		out.push(
 			CommandInfo::new(
 				strings::commands::navigate_commit_message(
@@ -155,9 +165,46 @@ impl Component for MsgPopup {
 
 	fn event(&mut self, ev: &Event) -> Result<EventState> {
 		if self.visible {
+			if let Event::Mouse(mouse) = ev {
+				let pos = Position::new(mouse.column, mouse.row);
+				match mouse.kind {
+					MouseEventKind::Down(MouseButton::Left) => {
+						if !self.last_area.get().contains(pos) {
+							self.hide();
+						}
+					}
+					MouseEventKind::ScrollUp => {
+						self.scroll.move_top(ScrollType::Up);
+					}
+					MouseEventKind::ScrollDown => {
+						self.scroll.move_top(ScrollType::Down);
+					}
+					_ => {}
+				}
+				return Ok(EventState::Consumed);
+			}
 			if let Event::Key(e) = ev {
-				if key_match(e, self.key_config.keys.exit_popup) {
+				if key_match(e, self.key_config.keys.exit_popup)
+					|| key_match(e, self.key_config.keys.enter)
+				{
 					self.hide();
+				} else if key_match(e, self.key_config.keys.copy)
+					&& !self.msg.is_empty()
+				{
+					match copy_string(&self.msg) {
+						Ok(()) => {
+							self.queue.push(InternalEvent::ShowToast(
+								"Copied message".to_owned(),
+							));
+						}
+						Err(err) => {
+							self.queue.push(
+								InternalEvent::ShowWarningToast(
+									format!("Copy failed: {err}"),
+								),
+							);
+						}
+					}
 				} else if key_match(e, self.key_config.keys.move_down)
 					|| key_match(e, self.key_config.keys.popup_down)
 				{
@@ -166,6 +213,15 @@ impl Component for MsgPopup {
 					|| key_match(e, self.key_config.keys.popup_up)
 				{
 					self.scroll.move_top(ScrollType::Up);
+				} else if key_match(e, self.key_config.keys.page_down)
+				{
+					self.scroll.move_top(ScrollType::PageDown);
+				} else if key_match(e, self.key_config.keys.page_up) {
+					self.scroll.move_top(ScrollType::PageUp);
+				} else if key_match(e, self.key_config.keys.home) {
+					self.scroll.move_top(ScrollType::Home);
+				} else if key_match(e, self.key_config.keys.end) {
+					self.scroll.move_top(ScrollType::End);
 				}
 			}
 			Ok(EventState::Consumed)
@@ -202,15 +258,20 @@ impl MsgPopup {
 			visible: false,
 			theme: env.theme.clone(),
 			key_config: env.key_config.clone(),
+			queue: env.queue.clone(),
 			scroll: VerticalScroll::new(),
+			last_area: Cell::new(Rect::default()),
 		}
 	}
 
 	fn compact_close_hint(&self) -> String {
-		format!(
-			"{} Close",
-			self.key_config.get_hint(self.key_config.keys.exit_popup)
-		)
+		let exit = self.key_config.get_hint(self.key_config.keys.exit_popup);
+		if self.msg.is_empty() {
+			format!("{exit} Close")
+		} else {
+			let copy = self.key_config.get_hint(self.key_config.keys.copy);
+			format!("{exit} Close · {copy} Copy")
+		}
 	}
 
 	fn ensure_wrapped(&self, text_width: usize) -> usize {
@@ -241,50 +302,32 @@ impl MsgPopup {
 		let mut block = Block::default()
 			.borders(Borders::ALL)
 			.border_type(BorderType::Rounded);
-		let padding = u16::from(self.compact && viewport.width >= 6);
+		let padding = u16::from(viewport.width >= 6);
 		let horizontal_inset = BORDER_WIDTH + 2 * padding;
-		let min_width = if self.compact {
-			let min_width =
-				(self.title.width() + usize::from(BORDER_WIDTH)).max(
-					self.compact_close_hint().width()
-						+ usize::from(horizontal_inset),
-				);
-			let title_style = if self.is_error {
-				self.theme.text_danger()
-			} else {
-				self.theme.title(true)
-			};
-			let border_style = if self.is_error {
-				self.theme.text_danger()
-			} else {
-				self.theme.block(true)
-			};
-			block = block
-				.title(Span::styled(
-					self.title.as_str(),
-					title_style,
-				))
-				.border_style(border_style)
-				.padding(Padding::horizontal(padding));
-			min_width
+		let title_style = if self.is_error {
+			self.theme.text_danger()
 		} else {
-			let title_style = if self.is_error {
-				self.theme.text_danger()
-			} else {
-				self.theme.title(true)
-			};
-			let border_style = if self.is_error {
-				self.theme.text_danger()
-			} else {
-				self.theme.block(true)
-			};
-			block = block
-				.title(Span::styled(
-					self.title.as_str(),
-					title_style,
-				))
-				.border_style(border_style);
-			MINIMUM_WIDTH.into()
+			self.theme.title(true)
+		};
+		let border_style = if self.is_error {
+			self.theme.text_danger()
+		} else {
+			self.theme.block(true)
+		};
+		block = block
+			.title(Span::styled(self.title.as_str(), title_style))
+			.border_style(border_style)
+			.padding(Padding::horizontal(padding));
+		let min_width = if self.compact {
+			(self.title.width() + usize::from(BORDER_WIDTH)).max(
+				self.compact_close_hint().width()
+					+ usize::from(horizontal_inset),
+			)
+		} else {
+			usize::from(MINIMUM_WIDTH).max(
+				self.compact_close_hint().width()
+					+ usize::from(horizontal_inset),
+			)
 		};
 		let label_width =
 			self.label.as_deref().map_or(0, UnicodeWidthStr::width);

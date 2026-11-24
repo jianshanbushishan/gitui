@@ -49,6 +49,14 @@ impl Theme {
 		Style::default().fg(self.selection_bg)
 	}
 
+	pub const fn selection_bg(&self) -> Color {
+		self.selection_bg
+	}
+
+	pub fn warning(&self) -> Style {
+		Style::default().fg(self.diff_file_modified)
+	}
+
 	pub fn block(&self, focus: bool) -> Style {
 		if focus {
 			Style::default().fg(self.block_border_focused)
@@ -306,10 +314,6 @@ impl Theme {
 		Style::default()
 			.fg(self.push_gauge_fg)
 			.bg(self.push_gauge_bg)
-	}
-
-	pub fn attention_block() -> Style {
-		Style::default().fg(Color::Yellow)
 	}
 
 	fn load_patch(theme_path: &PathBuf) -> Result<ThemePatch> {

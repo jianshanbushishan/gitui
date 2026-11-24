@@ -16,12 +16,15 @@ use asyncgit::{
 	sync::{self, CommitId, RepoPath, RepoPathRef},
 	AsyncGitNotification, CommitFilesParams,
 };
-use crossterm::event::{Event, MouseButton, MouseEventKind};
+use crossterm::event::{
+	Event, KeyCode, MouseButton, MouseEventKind,
+};
 use ratatui::layout::{
 	Constraint, Direction, Layout, Position, Rect,
 };
 use std::cell::Cell;
 
+#[allow(clippy::struct_excessive_bools)]
 pub struct StashList {
 	repo: RepoPathRef,
 	list: CommitList,
@@ -30,30 +33,38 @@ pub struct StashList {
 	queue: Queue,
 	key_config: SharedKeyConfig,
 	options: SharedOptions,
+	theme: crate::ui::style::SharedTheme,
 	total_area: Cell<Rect>,
 	list_area: Cell<Rect>,
 	details_area: Cell<Rect>,
 	dragging_split: bool,
+	hover_split: bool,
+	details_zoomed: bool,
 }
 
 impl StashList {
 	///
 	pub fn new(env: &Environment) -> Self {
+		let mut list = CommitList::new(
+			env,
+			&strings::stashlist_title(&env.key_config),
+		);
+		list.set_empty_hint("No stashes");
 		Self {
 			visible: false,
-			list: CommitList::new(
-				env,
-				&strings::stashlist_title(&env.key_config),
-			),
+			list,
 			commit_details: CommitDetailsComponent::new(env),
 			queue: env.queue.clone(),
 			key_config: env.key_config.clone(),
 			repo: env.repo.clone(),
 			options: env.options.clone(),
+			theme: env.theme.clone(),
 			total_area: Cell::new(Rect::default()),
 			list_area: Cell::new(Rect::default()),
 			details_area: Cell::new(Rect::default()),
 			dragging_split: false,
+			hover_split: false,
+			details_zoomed: false,
 		}
 	}
 
@@ -197,21 +208,40 @@ impl DrawableComponent for StashList {
 	) -> Result<()> {
 		self.total_area.set(rect);
 		if self.commit_details.is_visible() {
-			let left_ratio = self.options.borrow().log_left_ratio();
-			let right_ratio = 100 - left_ratio;
+			if self.details_zoomed {
+				self.list_area.set(Rect::default());
+				self.details_area.set(rect);
+				self.commit_details.draw(f, rect)?;
+			} else {
+				let left_ratio = self.options.borrow().log_left_ratio();
+				let right_ratio = 100 - left_ratio;
 
-			let chunks = Layout::default()
-				.direction(Direction::Horizontal)
-				.constraints([
-					Constraint::Percentage(left_ratio),
-					Constraint::Percentage(right_ratio),
-				])
-				.split(rect);
+				let chunks = Layout::default()
+					.direction(Direction::Horizontal)
+					.constraints([
+						Constraint::Percentage(left_ratio),
+						Constraint::Percentage(right_ratio),
+					])
+					.split(rect);
 
-			self.list_area.set(chunks[0]);
-			self.details_area.set(chunks[1]);
-			self.list.draw(f, chunks[0])?;
-			self.commit_details.draw(f, chunks[1])?;
+				self.list_area.set(chunks[0]);
+				self.details_area.set(chunks[1]);
+				self.list.draw(f, chunks[0])?;
+				self.commit_details.draw(f, chunks[1])?;
+				if self.options.borrow().mouse_support()
+					|| self.dragging_split
+					|| self.hover_split
+				{
+					crate::ui::draw_split_handle(
+						f.buffer_mut(),
+						chunks[1].x,
+						rect.y,
+						rect.height,
+						self.dragging_split || self.hover_split,
+						&self.theme,
+					);
+				}
+			}
 			self.commit_details.files().draw_popup(f)?;
 		} else {
 			self.list_area.set(rect);
@@ -284,7 +314,8 @@ impl Component for StashList {
 				let details_area = self.details_area.get();
 				match mouse.kind {
 					MouseEventKind::Down(MouseButton::Left) => {
-						if self.commit_details.is_visible()
+						if !self.details_zoomed
+							&& self.commit_details.is_visible()
 							&& total.contains(pos)
 							&& total.width >= 20
 							&& mouse.column.abs_diff(details_area.x) <= 1
@@ -322,6 +353,14 @@ impl Component for StashList {
 							.set_log_left_ratio_preview(ratio);
 						return Ok(EventState::Consumed);
 					}
+					MouseEventKind::Moved => {
+						let hovering = self.commit_details.is_visible()
+							&& !self.details_zoomed
+							&& total.contains(pos)
+							&& total.width >= 20
+							&& mouse.column.abs_diff(details_area.x) <= 1;
+						self.hover_split = hovering;
+					}
 					MouseEventKind::Up(MouseButton::Left)
 						if self.dragging_split =>
 					{
@@ -358,8 +397,21 @@ impl Component for StashList {
 			}
 
 			if let Event::Key(k) = ev {
+				if k.modifiers.is_empty()
+					&& k.code == KeyCode::Char('z')
+					&& self.commit_details.is_visible()
+				{
+					self.details_zoomed = !self.details_zoomed;
+					if self.details_zoomed {
+						self.commit_details.focus_details();
+					}
+					return Ok(EventState::Consumed);
+				}
 				if key_match(k, self.key_config.keys.enter) {
 					self.commit_details.toggle_visible()?;
+					if !self.commit_details.is_visible() {
+						self.details_zoomed = false;
+					}
 					self.update_commit_details()?;
 					return Ok(EventState::Consumed);
 				} else if key_match(k, self.key_config.keys.stash_pop)

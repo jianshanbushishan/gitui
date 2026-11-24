@@ -1,15 +1,13 @@
 use crate::components::{
 	time_to_string, visibility_blocking, CommandBlocking,
 	CommandInfo, Component, DrawableComponent, EventState,
-	FuzzyFinderTarget, VerticalScroll,
+	FuzzyFinderTarget, InputType, TextInputComponent, VerticalScroll,
 };
 use crate::{
 	app::Environment,
 	components::ScrollType,
 	keys::{key_match, SharedKeyConfig},
-	queue::{
-		Action, InternalEvent, NeedsUpdate, Queue, StackablePopupOpen,
-	},
+	queue::{Action, InternalEvent, Queue, StackablePopupOpen},
 	repo_operation::RepoOperation,
 	strings, try_or_popup,
 	ui::{self, Size},
@@ -17,20 +15,19 @@ use crate::{
 use anyhow::Result;
 use asyncgit::{
 	sync::{
-		self,
 		branch::{BranchDetails, LocalBranch, RemoteBranch},
 		get_branches_info, BranchInfo, BranchType, CommitId,
-		RepoPathRef, RepoState,
+		RepoPathRef,
 	},
 	AsyncGitNotification,
 };
-use crossterm::event::{Event, KeyEvent};
+use crossterm::event::{
+	Event, KeyEvent, MouseButton, MouseEventKind,
+};
 use ratatui::{
-	layout::{
-		Alignment, Constraint, Direction, Layout, Margin, Rect,
-	},
-	text::{Line, Span, Text},
-	widgets::{Block, BorderType, Borders, Paragraph, Tabs},
+	layout::{Constraint, Direction, Layout, Margin, Position, Rect},
+	text::{Line, Span},
+	widgets::{Block, BorderType, Borders, Tabs},
 	Frame,
 };
 use std::cell::Cell;
@@ -41,17 +38,25 @@ use unicode_width::UnicodeWidthStr;
 use super::InspectCommitOpen;
 
 ///
+#[allow(clippy::struct_excessive_bools)]
 pub struct BranchListPopup {
 	repo: RepoPathRef,
+	all_branches: Vec<BranchInfo>,
 	branches: Vec<BranchInfo>,
 	longest_branch_name_width: usize,
 	remote_text_width: usize,
+	prefix_width: usize,
+	filtering: bool,
+	filter_input: TextInputComponent,
 	local: bool,
 	has_remotes: bool,
 	visible: bool,
 	selection: u16,
 	scroll: VerticalScroll,
 	current_height: Cell<u16>,
+	last_area: Cell<Rect>,
+	tabs_area: Cell<Rect>,
+	list_area: Cell<Rect>,
 	queue: Queue,
 	theme: SharedTheme,
 	key_config: SharedKeyConfig,
@@ -71,6 +76,7 @@ impl DrawableComponent for BranchListPopup {
 			let area =
 				ui::rect_inside(MIN_SIZE, f.area().into(), area);
 			let area = area.intersection(rect);
+			self.last_area.set(area);
 
 			ui::clear_popup_area(f, area);
 
@@ -91,16 +97,31 @@ impl DrawableComponent for BranchListPopup {
 				horizontal: 1,
 			});
 
-			let chunks = Layout::default()
-				.direction(Direction::Vertical)
-				.constraints([
-					Constraint::Length(2),
-					Constraint::Min(1),
-				])
-				.split(area);
-
-			self.draw_tabs(f, chunks[0]);
-			self.draw_list(f, chunks[1])?;
+			let show_filter = self.filtering
+				|| !self.filter_input.get_text().is_empty();
+			if show_filter {
+				let chunks = Layout::default()
+					.direction(Direction::Vertical)
+					.constraints([
+						Constraint::Length(2),
+						Constraint::Length(2),
+						Constraint::Min(1),
+					])
+					.split(area);
+				self.draw_tabs(f, chunks[0]);
+				self.draw_filter_bar(f, chunks[1])?;
+				self.draw_list(f, chunks[2])?;
+			} else {
+				let chunks = Layout::default()
+					.direction(Direction::Vertical)
+					.constraints([
+						Constraint::Length(2),
+						Constraint::Min(1),
+					])
+					.split(area);
+				self.draw_tabs(f, chunks[0]);
+				self.draw_list(f, chunks[1])?;
+			}
 		}
 
 		Ok(())
@@ -130,104 +151,26 @@ impl Component for BranchListPopup {
 			return Ok(EventState::NotConsumed);
 		}
 
+		if let Event::Mouse(mouse) = ev {
+			return self.handle_mouse(*mouse);
+		}
+
 		if let Event::Key(e) = ev {
+			if self.filtering {
+				return self.handle_filter_key(ev, e);
+			}
+			if e.code == crossterm::event::KeyCode::Char('/')
+				&& e.modifiers.is_empty()
+			{
+				self.filtering = true;
+				self.filter_input.show()?;
+				return Ok(EventState::Consumed);
+			}
 			if self.move_event(e)?.is_consumed() {
 				return Ok(EventState::Consumed);
 			}
 
-			let selection_is_cur_branch =
-				self.selection_is_cur_branch();
-
-			if key_match(e, self.key_config.keys.enter) {
-				try_or_popup!(
-					self,
-					"switch branch error:",
-					self.switch_to_selected_branch()
-				);
-			} else if key_match(
-				e,
-				self.key_config.keys.branch_view_log,
-			) {
-				self.view_selected_history();
-			} else if key_match(e, self.key_config.keys.create_branch)
-				&& self.local
-			{
-				self.queue.push(InternalEvent::CreateBranch);
-			} else if key_match(e, self.key_config.keys.rename_branch)
-				&& self.valid_selection()
-			{
-				self.rename_branch();
-			} else if key_match(e, self.key_config.keys.delete_branch)
-				&& !selection_is_cur_branch
-				&& self.valid_selection()
-			{
-				self.delete_branch();
-			} else if key_match(e, self.key_config.keys.merge_branch)
-				&& !selection_is_cur_branch
-				&& self.valid_selection()
-			{
-				try_or_popup!(
-					self,
-					"merge branch error:",
-					self.merge_branch()
-				);
-			} else if key_match(e, self.key_config.keys.rebase_branch)
-				&& !selection_is_cur_branch
-				&& self.valid_selection()
-			{
-				try_or_popup!(
-					self,
-					"rebase error:",
-					self.rebase_branch()
-				);
-			} else if key_match(e, self.key_config.keys.move_right)
-				&& self.valid_selection()
-			{
-				self.inspect_head_of_branch();
-			} else if key_match(
-				e,
-				self.key_config.keys.compare_commits,
-			) && self.valid_selection()
-			{
-				self.hide();
-				if let Some(commit_id) = self.get_selected_commit() {
-					self.queue.push(InternalEvent::OpenPopup(
-						StackablePopupOpen::CompareCommits(
-							InspectCommitOpen::new(commit_id),
-						),
-					));
-				}
-			} else if key_match(e, self.key_config.keys.fetch)
-				&& self.has_remotes
-			{
-				self.queue.push(InternalEvent::FetchRemotes);
-			} else if key_match(e, self.key_config.keys.view_remotes)
-			{
-				self.queue.push(InternalEvent::ViewRemotes);
-			} else if key_match(e, self.key_config.keys.reset_branch)
-			{
-				if let Some(commit_id) = self.get_selected_commit() {
-					self.queue.push(InternalEvent::OpenResetPopup(
-						commit_id,
-					));
-				}
-			} else if key_match(
-				e,
-				self.key_config.keys.cmd_bar_toggle,
-			) {
-				//do not consume if its the more key
-				return Ok(EventState::NotConsumed);
-			} else if key_match(e, self.key_config.keys.branch_find) {
-				let branches = self
-					.branches
-					.iter()
-					.map(|b| b.name.clone())
-					.collect();
-				self.queue.push(InternalEvent::OpenFuzzyFinder(
-					branches,
-					FuzzyFinderTarget::Branches,
-				));
-			}
+			return Ok(self.handle_action_key(e));
 		}
 
 		Ok(EventState::Consumed)
@@ -237,8 +180,14 @@ impl Component for BranchListPopup {
 		self.visible
 	}
 
+	fn is_input_mode(&self) -> bool {
+		self.visible && self.filtering
+	}
+
 	fn hide(&mut self) {
 		self.visible = false;
+		self.filtering = false;
+		self.filter_input.hide();
 	}
 
 	fn show(&mut self) -> Result<()> {
@@ -249,16 +198,106 @@ impl Component for BranchListPopup {
 }
 
 impl BranchListPopup {
+	#[allow(clippy::cognitive_complexity)]
+	fn handle_action_key(
+		&mut self,
+		e: &crossterm::event::KeyEvent,
+	) -> EventState {
+		let selection_is_cur_branch = self.selection_is_cur_branch();
+
+		if key_match(e, self.key_config.keys.enter) {
+			try_or_popup!(
+				self,
+				"switch branch error:",
+				self.switch_to_selected_branch()
+			);
+		} else if key_match(e, self.key_config.keys.branch_view_log) {
+			self.view_selected_history();
+		} else if key_match(e, self.key_config.keys.create_branch)
+			&& self.local
+		{
+			self.queue.push(InternalEvent::CreateBranch);
+		} else if key_match(e, self.key_config.keys.rename_branch)
+			&& self.valid_selection()
+		{
+			self.rename_branch();
+		} else if key_match(e, self.key_config.keys.delete_branch)
+			&& !selection_is_cur_branch
+			&& self.valid_selection()
+		{
+			self.delete_branch();
+		} else if key_match(e, self.key_config.keys.merge_branch)
+			&& !selection_is_cur_branch
+			&& self.valid_selection()
+		{
+			self.merge_branch();
+		} else if key_match(e, self.key_config.keys.rebase_branch)
+			&& !selection_is_cur_branch
+			&& self.valid_selection()
+		{
+			self.rebase_branch();
+		} else if key_match(e, self.key_config.keys.move_right)
+			&& self.valid_selection()
+		{
+			self.inspect_head_of_branch();
+		} else if key_match(e, self.key_config.keys.compare_commits)
+			&& self.valid_selection()
+		{
+			self.hide();
+			if let Some(commit_id) = self.get_selected_commit() {
+				self.queue.push(InternalEvent::OpenPopup(
+					StackablePopupOpen::CompareCommits(
+						InspectCommitOpen::new(commit_id),
+					),
+				));
+			}
+		} else if key_match(e, self.key_config.keys.fetch)
+			&& self.has_remotes
+		{
+			self.queue.push(InternalEvent::FetchRemotes);
+		} else if key_match(e, self.key_config.keys.view_remotes) {
+			self.queue.push(InternalEvent::ViewRemotes);
+		} else if key_match(e, self.key_config.keys.reset_branch) {
+			if let Some(commit_id) = self.get_selected_commit() {
+				self.queue
+					.push(InternalEvent::OpenResetPopup(commit_id));
+			}
+		} else if key_match(e, self.key_config.keys.cmd_bar_toggle) {
+			return EventState::NotConsumed;
+		} else if key_match(e, self.key_config.keys.branch_find) {
+			let branches =
+				self.branches.iter().map(|b| b.name.clone()).collect();
+			self.queue.push(InternalEvent::OpenFuzzyFinder(
+				branches,
+				FuzzyFinderTarget::Branches,
+			));
+		}
+
+		EventState::Consumed
+	}
+
 	pub fn show_local(&mut self) -> Result<()> {
 		self.local = true;
 		self.open()
 	}
 
 	pub fn new(env: &Environment) -> Self {
+		let mut filter_input = TextInputComponent::new(
+			env,
+			"",
+			"filter branches..",
+			false,
+		)
+		.with_input_type(InputType::Singleline);
+		filter_input.embed();
 		Self {
+			all_branches: Vec::new(),
 			branches: Vec::new(),
 			longest_branch_name_width: 0,
 			remote_text_width: 0,
+			prefix_width: 3,
+			filtering: false,
+			filter_input,
 			local: true,
 			has_remotes: false,
 			visible: false,
@@ -268,24 +307,243 @@ impl BranchListPopup {
 			theme: env.theme.clone(),
 			key_config: env.key_config.clone(),
 			current_height: Cell::new(0),
+			last_area: Cell::new(Rect::default()),
+			tabs_area: Cell::new(Rect::default()),
+			list_area: Cell::new(Rect::default()),
 			repo: env.repo.clone(),
 		}
 	}
 
+	fn handle_filter_key(
+		&mut self,
+		ev: &Event,
+		e: &KeyEvent,
+	) -> Result<EventState> {
+		if key_match(e, self.key_config.keys.exit_popup) {
+			if !self.filter_input.get_text().is_empty() {
+				self.filter_input.clear();
+				self.apply_filter()?;
+			}
+			self.filtering = false;
+			self.filter_input.hide();
+			return Ok(EventState::Consumed);
+		}
+		if key_match(e, self.key_config.keys.enter) {
+			self.filtering = false;
+			self.filter_input.hide();
+			return Ok(EventState::Consumed);
+		}
+		if key_match(e, self.key_config.keys.popup_down)
+			|| (e.code == crossterm::event::KeyCode::Down
+				&& e.modifiers.is_empty())
+		{
+			let _ = self.move_selection(ScrollType::Down);
+			return Ok(EventState::Consumed);
+		}
+		if key_match(e, self.key_config.keys.popup_up)
+			|| (e.code == crossterm::event::KeyCode::Up
+				&& e.modifiers.is_empty())
+		{
+			let _ = self.move_selection(ScrollType::Up);
+			return Ok(EventState::Consumed);
+		}
+		if key_match(e, self.key_config.keys.page_down) {
+			let _ = self.move_selection(ScrollType::PageDown);
+			return Ok(EventState::Consumed);
+		}
+		if key_match(e, self.key_config.keys.page_up) {
+			let _ = self.move_selection(ScrollType::PageUp);
+			return Ok(EventState::Consumed);
+		}
+		if self.filter_input.event(ev)?.is_consumed() {
+			self.apply_filter()?;
+		}
+		Ok(EventState::Consumed)
+	}
+
+	fn apply_filter(&mut self) -> Result<()> {
+		let query = self.filter_input.get_text().trim().to_lowercase();
+		let selected_ref = self
+			.branches
+			.get(usize::from(self.selection))
+			.map(|b| b.reference.clone());
+
+		let filtered: Vec<BranchInfo> = if query.is_empty() {
+			self.all_branches.clone()
+		} else {
+			self.all_branches
+				.iter()
+				.filter(|b| {
+					b.name.to_lowercase().contains(&query)
+						|| Self::remote_text(b).is_some_and(|r| {
+							r.to_lowercase().contains(&query)
+						})
+						|| b.top_commit_message
+							.to_lowercase()
+							.contains(&query)
+				})
+				.cloned()
+				.collect()
+		};
+
+		let selection = selected_ref
+			.and_then(|r| {
+				filtered.iter().position(|b| b.reference == r)
+			})
+			.unwrap_or(0);
+		self.longest_branch_name_width = filtered
+			.iter()
+			.map(|branch| branch.name.width())
+			.max()
+			.unwrap_or_default();
+		self.remote_text_width = filtered
+			.iter()
+			.filter_map(Self::remote_text)
+			.map(UnicodeWidthStr::width)
+			.max()
+			.unwrap_or_default();
+		self.prefix_width = filtered
+			.iter()
+			.map(|b| 1 + Self::branch_status_text(b).width() + 1)
+			.max()
+			.unwrap_or(3)
+			.max(3);
+		self.branches = filtered;
+		self.set_selection(selection.try_into()?)?;
+		Ok(())
+	}
+
+	fn draw_filter_bar(&self, f: &mut Frame, r: Rect) -> Result<()> {
+		let count_label = format!(
+			" {}/{}",
+			self.branches.len(),
+			self.all_branches.len()
+		);
+		let count_w = u16::try_from(count_label.width()).unwrap_or(8);
+		let top_row = Rect::new(r.x, r.y, r.width, 1);
+		let h_chunks = Layout::default()
+			.direction(Direction::Horizontal)
+			.constraints([
+				Constraint::Length(8),
+				Constraint::Min(1),
+				Constraint::Length(count_w),
+			])
+			.split(top_row);
+		f.render_widget(
+			ratatui::widgets::Paragraph::new(Span::styled(
+				"Filter: ",
+				self.theme.title(true),
+			)),
+			h_chunks[0],
+		);
+		if self.filtering {
+			self.filter_input.draw(f, h_chunks[1])?;
+		} else {
+			f.render_widget(
+				ratatui::widgets::Paragraph::new(Span::styled(
+					self.filter_input.get_text(),
+					self.theme.text(false, false),
+				)),
+				h_chunks[1],
+			);
+		}
+		f.render_widget(
+			ratatui::widgets::Paragraph::new(Span::styled(
+				count_label,
+				self.theme.text(false, false),
+			)),
+			h_chunks[2],
+		);
+		f.render_widget(
+			Block::default()
+				.borders(Borders::BOTTOM)
+				.border_style(self.theme.block(false)),
+			r,
+		);
+		Ok(())
+	}
+
+	fn handle_mouse(
+		&mut self,
+		mouse: crossterm::event::MouseEvent,
+	) -> Result<EventState> {
+		let pos = Position::new(mouse.column, mouse.row);
+		let area = self.last_area.get();
+		let tabs_area = self.tabs_area.get();
+		let list_area = self.list_area.get();
+		match mouse.kind {
+			MouseEventKind::Down(MouseButton::Left) => {
+				if !area.is_empty() && !area.contains(pos) {
+					self.hide();
+					return Ok(EventState::Consumed);
+				}
+				if tabs_area.contains(pos) {
+					let rel_x = usize::from(
+						mouse.column.saturating_sub(tabs_area.x),
+					);
+					let divider_w =
+						strings::tab_divider(&self.key_config).width();
+					let local_w = 2 + "Local".width();
+					let remote_start = local_w + divider_w;
+					let remote_end =
+						remote_start + 2 + "Remote".width();
+					let clicked_local = if rel_x < local_w {
+						Some(true)
+					} else if rel_x >= remote_start
+						&& rel_x < remote_end
+					{
+						Some(false)
+					} else {
+						None
+					};
+					if let Some(new_local) = clicked_local {
+						if self.local != new_local {
+							self.local = new_local;
+							self.update_branches()?;
+						}
+					}
+				} else if list_area.contains(pos) {
+					let rel_row =
+						usize::from(mouse.row - list_area.y);
+					let target = self.scroll.get_top() + rel_row;
+					if target < self.branches.len() {
+						let _ = self.set_selection(
+							u16::try_from(target).unwrap_or(u16::MAX),
+						);
+					}
+				}
+			}
+			MouseEventKind::ScrollUp => {
+				let _ = self.move_selection(ScrollType::Up);
+			}
+			MouseEventKind::ScrollDown => {
+				let _ = self.move_selection(ScrollType::Down);
+			}
+			_ => {}
+		}
+		Ok(EventState::Consumed)
+	}
+
 	fn move_event(&mut self, e: &KeyEvent) -> Result<EventState> {
 		if key_match(e, self.key_config.keys.exit_popup) {
-			self.hide();
+			if self.filter_input.get_text().is_empty() {
+				self.hide();
+			} else {
+				self.filter_input.clear();
+				self.apply_filter()?;
+			}
+			return Ok(EventState::Consumed);
 		} else if key_match(e, self.key_config.keys.move_down)
 			|| key_match(e, self.key_config.keys.popup_down)
 		{
 			return self
-				.move_selection(ScrollType::Up)
+				.move_selection(ScrollType::Down)
 				.map(Into::into);
 		} else if key_match(e, self.key_config.keys.move_up)
 			|| key_match(e, self.key_config.keys.popup_up)
 		{
 			return self
-				.move_selection(ScrollType::Down)
+				.move_selection(ScrollType::Up)
 				.map(Into::into);
 		} else if key_match(e, self.key_config.keys.page_down) {
 			return self
@@ -315,6 +573,9 @@ impl BranchListPopup {
 
 	///
 	pub fn open(&mut self) -> Result<()> {
+		self.filter_input.clear();
+		self.filter_input.hide();
+		self.filtering = false;
 		self.show()?;
 		self.update_branches()?;
 
@@ -340,8 +601,10 @@ impl BranchListPopup {
 			if self.local {
 				self.check_remotes();
 			}
-			let selected_branch =
-				self.branches.get(usize::from(self.selection));
+			let selected_ref = self
+				.branches
+				.get(usize::from(self.selection))
+				.map(|b| b.reference.clone());
 			let mut branches =
 				get_branches_info(&self.repo.borrow(), self.local)?;
 			if !self.local {
@@ -363,26 +626,17 @@ impl BranchListPopup {
 					.cmp(&a.top_commit_time)
 					.then_with(|| a.name.cmp(&b.name))
 			});
-			let selection = selected_branch
-				.and_then(|selected| {
-					branches.iter().position(|branch| {
-						branch.reference == selected.reference
-					})
-				})
-				.unwrap_or_else(|| usize::from(self.selection));
-			self.longest_branch_name_width = branches
-				.iter()
-				.map(|branch| branch.name.width())
-				.max()
-				.unwrap_or_default();
-			self.remote_text_width = branches
-				.iter()
-				.filter_map(Self::remote_text)
-				.map(UnicodeWidthStr::width)
-				.max()
-				.unwrap_or_default();
-			self.branches = branches;
-			self.set_selection(selection.try_into()?)?;
+			self.all_branches = branches;
+			self.apply_filter()?;
+			if let Some(sel_ref) = selected_ref {
+				if let Some(pos) = self
+					.branches
+					.iter()
+					.position(|b| b.reference == sel_ref)
+				{
+					self.set_selection(pos.try_into()?)?;
+				}
+			}
 		}
 		Ok(())
 	}
@@ -415,36 +669,30 @@ impl BranchListPopup {
 		}
 	}
 
-	fn merge_branch(&mut self) -> Result<()> {
+	fn merge_branch(&self) {
 		if let Some(branch) =
 			self.branches.get(usize::from(self.selection))
 		{
-			sync::merge_branch(
-				&self.repo.borrow(),
-				&branch.name,
-				self.get_branch_type(),
-			)?;
-
-			self.hide_and_switch_tab()?;
+			self.queue.push(InternalEvent::ConfirmAction(
+				Action::MergeBranch(
+					branch.name.clone(),
+					self.get_branch_type(),
+				),
+			));
 		}
-
-		Ok(())
 	}
 
-	fn rebase_branch(&mut self) -> Result<()> {
+	fn rebase_branch(&self) {
 		if let Some(branch) =
 			self.branches.get(usize::from(self.selection))
 		{
-			sync::rebase_branch(
-				&self.repo.borrow(),
-				&branch.name,
-				self.get_branch_type(),
-			)?;
-
-			self.hide_and_switch_tab()?;
+			self.queue.push(InternalEvent::ConfirmAction(
+				Action::RebaseBranch(
+					branch.name.clone(),
+					self.get_branch_type(),
+				),
+			));
 		}
-
-		Ok(())
 	}
 
 	fn inspect_head_of_branch(&mut self) {
@@ -466,18 +714,6 @@ impl BranchListPopup {
 		}
 	}
 
-	fn hide_and_switch_tab(&mut self) -> Result<()> {
-		self.hide();
-		self.queue.push(InternalEvent::Update(NeedsUpdate::ALL));
-
-		if sync::repo_state(&self.repo.borrow())? != RepoState::Clean
-		{
-			self.queue.push(InternalEvent::TabSwitchStatus);
-		}
-
-		Ok(())
-	}
-
 	fn selection_is_cur_branch(&self) -> bool {
 		self.branches
 			.get(usize::from(self.selection))
@@ -495,8 +731,8 @@ impl BranchListPopup {
 	///
 	fn move_selection(&mut self, scroll: ScrollType) -> Result<bool> {
 		let new_selection = match scroll {
-			ScrollType::Up => self.selection.saturating_add(1),
-			ScrollType::Down => self.selection.saturating_sub(1),
+			ScrollType::Up => self.selection.saturating_sub(1),
+			ScrollType::Down => self.selection.saturating_add(1),
 			ScrollType::PageDown => self
 				.selection
 				.saturating_add(self.current_height.get()),
@@ -557,31 +793,57 @@ impl BranchListPopup {
 		)
 	}
 
-	const fn branch_status_symbol(branch: &BranchInfo) -> char {
-		match branch.details {
+	fn branch_status_text(branch: &BranchInfo) -> String {
+		match &branch.details {
 			BranchDetails::Local(LocalBranch {
-				has_upstream,
+				ahead_behind: Some((ahead, behind)),
 				..
-			}) if has_upstream => '↑',
+			}) if *ahead > 0 || *behind > 0 => {
+				match (*ahead > 0, *behind > 0) {
+					(true, true) => format!("↑{ahead}↓{behind}"),
+					(true, false) => format!("↑{ahead}"),
+					(false, true) => format!("↓{behind}"),
+					(false, false) => unreachable!(),
+				}
+			}
+			BranchDetails::Local(LocalBranch {
+				has_upstream: true,
+				..
+			}) => "↑".to_owned(),
 			BranchDetails::Remote(RemoteBranch {
-				has_tracking,
+				has_tracking: true,
 				..
-			}) if has_tracking => '↓',
-			_ => ' ',
+			}) => "↓".to_owned(),
+			_ => " ".to_owned(),
 		}
 	}
 
 	/// Get branches to display
-	fn get_text(
+	#[allow(clippy::too_many_lines)]
+	fn get_lines(
 		&self,
 		theme: &SharedTheme,
 		width_available: u16,
 		height: usize,
-	) -> Text<'_> {
+	) -> Vec<Line<'_>> {
 		const HEAD_SYMBOL: char = '*';
 		const EMPTY_SYMBOL: char = ' ';
 		const COMMIT_HASH_LENGTH: usize = 8;
-		const IS_HEAD_STAR_LENGTH: usize = 3; // "*  "
+
+		if self.branches.is_empty() {
+			return vec![Line::from(Span::styled(
+				if !self.filter_input.get_text().trim().is_empty() {
+					"No matching branches"
+				} else if self.local {
+					"No local branches"
+				} else {
+					"No remote branches"
+				},
+				theme.text(false, false),
+			))];
+		}
+
+		let prefix_width = self.prefix_width.max(3);
 
 		let mut txt = Vec::new();
 
@@ -599,7 +861,7 @@ impl BranchListPopup {
 			let width_without_time = usize::from(width_available)
 				.saturating_sub(time.len());
 			let content_width = width_without_time.saturating_sub(
-				COMMIT_HASH_LENGTH + IS_HEAD_STAR_LENGTH + 1,
+				COMMIT_HASH_LENGTH + prefix_width + 1,
 			);
 			let branch_name_width = (width_without_time * 40 / 100)
 				.min(content_width)
@@ -631,11 +893,12 @@ impl BranchListPopup {
 				.is_some_and(|details| details.is_head);
 			let is_head_str =
 				if is_head { HEAD_SYMBOL } else { EMPTY_SYMBOL };
-			let upstream_tracking_str =
-				Self::branch_status_symbol(displaybranch);
-
+			let status_str = Self::branch_status_text(displaybranch);
+			let raw_prefix = format!("{is_head_str}{status_str}");
+			let prefix_pad =
+				prefix_width.saturating_sub(raw_prefix.width());
 			let span_prefix = Span::styled(
-				format!("{is_head_str}{upstream_tracking_str} "),
+				format!("{raw_prefix}{:prefix_pad$}", ""),
 				theme.commit_author(selected),
 			);
 			let span_hash = Span::styled(
@@ -676,7 +939,21 @@ impl BranchListPopup {
 			txt.push(Line::from(spans));
 		}
 
-		Text::from(txt)
+		txt
+	}
+
+	#[cfg(test)]
+	fn get_text(
+		&self,
+		theme: &SharedTheme,
+		width_available: u16,
+		height: usize,
+	) -> ratatui::text::Text<'_> {
+		ratatui::text::Text::from(self.get_lines(
+			theme,
+			width_available,
+			height,
+		))
 	}
 
 	///
@@ -699,6 +976,7 @@ impl BranchListPopup {
 	}
 
 	fn draw_tabs(&self, f: &mut Frame, r: Rect) {
+		self.tabs_area.set(r);
 		let tabs: Vec<Line> =
 			[Span::raw("Local"), Span::raw("Remote")]
 				.iter()
@@ -722,6 +1000,7 @@ impl BranchListPopup {
 	}
 
 	fn draw_list(&self, f: &mut Frame, r: Rect) -> Result<()> {
+		self.list_area.set(r);
 		let height_in_lines = r.height as usize;
 		self.current_height.set(height_in_lines.try_into()?);
 
@@ -731,15 +1010,9 @@ impl BranchListPopup {
 			height_in_lines,
 		);
 
-		f.render_widget(
-			Paragraph::new(self.get_text(
-				&self.theme,
-				r.width,
-				height_in_lines,
-			))
-			.alignment(Alignment::Left),
-			r,
-		);
+		let lines =
+			self.get_lines(&self.theme, r.width, height_in_lines);
+		ui::render_lines(f.buffer_mut(), r, &lines);
 
 		let mut r = r;
 		r.width += 1;
@@ -1177,5 +1450,89 @@ mod tests {
 		);
 		assert!(!popup.is_visible());
 		assert!(env.queue.pop().is_none());
+	}
+
+	#[test]
+	fn test_ahead_behind_prefix_and_inline_filter() {
+		let dir = tempfile::tempdir().unwrap();
+		let repo = git2::Repository::init(dir.path()).unwrap();
+		let sig =
+			git2::Signature::now("Test", "test@example.com").unwrap();
+		let empty_tree = repo
+			.find_tree(repo.treebuilder(None).unwrap().write().unwrap())
+			.unwrap();
+		let c1 = repo
+			.commit(Some("HEAD"), &sig, &sig, "init", &empty_tree, &[])
+			.unwrap();
+		let c1_obj = repo.find_commit(c1).unwrap();
+		let c_local = repo
+			.commit(
+				Some("HEAD"),
+				&sig,
+				&sig,
+				"local ahead",
+				&empty_tree,
+				&[&c1_obj],
+			)
+			.unwrap();
+		let c_remote = repo
+			.commit(
+				None,
+				&sig,
+				&sig,
+				"remote behind",
+				&empty_tree,
+				&[&c1_obj],
+			)
+			.unwrap();
+		repo.remote("origin", "https://example.com/repo.git")
+			.unwrap();
+		repo.reference(
+			"refs/remotes/origin/main",
+			c_remote,
+			true,
+			"remote ref",
+		)
+		.unwrap();
+		let head_name = repo.head().unwrap().shorthand().unwrap().to_owned();
+		repo.find_branch(&head_name, git2::BranchType::Local)
+			.unwrap()
+			.set_upstream(Some("origin/main"))
+			.unwrap();
+		repo.branch("feature-xyz", &repo.find_commit(c_local).unwrap(), false)
+			.unwrap();
+
+		let env = Environment::test_env();
+		*env.repo.borrow_mut() = RepoPath::Path(dir.path().into());
+		let mut popup = BranchListPopup::new(&env);
+		popup.local = true;
+		popup.open().unwrap();
+
+		let text = popup.get_text(&env.theme, 120, 10);
+		let main_line = text
+			.lines
+			.iter()
+			.find(|l| l.spans[1].content.trim() == head_name)
+			.expect("head branch line");
+		assert!(main_line.spans[0].content.contains("↑1↓1"));
+
+		// Trigger inline filter with '/' and type "feature"
+		popup
+			.event(&Event::Key(KeyEvent::new(
+				KeyCode::Char('/'),
+				KeyModifiers::NONE,
+			)))
+			.unwrap();
+		assert!(popup.is_input_mode());
+		for ch in "feature".chars() {
+			popup
+				.event(&Event::Key(KeyEvent::new(
+					KeyCode::Char(ch),
+					KeyModifiers::NONE,
+				)))
+				.unwrap();
+		}
+		assert_eq!(popup.branches.len(), 1);
+		assert_eq!(popup.branches[0].name, "feature-xyz");
 	}
 }

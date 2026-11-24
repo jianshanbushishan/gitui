@@ -31,6 +31,7 @@ pub type CommitTags = Vec<Tag>;
 pub type Tags = BTreeMap<CommitId, CommitTags>;
 
 ///
+#[derive(Clone)]
 pub struct TagWithMetadata {
 	///
 	pub name: String,

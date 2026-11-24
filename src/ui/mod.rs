@@ -174,14 +174,48 @@ pub fn rect_inside(min: Size, max: Size, r: Rect) -> Rect {
 	)
 }
 
+pub fn draw_split_handle(
+	buf: &mut ratatui::buffer::Buffer,
+	split_x: u16,
+	top: u16,
+	height: u16,
+	active: bool,
+	theme: &style::Theme,
+) {
+	if split_x == 0 || height < 5 {
+		return;
+	}
+	let mid_y = top.saturating_add(height / 2);
+	let style = if active {
+		theme.commandbar_key()
+	} else {
+		theme.block(true)
+	};
+	let start_y = mid_y.saturating_sub(1).max(top.saturating_add(1));
+	let end_y = mid_y
+		.saturating_add(1)
+		.min(top.saturating_add(height.saturating_sub(2)));
+	for y in start_y..=end_y {
+		let glyph = if y == mid_y && active { "╋" } else { "┃" };
+		for x in [split_x.saturating_sub(1), split_x] {
+			if let Some(cell) = buf.cell_mut((x, y)) {
+				if cell.symbol() == "│" {
+					cell.set_symbol(glyph);
+					cell.set_style(style);
+				}
+			}
+		}
+	}
+}
+
 pub fn centered_rect_absolute(
 	width: u16,
 	height: u16,
 	r: Rect,
 ) -> Rect {
 	Rect::new(
-		(r.width.saturating_sub(width)) / 2,
-		(r.height.saturating_sub(height)) / 2,
+		r.x.saturating_add((r.width.saturating_sub(width)) / 2),
+		r.y.saturating_add((r.height.saturating_sub(height)) / 2),
 		width.min(r.width),
 		height.min(r.height),
 	)
@@ -375,5 +409,24 @@ mod test {
 		);
 		assert_eq!(tiny.width, 20);
 		assert_eq!(tiny.height, 6);
+	}
+
+	#[test]
+	fn test_draw_split_handle_replaces_only_vertical_borders() {
+		let area = Rect::new(0, 0, 20, 9);
+		let mut buf = ratatui::buffer::Buffer::empty(area);
+		for y in 0..9 {
+			buf[(9, y)].set_symbol(if y == 4 { "╯" } else { "│" });
+			buf[(10, y)].set_symbol("│");
+		}
+		let theme = super::style::Theme::default();
+		super::draw_split_handle(&mut buf, 10, 0, 9, true, &theme);
+
+		assert_eq!(buf[(9, 3)].symbol(), "┃");
+		assert_eq!(buf[(10, 3)].symbol(), "┃");
+		assert_eq!(buf[(9, 4)].symbol(), "╯");
+		assert_eq!(buf[(10, 4)].symbol(), "╋");
+		assert_eq!(buf[(9, 5)].symbol(), "┃");
+		assert_eq!(buf[(10, 5)].symbol(), "┃");
 	}
 }

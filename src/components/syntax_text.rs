@@ -825,13 +825,98 @@ fn split_and_highlight(
 	}
 }
 
-fn case_insensitive_ranges(
+pub fn highlight_line_matches(
+	line: &mut ratatui::text::Line<'static>,
+	needle: &str,
+	active: bool,
+) {
+	if needle.is_empty() || line.spans.is_empty() {
+		return;
+	}
+	let full: String = line
+		.spans
+		.iter()
+		.map(|s| s.content.as_ref())
+		.collect();
+	let ranges = case_insensitive_ranges(&full, needle);
+	if ranges.is_empty() {
+		return;
+	}
+	let mut hl = Style::default().add_modifier(Modifier::REVERSED);
+	if active {
+		hl = hl.add_modifier(Modifier::BOLD);
+	}
+	let mut new_spans: Vec<Span<'static>> =
+		Vec::with_capacity(line.spans.len() + ranges.len());
+	let mut span_start = 0_usize;
+	let mut range_idx = 0_usize;
+	for span in line.spans.drain(..) {
+		let span_len = span.content.len();
+		let span_end = span_start + span_len;
+		while range_idx < ranges.len()
+			&& ranges[range_idx].end <= span_start
+		{
+			range_idx += 1;
+		}
+		if range_idx >= ranges.len()
+			|| ranges[range_idx].start >= span_end
+		{
+			new_spans.push(span);
+			span_start = span_end;
+			continue;
+		}
+		let base_style = span.style;
+		let content = span.content.as_ref();
+		let mut cursor = 0_usize;
+		while range_idx < ranges.len()
+			&& ranges[range_idx].start < span_end
+		{
+			let m_start = ranges[range_idx].start.saturating_sub(span_start);
+			let m_end = ranges[range_idx].end.min(span_end) - span_start;
+			if m_start > cursor {
+				new_spans.push(Span::styled(
+					content[cursor..m_start].to_owned(),
+					base_style,
+				));
+			}
+			if m_end > m_start {
+				new_spans.push(Span::styled(
+					content[m_start..m_end].to_owned(),
+					base_style.patch(hl),
+				));
+			}
+			cursor = m_end;
+			if ranges[range_idx].end <= span_end {
+				range_idx += 1;
+			} else {
+				break;
+			}
+		}
+		if cursor < content.len() {
+			new_spans.push(Span::styled(
+				content[cursor..].to_owned(),
+				base_style,
+			));
+		}
+		span_start = span_end;
+	}
+	line.spans = new_spans;
+}
+
+pub fn case_insensitive_ranges(
 	content: &str,
 	needle: &str,
 ) -> Vec<std::ops::Range<usize>> {
 	if needle.is_empty() || content.is_empty() {
 		return Vec::new();
 	}
+	let needle_lower;
+	let needle = if needle.chars().any(char::is_uppercase) {
+		needle_lower = needle.to_lowercase();
+		needle_lower.as_str()
+	} else {
+		needle
+	};
 	let lower = content.to_lowercase();
 	if !lower.contains(needle) {
 		return Vec::new();
@@ -954,7 +1039,12 @@ mod tests {
 	};
 	use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 	use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
-	use ratatui::{backend::TestBackend, Terminal};
+	use ratatui::{
+		backend::TestBackend,
+		style::{Modifier, Style},
+		text::Span,
+		Terminal,
+	};
 	use std::io::Cursor;
 
 	#[test]
@@ -1211,5 +1301,30 @@ mod tests {
 		);
 
 		assert_eq!(component.render_generation.get(), generation);
+	}
+
+	#[test]
+	fn highlight_line_matches_crosses_spans_and_handles_mixed_case() {
+		let mut line = ratatui::text::Line::from(vec![
+			Span::raw("foo"),
+			Span::styled(
+				"Bar",
+				Style::default().fg(ratatui::style::Color::Red),
+			),
+			Span::raw("Baz"),
+		]);
+		super::highlight_line_matches(&mut line, "FoObAr", true);
+		let hl_text: String = line
+			.spans
+			.iter()
+			.filter(|s| s.style.add_modifier.contains(Modifier::REVERSED))
+			.map(|s| s.content.as_ref())
+			.collect();
+		assert_eq!(hl_text, "fooBar");
+		assert!(line
+			.spans
+			.iter()
+			.filter(|s| s.style.add_modifier.contains(Modifier::REVERSED))
+			.all(|s| s.style.add_modifier.contains(Modifier::BOLD)));
 	}
 }

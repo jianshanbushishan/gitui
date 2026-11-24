@@ -2,12 +2,14 @@ use crate::{
 	components::CommandInfo, keys::SharedKeyConfig, strings,
 	ui::style::SharedTheme,
 };
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
-	layout::{Alignment, Rect},
+	layout::{Alignment, Position, Rect},
 	text::{Line, Span},
 	widgets::Paragraph,
 	Frame,
 };
+use std::cell::Cell;
 use unicode_width::UnicodeWidthStr;
 
 enum DrawListEntry {
@@ -34,6 +36,7 @@ pub struct CommandBar {
 	width: u16,
 	expandable: bool,
 	expanded: bool,
+	more_rect: Cell<Option<Rect>>,
 }
 
 impl CommandBar {
@@ -67,6 +70,7 @@ impl CommandBar {
 			width: 0,
 			expandable: false,
 			expanded: false,
+			more_rect: Cell::new(None),
 		}
 	}
 
@@ -261,9 +265,27 @@ impl CommandBar {
 		}
 	}
 
+	pub const fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+		if !self.expandable {
+			return false;
+		}
+		if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+		{
+			if let Some(rect) = self.more_rect.get() {
+				if rect.contains(Position::new(mouse.column, mouse.row))
+				{
+					self.toggle_more();
+					return true;
+				}
+			}
+		}
+		false
+	}
+
 	pub fn draw(&self, f: &mut Frame, r: Rect) {
 		let more_width = self.more_width;
 		if r.width < more_width {
+			self.more_rect.set(None);
 			return;
 		}
 
@@ -274,12 +296,13 @@ impl CommandBar {
 		);
 
 		if self.expandable {
-			let r = Rect::new(
-				r.width.saturating_sub(more_width),
+			let more_r = Rect::new(
+				r.x.saturating_add(r.width.saturating_sub(more_width)),
 				r.y + r.height.saturating_sub(1),
 				more_width.min(r.width),
 				1.min(r.height),
 			);
+			self.more_rect.set(Some(more_r));
 
 			let line = if self.expanded {
 				self.less_line.clone()
@@ -288,8 +311,10 @@ impl CommandBar {
 			};
 			f.render_widget(
 				Paragraph::new(line).alignment(Alignment::Right),
-				r,
+				more_r,
 			);
+		} else {
+			self.more_rect.set(None);
 		}
 	}
 }

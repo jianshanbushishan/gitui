@@ -51,6 +51,7 @@ enum TreeLoadState {
 	NoCommits,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 pub struct RevisionFilesComponent {
 	repo: RepoPathRef,
 	queue: Queue,
@@ -75,6 +76,8 @@ pub struct RevisionFilesComponent {
 	tree_area: Cell<Rect>,
 	preview_area: Cell<Rect>,
 	dragging_split: bool,
+	hover_split: bool,
+	preview_zoomed: bool,
 }
 
 impl RevisionFilesComponent {
@@ -112,6 +115,8 @@ impl RevisionFilesComponent {
 			tree_area: Cell::new(Rect::default()),
 			preview_area: Cell::new(Rect::default()),
 			dragging_split: false,
+			hover_split: false,
+			preview_zoomed: false,
 		}
 	}
 
@@ -632,24 +637,43 @@ impl DrawableComponent for RevisionFilesComponent {
 	fn draw(&self, f: &mut Frame, area: Rect) -> Result<()> {
 		if self.is_visible() {
 			self.total_area.set(area);
-			let left_ratio =
-				self.options.borrow().detail_left_ratio();
-			let right_ratio = 100 - left_ratio;
+			if self.preview_zoomed && matches!(self.focus, Focus::File) {
+				self.tree_area.set(Rect::default());
+				self.preview_area.set(area);
+				self.current_file.draw(f, area)?;
+			} else {
+				let left_ratio =
+					self.options.borrow().detail_left_ratio();
+				let right_ratio = 100 - left_ratio;
 
-			let chunks = Layout::default()
-				.direction(Direction::Horizontal)
-				.constraints([
-					Constraint::Percentage(left_ratio),
-					Constraint::Percentage(right_ratio),
-				])
-				.split(area);
+				let chunks = Layout::default()
+					.direction(Direction::Horizontal)
+					.constraints([
+						Constraint::Percentage(left_ratio),
+						Constraint::Percentage(right_ratio),
+					])
+					.split(area);
 
-			self.tree_area.set(chunks[0]);
-			self.preview_area.set(chunks[1]);
+				self.tree_area.set(chunks[0]);
+				self.preview_area.set(chunks[1]);
 
-			self.draw_tree(f, chunks[0])?;
+				self.draw_tree(f, chunks[0])?;
 
-			self.current_file.draw(f, chunks[1])?;
+				self.current_file.draw(f, chunks[1])?;
+				if self.options.borrow().mouse_support()
+					|| self.dragging_split
+					|| self.hover_split
+				{
+					crate::ui::draw_split_handle(
+						f.buffer_mut(),
+						chunks[1].x,
+						area.y,
+						area.height,
+						self.dragging_split || self.hover_split,
+						&self.theme,
+					);
+				}
+			}
 		}
 
 		self.copy_path_popup.draw(f, area)?;
@@ -772,9 +796,12 @@ impl Component for RevisionFilesComponent {
 			let preview_area = self.preview_area.get();
 			let total = self.total_area.get();
 			let split_x = tree_area.right();
+			let split_visible = !(self.preview_zoomed
+				&& matches!(self.focus, Focus::File));
 			match mouse.kind {
 				MouseEventKind::Down(MouseButton::Left) => {
-					if total.contains(pos)
+					if split_visible
+						&& total.contains(pos)
 						&& total.width >= 20
 						&& mouse.column.abs_diff(split_x) <= 1
 					{
@@ -844,6 +871,13 @@ impl Component for RevisionFilesComponent {
 						.set_detail_left_ratio_preview(ratio);
 					return Ok(EventState::Consumed);
 				}
+				MouseEventKind::Moved => {
+					let hovering = split_visible
+						&& total.contains(pos)
+						&& total.width >= 20
+						&& mouse.column.abs_diff(split_x) <= 1;
+					self.hover_split = hovering;
+				}
 				MouseEventKind::Up(MouseButton::Left)
 					if self.dragging_split =>
 				{
@@ -893,6 +927,22 @@ impl Component for RevisionFilesComponent {
 
 		if let Event::Key(key) = event {
 			let is_tree_focused = matches!(self.focus, Focus::Tree);
+			if key.modifiers.is_empty()
+				&& key.code == crossterm::event::KeyCode::Char('z')
+			{
+				if is_tree_focused {
+					if self.tree.selected_file().is_some() {
+						self.focus = Focus::File;
+						self.current_file.focus(true);
+						self.focus(true);
+						self.preview_zoomed = true;
+						return Ok(EventState::Consumed);
+					}
+				} else {
+					self.preview_zoomed = !self.preview_zoomed;
+					return Ok(EventState::Consumed);
+				}
+			}
 			if self.can_retry()
 				&& key_match(key, self.key_config.keys.enter)
 			{
@@ -926,6 +976,7 @@ impl Component for RevisionFilesComponent {
 				}
 			} else if key_match(key, self.key_config.keys.move_left) {
 				if !is_tree_focused {
+					self.preview_zoomed = false;
 					self.focus = Focus::Tree;
 					self.current_file.focus(false);
 					self.focus(false);

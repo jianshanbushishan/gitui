@@ -11,7 +11,7 @@ use crate::{
 	strings,
 	ui::{
 		draw_scrollbar,
-		style::{SharedTheme, Theme},
+		style::SharedTheme,
 		Orientation,
 	},
 };
@@ -446,7 +446,7 @@ impl FileRevlogPopup {
 						))
 						.borders(Borders::ALL)
 						.border_type(ratatui::widgets::BorderType::Rounded)
-						.border_style(Theme::attention_block()),
+						.border_style(self.theme.warning()),
 				)
 				.alignment(Alignment::Left),
 			area,

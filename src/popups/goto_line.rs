@@ -12,7 +12,6 @@ use crate::{
 
 use ratatui::{
 	layout::Rect,
-	style::{Color, Style},
 	widgets::{Block, Clear, Paragraph},
 	Frame,
 };
@@ -171,7 +170,7 @@ impl DrawableComponent for GotoLinePopup {
 	fn draw(&self, f: &mut Frame, area: Rect) -> Result<()> {
 		if self.is_visible() {
 			let style = if self.invalid_input {
-				Style::default().fg(Color::Red)
+				self.theme.text_danger()
 			} else {
 				self.theme.text(true, false)
 			};

@@ -11,10 +11,12 @@ use crate::{
 	ui::{self, style::SharedTheme},
 };
 use anyhow::Result;
-use crossterm::event::{Event, KeyCode, KeyModifiers};
+use crossterm::event::{
+	Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind,
+};
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use ratatui::{
-	layout::{Constraint, Direction, Layout, Margin, Rect},
+	layout::{Constraint, Direction, Layout, Margin, Position, Rect},
 	text::{Line, Span},
 	widgets::{Block, BorderType, Borders},
 	Frame,
@@ -91,6 +93,8 @@ pub struct CommandPalettePopup {
 	filtered: Vec<usize>,
 	selection: usize,
 	list_height: Cell<usize>,
+	last_area: Cell<Rect>,
+	list_area: Cell<Rect>,
 	matcher: SkimMatcherV2,
 	queue: Queue,
 	theme: SharedTheme,
@@ -118,6 +122,8 @@ impl CommandPalettePopup {
 			filtered,
 			selection: 0,
 			list_height: Cell::new(15),
+			last_area: Cell::new(Rect::default()),
+			list_area: Cell::new(Rect::default()),
 			matcher: SkimMatcherV2::default(),
 			queue: env.queue.clone(),
 			theme: env.theme.clone(),
@@ -323,7 +329,7 @@ impl CommandPalettePopup {
 				"Toggle mouse support",
 				"Options",
 				"鼠标 开关 mouse toggle",
-				String::new(),
+				format!("[{}]", kc.get_hint(kc.keys.open_options)),
 				PaletteAction::ToggleMouse,
 			),
 			PaletteItem::new(
@@ -445,6 +451,7 @@ impl DrawableComponent for CommandPalettePopup {
 			ui::Size::new(82, 26),
 			area,
 		);
+		self.last_area.set(popup_area);
 
 		ui::clear_popup_area(f, popup_area);
 		f.render_widget(
@@ -473,6 +480,7 @@ impl DrawableComponent for CommandPalettePopup {
 		self.input.draw(f, chunks[0])?;
 
 		let list_area = chunks[1];
+		self.list_area.set(list_area);
 		let list_height =
 			usize::from(list_area.height.saturating_sub(1)).max(1);
 		self.list_height.set(list_height);
@@ -480,48 +488,71 @@ impl DrawableComponent for CommandPalettePopup {
 		let scroll_skip =
 			self.selection.saturating_sub(list_height.saturating_sub(1));
 
-		let rows: Vec<Line<'_>> = self
-			.filtered
-			.iter()
-			.enumerate()
-			.skip(scroll_skip)
-			.take(list_height)
-			.map(|(visible_idx, &item_idx)| {
-				let item = &self.items[item_idx];
-				let selected = visible_idx == self.selection;
-				let row_style = self.theme.text(true, selected);
-				let prefix = if selected { "> " } else { "  " };
-				let cat = format!("[{}] ", item.category);
-				let hint_w = item.hint.width();
-				let left_text =
-					format!("{prefix}{cat}{}", item.title);
-				let left_w = left_text.width();
-				let pad = inner_width
-					.saturating_sub(left_w)
-					.saturating_sub(hint_w);
-				Line::from(vec![
-					Span::styled(prefix, row_style),
-					Span::styled(
+		let query = self.input.get_text().trim();
+		let rows: Vec<Line<'_>> = if self.filtered.is_empty() {
+			vec![Line::from(Span::styled(
+				"  No matching commands.",
+				self.theme.text(false, false),
+			))]
+		} else {
+			self.filtered
+				.iter()
+				.enumerate()
+				.skip(scroll_skip)
+				.take(list_height)
+				.map(|(visible_idx, &item_idx)| {
+					let item = &self.items[item_idx];
+					let selected = visible_idx == self.selection;
+					let row_style = self.theme.text(true, selected);
+					let match_style = self.theme.search_match(selected);
+					let prefix = if selected { "> " } else { "  " };
+					let cat = format!("[{}] ", item.category);
+					let hint_w = item.hint.width();
+					let left_text =
+						format!("{prefix}{cat}{}", item.title);
+					let left_w = left_text.width();
+					let pad = inner_width
+						.saturating_sub(left_w)
+						.saturating_sub(hint_w);
+					let title_indices = if query.is_empty() {
+						Vec::new()
+					} else {
+						self.matcher
+							.fuzzy_indices(item.title, query)
+							.map(|(_, idx)| idx)
+							.unwrap_or_default()
+					};
+					let mut spans = Vec::with_capacity(8);
+					spans.push(Span::styled(prefix, row_style));
+					spans.push(Span::styled(
 						cat,
 						if selected {
 							row_style
 						} else {
 							self.theme.text(false, false)
 						},
-					),
-					Span::styled(item.title, row_style),
-					Span::styled(" ".repeat(pad), row_style),
-					Span::styled(
+					));
+					super::content_search::push_highlighted_graphemes(
+						&mut spans,
+						item.title,
+						0,
+						&title_indices,
+						row_style,
+						match_style,
+					);
+					spans.push(Span::styled(" ".repeat(pad), row_style));
+					spans.push(Span::styled(
 						item.hint.as_str(),
 						if selected {
 							row_style
 						} else {
 							self.theme.commandbar_key()
 						},
-					),
-				])
-			})
-			.collect();
+					));
+					Line::from(spans)
+				})
+				.collect()
+		};
 
 		let list_block = Block::default()
 			.borders(Borders::TOP)
@@ -584,6 +615,49 @@ impl Component for CommandPalettePopup {
 			return Ok(EventState::NotConsumed);
 		}
 
+		if let Event::Mouse(mouse) = event {
+			let pos = Position::new(mouse.column, mouse.row);
+			match mouse.kind {
+				MouseEventKind::Down(MouseButton::Left) => {
+					let area = self.last_area.get();
+					if !area.is_empty() && !area.contains(pos) {
+						self.hide();
+						return Ok(EventState::Consumed);
+					}
+					let list_area = self.list_area.get();
+					let rows_area = Rect::new(
+						list_area.x,
+						list_area.y.saturating_add(1),
+						list_area.width,
+						list_area.height.saturating_sub(1),
+					);
+					if rows_area.contains(pos) {
+						let list_height = self.list_height.get().max(1);
+						let scroll_skip = self
+							.selection
+							.saturating_sub(list_height.saturating_sub(1));
+						let target =
+							scroll_skip + usize::from(mouse.row - rows_area.y);
+						if target < self.filtered.len() {
+							if self.selection == target {
+								self.execute_selected();
+							} else {
+								self.selection = target;
+							}
+						}
+					}
+				}
+				MouseEventKind::ScrollUp => {
+					self.move_selection(ScrollType::Up);
+				}
+				MouseEventKind::ScrollDown => {
+					self.move_selection(ScrollType::Down);
+				}
+				_ => {}
+			}
+			return Ok(EventState::Consumed);
+		}
+
 		if let Event::Key(key) = event {
 			if key_match(key, self.key_config.keys.exit_popup) {
 				self.hide();
@@ -610,6 +684,12 @@ impl Component for CommandPalettePopup {
 				return Ok(EventState::Consumed);
 			} else if key_match(key, self.key_config.keys.page_up) {
 				self.move_selection(ScrollType::PageUp);
+				return Ok(EventState::Consumed);
+			} else if key_match(key, self.key_config.keys.home) {
+				self.move_selection(ScrollType::Home);
+				return Ok(EventState::Consumed);
+			} else if key_match(key, self.key_config.keys.end) {
+				self.move_selection(ScrollType::End);
 				return Ok(EventState::Consumed);
 			}
 		}

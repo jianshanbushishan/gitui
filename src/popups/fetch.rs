@@ -4,7 +4,7 @@ use crate::{
 		visibility_blocking, CommandBlocking, CommandInfo, Component,
 		CredComponent, DrawableComponent, EventState,
 	},
-	keys::SharedKeyConfig,
+	keys::{key_match, SharedKeyConfig},
 	queue::{InternalEvent, NeedsUpdate, Queue},
 	strings,
 	ui::{self, style::SharedTheme},
@@ -41,6 +41,7 @@ pub struct FetchPopup {
 	theme: SharedTheme,
 	key_config: SharedKeyConfig,
 	input_cred: CredComponent,
+	started_at: Option<std::time::Instant>,
 }
 
 impl FetchPopup {
@@ -56,6 +57,7 @@ impl FetchPopup {
 			theme: env.theme.clone(),
 			key_config: env.key_config.clone(),
 			repo: env.repo.clone(),
+			started_at: None,
 		}
 	}
 
@@ -82,6 +84,7 @@ impl FetchPopup {
 
 	fn fetch_all(&mut self, cred: Option<BasicAuthCredential>) {
 		self.pending = true;
+		self.started_at = Some(std::time::Instant::now());
 		self.progress = Some(FetchProgress::default());
 		self.async_fetch.spawn(AsyncFetchJob::new(
 			self.repo.borrow().clone(),
@@ -151,10 +154,17 @@ impl DrawableComponent for FetchPopup {
 				f.area(),
 			);
 
+			let label = if let Some(started) = self.started_at {
+				let secs = started.elapsed().as_secs();
+				format!("{stage} {}% ({secs}s)", progress.percent)
+			} else {
+				format!("{stage} {}%", progress.percent)
+			};
+
 			ui::clear_popup_area(f, area);
 			f.render_widget(
 				Gauge::default()
-					.label(format!("{stage} {}%", progress.percent))
+					.label(label)
 					.block(
 						Block::default()
 							.title(Span::styled(
@@ -202,7 +212,7 @@ impl Component for FetchPopup {
 
 	fn event(&mut self, ev: &Event) -> Result<EventState> {
 		if self.visible {
-			if let Event::Key(_) = ev {
+			if let Event::Key(e) = ev {
 				if self.input_cred.is_visible() {
 					self.input_cred.event(ev)?;
 
@@ -214,6 +224,10 @@ impl Component for FetchPopup {
 					} else if !self.input_cred.is_visible() {
 						self.hide();
 					}
+				} else if key_match(e, self.key_config.keys.exit_popup)
+					&& !self.pending
+				{
+					self.hide();
 				}
 			}
 			return Ok(EventState::Consumed);
@@ -231,6 +245,7 @@ impl Component for FetchPopup {
 
 	fn hide(&mut self) {
 		self.visible = false;
+		self.started_at = None;
 	}
 
 	fn show(&mut self) -> Result<()> {

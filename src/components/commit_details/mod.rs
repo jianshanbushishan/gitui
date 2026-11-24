@@ -52,6 +52,9 @@ impl CommitDetailsComponent {
 
 	///
 	pub fn new(env: &Environment) -> Self {
+		let mut file_tree =
+			StatusTreeComponent::new(env, "", false);
+		file_tree.set_empty_hint("No changed files");
 		Self {
 			single_details: DetailsComponent::new(env, false),
 			compare_details: CompareDetailsComponent::new(env, false),
@@ -59,7 +62,7 @@ impl CommitDetailsComponent {
 				env.repo.borrow().clone(),
 				&env.sender_git,
 			),
-			file_tree: StatusTreeComponent::new(env, "", false),
+			file_tree,
 			visible: false,
 			focus: Focus::None,
 			commit: None,

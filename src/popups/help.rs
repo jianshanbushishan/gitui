@@ -1,6 +1,6 @@
 use crate::components::{
 	visibility_blocking, CommandBlocking, CommandInfo, Component,
-	DrawableComponent, EventState,
+	DrawableComponent, EventState, InputType, TextInputComponent,
 };
 use crate::{
 	app::Environment,
@@ -10,11 +10,13 @@ use crate::{
 	strings, ui,
 };
 use anyhow::Result;
-use crossterm::event::{Event, KeyCode, KeyModifiers};
+use crossterm::event::{
+	Event, KeyCode, MouseButton, MouseEventKind,
+};
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use itertools::Itertools;
 use ratatui::{
-	layout::{Alignment, Constraint, Direction, Layout, Rect},
+	layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
 	style::{Modifier, Style},
 	text::{Line, Span},
 	widgets::{Block, BorderType, Borders, Paragraph},
@@ -45,9 +47,10 @@ pub struct HelpPopup {
 	cmds: Vec<CommandInfo>,
 	visible: bool,
 	selection: usize,
-	filter: String,
+	filter_input: TextInputComponent,
 	filtering: bool,
 	viewport_height: Cell<usize>,
+	last_area: Cell<Rect>,
 	matcher: SkimMatcherV2,
 	queue: Queue,
 	theme: SharedTheme,
@@ -66,6 +69,7 @@ impl DrawableComponent for HelpPopup {
 				ui::Size::new(96, 36),
 				fsize,
 			);
+			self.last_area.set(area);
 
 			ui::clear_popup_area(f, area);
 			f.render_widget(
@@ -94,29 +98,58 @@ impl DrawableComponent for HelpPopup {
 				])
 				.split(area);
 
-			let filter_line = if self.filtering || !self.filter.is_empty() {
-				let cursor = if self.filtering { "▌" } else { "" };
-				Line::from(vec![
-					Span::styled("Filter: ", self.theme.title(true)),
-					Span::styled(
-						format!("{}{cursor}", self.filter),
-						self.theme.text(true, false),
-					),
-				])
-			} else {
-				Line::from(Span::styled(
-					"Press [/] to fuzzy-filter · [↑↓] scroll · [Enter] run command",
-					self.theme.text(false, false),
-				))
-			};
-			f.render_widget(
-				Paragraph::new(filter_line).block(
+			let filter_text = self.filter_input.get_text();
+			if self.filtering || !filter_text.is_empty() {
+				let filter_chunks = Layout::default()
+					.direction(Direction::Horizontal)
+					.constraints([
+						Constraint::Length(8),
+						Constraint::Min(1),
+					])
+					.split(Rect::new(
+						chunks[0].x,
+						chunks[0].y,
+						chunks[0].width,
+						1,
+					));
+				f.render_widget(
+					Paragraph::new(Span::styled(
+						"Filter: ",
+						self.theme.title(true),
+					)),
+					filter_chunks[0],
+				);
+				if self.filtering {
+					self.filter_input.draw(f, filter_chunks[1])?;
+				} else {
+					f.render_widget(
+						Paragraph::new(Span::styled(
+							filter_text,
+							self.theme.text(false, false),
+						)),
+						filter_chunks[1],
+					);
+				}
+				f.render_widget(
 					Block::default()
 						.borders(Borders::BOTTOM)
 						.border_style(self.theme.block(false)),
-				),
-				chunks[0],
-			);
+					chunks[0],
+				);
+			} else {
+				let filter_line = Line::from(Span::styled(
+					"Press [/] to fuzzy-filter · [↑↓] scroll · [Enter] run command",
+					self.theme.text(false, false),
+				));
+				f.render_widget(
+					Paragraph::new(filter_line).block(
+						Block::default()
+							.borders(Borders::BOTTOM)
+							.border_style(self.theme.block(false)),
+					),
+					chunks[0],
+				);
+			}
 
 			let list_height = usize::from(chunks[1].height).max(1);
 			self.viewport_height.set(list_height);
@@ -138,9 +171,15 @@ impl DrawableComponent for HelpPopup {
 			);
 
 			if total_rows > list_height {
+				let sb_area = Rect::new(
+					area.x,
+					chunks[1].y.saturating_sub(1),
+					area.width,
+					chunks[1].height.saturating_add(2),
+				);
 				ui::draw_scrollbar(
 					f,
-					area,
+					sb_area,
 					&self.theme,
 					max_scroll,
 					target_scroll,
@@ -148,7 +187,7 @@ impl DrawableComponent for HelpPopup {
 				);
 			}
 
-			let footer_left = if self.filter.is_empty() {
+			let footer_left = if self.filter_input.get_text().is_empty() {
 				format!("{filtered_count} commands")
 			} else {
 				format!(
@@ -241,69 +280,88 @@ impl Component for HelpPopup {
 	#[allow(clippy::too_many_lines)]
 	fn event(&mut self, ev: &Event) -> Result<EventState> {
 		if self.visible {
+			if let Event::Mouse(mouse) = ev {
+				let pos = Position::new(mouse.column, mouse.row);
+				match mouse.kind {
+					MouseEventKind::Down(MouseButton::Left) => {
+						let area = self.last_area.get();
+						if !area.is_empty() && !area.contains(pos) {
+							self.hide();
+						}
+					}
+					MouseEventKind::ScrollUp => {
+						self.move_selection(-1);
+					}
+					MouseEventKind::ScrollDown => {
+						self.move_selection(1);
+					}
+					_ => {}
+				}
+				return Ok(EventState::Consumed);
+			}
 			if let Event::Key(e) = ev {
 				if self.filtering {
-					match e.code {
-						KeyCode::Esc => {
-							if !self.filter.is_empty() {
-								self.filter.clear();
-								self.selection = 0;
-							}
+					if key_match(e, self.key_config.keys.exit_popup) {
+						if !self.filter_input.get_text().is_empty() {
+							self.filter_input.clear();
+							self.selection = 0;
+						}
+						self.filtering = false;
+						self.filter_input.hide();
+						return Ok(EventState::Consumed);
+					} else if key_match(e, self.key_config.keys.enter) {
+						if !self.run_selected_command() {
 							self.filtering = false;
+							self.filter_input.hide();
 						}
-						KeyCode::Enter => {
-							if !self.run_selected_command() {
-								self.filtering = false;
-							}
-						}
-						KeyCode::Backspace => {
-							self.filter.pop();
-							self.selection = 0;
-						}
-						KeyCode::Down => self.move_selection(1),
-						KeyCode::Up => self.move_selection(-1),
-						KeyCode::PageDown => {
-							let step = isize::try_from(
-								self.viewport_height.get().max(1),
-							)
-							.unwrap_or(10);
-							self.move_selection(step);
-						}
-						KeyCode::PageUp => {
-							let step = isize::try_from(
-								self.viewport_height.get().max(1),
-							)
-							.unwrap_or(10);
-							self.move_selection(-step);
-						}
-						KeyCode::Char(c)
-							if e.modifiers.is_empty()
-								|| e.modifiers
-									== KeyModifiers::SHIFT =>
-						{
-							self.filter.push(c);
-							self.selection = 0;
-						}
-						_ => {}
+						return Ok(EventState::Consumed);
+					} else if key_match(e, self.key_config.keys.popup_down)
+						|| (e.code == KeyCode::Down
+							&& e.modifiers.is_empty())
+					{
+						self.move_selection(1);
+						return Ok(EventState::Consumed);
+					} else if key_match(e, self.key_config.keys.popup_up)
+						|| (e.code == KeyCode::Up && e.modifiers.is_empty())
+					{
+						self.move_selection(-1);
+						return Ok(EventState::Consumed);
+					} else if key_match(e, self.key_config.keys.page_down)
+					{
+						let step = isize::try_from(
+							self.viewport_height.get().max(1),
+						)
+						.unwrap_or(10);
+						self.move_selection(step);
+						return Ok(EventState::Consumed);
+					} else if key_match(e, self.key_config.keys.page_up) {
+						let step = isize::try_from(
+							self.viewport_height.get().max(1),
+						)
+						.unwrap_or(10);
+						self.move_selection(-step);
+						return Ok(EventState::Consumed);
+					}
+					if self.filter_input.event(ev)?.is_consumed() {
+						self.selection = 0;
 					}
 					return Ok(EventState::Consumed);
 				}
 
 				if key_match(e, self.key_config.keys.exit_popup) {
-					if self.filter.is_empty() {
+					if self.filter_input.get_text().is_empty() {
 						self.hide();
 					} else {
-						self.filter.clear();
+						self.filter_input.clear();
 						self.selection = 0;
 					}
-				} else if e.code == KeyCode::Enter
-					&& e.modifiers.is_empty()
-				{
+				} else if key_match(e, self.key_config.keys.enter) {
 					self.run_selected_command();
 				} else if e.code == KeyCode::Char('/')
 					&& e.modifiers.is_empty()
 				{
 					self.filtering = true;
+					self.filter_input.show()?;
 				} else if key_match(e, self.key_config.keys.move_down)
 					|| key_match(e, self.key_config.keys.popup_down)
 				{
@@ -357,11 +415,13 @@ impl Component for HelpPopup {
 	fn hide(&mut self) {
 		self.visible = false;
 		self.filtering = false;
+		self.filter_input.hide();
 	}
 
 	fn show(&mut self) -> Result<()> {
 		self.visible = true;
-		self.filter.clear();
+		self.filter_input.clear();
+		self.filter_input.hide();
 		self.filtering = false;
 		self.selection = 0;
 
@@ -371,13 +431,22 @@ impl Component for HelpPopup {
 
 impl HelpPopup {
 	pub fn new(env: &Environment) -> Self {
+		let mut filter_input = TextInputComponent::new(
+			env,
+			"",
+			"type to filter..",
+			false,
+		)
+		.with_input_type(InputType::Singleline);
+		filter_input.embed();
 		Self {
 			cmds: vec![],
 			visible: false,
 			selection: 0,
-			filter: String::new(),
+			filter_input,
 			filtering: false,
 			viewport_height: Cell::new(16),
+			last_area: Cell::new(Rect::default()),
 			matcher: SkimMatcherV2::default(),
 			queue: env.queue.clone(),
 			theme: env.theme.clone(),
@@ -476,10 +545,12 @@ impl HelpPopup {
 	}
 
 	fn filtered_cmds(&self) -> Vec<&CommandInfo> {
-		let query = self.filter.trim();
+		let query = self.filter_input.get_text().trim();
 		if query.is_empty() {
 			return self.cmds.iter().collect();
 		}
+		let mut best_group_score: std::collections::HashMap<&str, i64> =
+			std::collections::HashMap::new();
 		let mut scored: Vec<(i64, usize, &CommandInfo)> = self
 			.cmds
 			.iter()
@@ -489,13 +560,36 @@ impl HelpPopup {
 					"{} {} {}",
 					cmd.text.name, cmd.text.desc, cmd.text.group
 				);
-				self.matcher
-					.fuzzy_match(&haystack, query)
-					.map(|score| (score, idx, cmd))
+				self.matcher.fuzzy_match(&haystack, query).map(
+					|score| {
+						best_group_score
+							.entry(cmd.text.group)
+							.and_modify(|s| *s = (*s).max(score))
+							.or_insert(score);
+						(score, idx, cmd)
+					},
+				)
 			})
 			.collect();
+		// Keep items grouped so headers never repeat, ordering groups by
+		// best match score (descending) then standard group rank, and
+		// items within each group by score (descending).
 		scored.sort_unstable_by(|a, b| {
-			b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1))
+			let ga = best_group_score
+				.get(a.2.text.group)
+				.copied()
+				.unwrap_or(0);
+			let gb = best_group_score
+				.get(b.2.text.group)
+				.copied()
+				.unwrap_or(0);
+			gb.cmp(&ga)
+				.then_with(|| {
+					group_rank(a.2.text.group)
+						.cmp(&group_rank(b.2.text.group))
+				})
+				.then_with(|| b.0.cmp(&a.0))
+				.then_with(|| a.1.cmp(&b.1))
 		});
 		scored.into_iter().map(|(_, _, cmd)| cmd).collect()
 	}
@@ -579,5 +673,56 @@ impl HelpPopup {
 		}
 
 		(txt, selected_row, filtered_count)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::components::CommandText;
+
+	#[test]
+	fn filtered_help_does_not_repeat_group_headers() {
+		let env = Environment::test_env();
+		let mut popup = HelpPopup::new(&env);
+		popup.set_cmds(vec![
+			CommandInfo::new(
+				CommandText::new(
+					"Stage file [space]".into(),
+					"stage selected item",
+					"-- Changes --",
+				),
+				true,
+				true,
+			),
+			CommandInfo::new(
+				CommandText::new(
+					"Commit [c]".into(),
+					"record changes",
+					"-- General --",
+				),
+				true,
+				true,
+			),
+			CommandInfo::new(
+				CommandText::new(
+					"Stage all [a]".into(),
+					"stage all items",
+					"-- Changes --",
+				),
+				true,
+				true,
+			),
+		]);
+		popup.show().unwrap();
+		popup.filter_input.show().unwrap();
+		popup.filter_input.set_text("stage".into());
+		let (lines, _, count) = popup.build_lines();
+		assert_eq!(count, 2);
+		let changes_headers = lines
+			.iter()
+			.filter(|l| l.to_string().trim() == "-- Changes --")
+			.count();
+		assert_eq!(changes_headers, 1);
 	}
 }

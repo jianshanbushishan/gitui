@@ -68,10 +68,11 @@ Everything in this section is added or changed on top of upstream gitui (the for
 #### Delta-powered diffs
 
 - Diffs are rendered by [delta](https://github.com/dandavison/delta) when it is on `PATH` — **delta side-by-side is the default diff mode**, and `Alt+P` cycles between it and the built-in unified view (toggling into delta without the binary installed shows a hint to install it).
-- In the unified diff view, `0` and `$` jump to the start/end of the (potentially long) diff line, and line numbers are shown.
+- Press `/` while the diff pane is focused to **search within the diff** with inline match highlighting in both built-in Unified and Delta modes (active match bold + reversed); jump between matches, and press `[` / `]` in the Status diff pane to step to the previous/next changed file without leaving the diff.
+- The built-in Unified diff view renders **word-level diff highlighting** on paired deleted/added lines, line numbers, and `0`/`$` horizontal line start/end jumps.
+- Horizontal scrolling and wrapping work across both Delta and built-in Unified modes, including CJK/double-width characters (wrapping uses unicode display width, not char count).
 - Delta rendering is async with an LRU cache and request dedupe; same-file stage/unstage re-renders synchronously, so the cursor never jumps and the view never flickers or shows stale content after staging hunks/lines.
 - All gitui workflows work inside the delta preview: stage/unstage hunk & lines, reset hunk, per-file `(+added -deleted)` line counters in the diff title, and correct rendering of deleted files.
-- Line wrapping, background highlighting and horizontal scrolling behave correctly in both delta modes, including CJK/double-width characters (wrapping uses unicode display width, not char count).
 - delta (and bat) previews follow the **OS light/dark theme**, detected once at startup (on Windows via the `AppsUseLightTheme` registry key, and on Linux via the desktop portal or `gsettings`), so gitui's piped delta/bat output matches direct terminal runs.
 
 #### File previews: bat, eza, images, in-content search
@@ -88,11 +89,21 @@ Everything in this section is added or changed on top of upstream gitui (the for
 - `e` (edit file) and `c` (commit) also work while a diff pane is focused, not just from the file tree.
 - Windows fixes: backslashes in configured editor paths are preserved, and the `VISUAL` environment variable is honored.
 
-#### Status tab
+#### Status tab & popups
 
 - The Staged and Unstaged panes show live `(+N -M)` line-stat totals, and the Unstaged pane also shows the current branch with ahead/behind counts, on their top borders. The stats are computed off the UI thread via a single bulk diff.
-- The commit popup accepts `Shift+Enter`/`Alt+Enter` as newline (in addition to the configured `newline` key) and **persists the message draft and cursor position** across sessions and restarts (per-repo).
+- The commit popup opens as an expanded multiline editor (`64% × 40%`), shows the active branch, staged summary, live character counter, and `>50`-character first-line warning on its borders, renders **50/72-character column guides** (`┬`/`┆`), accepts `Shift+Enter`/`Alt+Enter` as newline, and **persists the message draft and cursor position** across sessions and restarts (per-repo).
+- Press `Ctrl+t` in the commit popup to open a **Conventional Commits quick-picker** (`feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`, selectable via `1–9` or `Enter`), preserving any existing `(scope)`, `!`, and body text.
+- The **Branch List** popup displays numeric **`↑ahead↓behind`** counts on local branches, and both **Branch List** and **Tag List** popups support `/` **real-time inline filtering** (`Esc` clears the filter and restores the full list).
 - Pushing (branches and tags) and stash apply ask for confirmation first.
+
+#### Command Palette, layout & UI ergonomics
+
+- Press `Ctrl+P` to open a fuzzy-searchable **Command Palette** for tabs, popups, diff mode/zoom, split adjustments, mouse toggle, and common Git actions.
+- The **Help** popup supports `/` **filtering** and pressing `Enter` to execute supported commands directly.
+- Press `z` to **toggle full-pane zoom** on the right/preview pane across **Status**, **Logs**, **Stashes**, and **Files** views (including commit-inspect/compare/file-history popups).
+- Resize split panes with `<` / `>` (`5%` steps, clamped to `15%–75%`) or drag the divider with the mouse; when mouse support is enabled (or while hovering/dragging), a visible split drag handle (`┃`/`╋`) marks the seam, and adjusted ratios save globally to `options.ron`.
+- Non-blocking bottom-right **toast notifications** confirm actions like copy or warn on missing signoff metadata (auto-dismissing or click-to-dismiss), alongside dimmed backdrops behind modal popups, styled command-bar keycaps, and higher-contrast light/dark theme colors.
 
 #### Revlog & commit details
 
@@ -127,7 +138,8 @@ Tuned on giant working trees such as Unreal Engine projects:
 
 All Options popup settings are shared across repositories: **Show untracked**,
 **Diff Mode**, **Ignore whitespaces**, **Context lines**, **Inter hunk lines**,
-**External diff tool**, and **AI Backend**. Selections are saved
+**External diff tool**, **AI Backend**, **Mouse support**, and split pane ratios
+(**Status split %**, **Revlog split %**, **Detail split %**). Selections are saved
 to `options.ron` in the user configuration directory (`%APPDATA%\gitui\options.ron`
 on Windows, typically `~/.config/gitui/options.ron` on Linux).
 
@@ -173,9 +185,12 @@ binding for resetting selected diff lines is now `Alt+d` (Vim preset: `u`).
 
 In **Options**, select **AI Backend** and use Left/Right to choose **Pi coding
 agent** or **Custom command**. The choice defaults to **Disabled** and is saved
-immediately and globally. In the commit popup, clear any existing message and press
-`Ctrl+g` to generate an editable draft from staged changes. Review and edit the
-draft, then use the usual commit key. Generation never commits automatically.
+immediately and globally. In the commit popup, press `Ctrl+g` to generate an editable draft from staged
+changes (if a manual draft is already present, press `Ctrl+g` a second time
+within 5 seconds to confirm replacing it). An animated spinner and elapsed
+timer appear while generating; `Esc` cancels, and `Ctrl+z` restores the
+pre-AI draft via **Undo AI**. Review and edit the draft, then use the usual
+commit key. Generation never commits automatically.
 The draft follows the language and format of the 5 most recent repository
 commit messages, including their subject conventions and body structure.
 The selected agent may send the staged patch and those messages to its model
@@ -249,7 +264,8 @@ GitUI supports LFS status and pointer metadata, whole-file staging and restore,
 branch checkout, fast-forward pull, and branch/tag push via the repository's
 pre-push hook.
 Checkout uses locally cached objects. Press `Ctrl+L` to open Git LFS and
-download objects for the current commit or restore existing pointers from cache.
+download objects for the current commit or restore existing pointers from cache
+with a live progress modal (transfer gauge, object count, and downloaded bytes).
 A fast-forward pull downloads LFS content for added or changed files, respecting
 the repository's LFS path filters and skip-smudge settings. If a download fails
 after the branch advances, use the Git LFS menu to retry the affected files.

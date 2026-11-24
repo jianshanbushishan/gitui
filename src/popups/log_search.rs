@@ -15,7 +15,6 @@ use asyncgit::sync::{
 	SearchOptions,
 };
 use crossterm::event::Event;
-use easy_cast::Cast;
 use ratatui::{
 	layout::{
 		Alignment, Constraint, Direction, Layout, Margin, Rect,
@@ -548,22 +547,22 @@ impl LogSearchPopupPopup {
 		f: &mut Frame,
 		area: Rect,
 	) -> Result<()> {
+		let show_invalid = !self.is_valid()
+			&& !self.find_text.get_text().trim().is_empty();
+		let height = if show_invalid { 4 } else { 3 };
 		let area = ui::responsive_popup_rect(
 			60,
 			15,
-			ui::Size::new(40, 3),
-			ui::Size::new(68, 3),
+			ui::Size::new(40, height),
+			ui::Size::new(68, height),
 			area,
 		);
 
-		let mut block_style = self.theme.block(true);
-
-		let show_invalid = !self.is_valid()
-			&& !self.find_text.get_text().trim().is_empty();
-
-		if show_invalid {
-			block_style = self.theme.text_danger();
-		}
+		let block_style = if show_invalid {
+			self.theme.text_danger()
+		} else {
+			self.theme.block(true)
+		};
 
 		ui::clear_popup_area(f, area);
 		f.render_widget(
@@ -578,38 +577,33 @@ impl LogSearchPopupPopup {
 			area,
 		);
 
+		let inner = area.inner(Margin {
+			horizontal: 1,
+			vertical: 1,
+		});
+		let constraints = if show_invalid {
+			vec![Constraint::Length(1), Constraint::Length(1)]
+		} else {
+			vec![Constraint::Length(1)]
+		};
 		let chunks = Layout::default()
 			.direction(Direction::Vertical)
-			.constraints([Constraint::Length(1)])
-			.split(area.inner(Margin {
-				horizontal: 1,
-				vertical: 1,
-			}));
+			.constraints(constraints)
+			.split(inner);
 
 		self.find_text.draw(f, chunks[0])?;
 
-		if show_invalid {
-			self.draw_invalid_sha(f);
+		if show_invalid && chunks.len() > 1 {
+			self.draw_invalid_sha(f, chunks[1]);
 		}
 
 		Ok(())
 	}
 
-	fn draw_invalid_sha(&self, f: &mut Frame) {
-		let msg_length: u16 = POPUP_COMMIT_SHA_INVALID.len().cast();
+	fn draw_invalid_sha(&self, f: &mut Frame, rect: Rect) {
 		let w = Paragraph::new(POPUP_COMMIT_SHA_INVALID)
-			.style(self.theme.text_danger());
-
-		let rect = {
-			let mut rect = self.find_text.get_area();
-			rect.y += rect.height;
-			rect.height = 1;
-			let offset = rect.width.saturating_sub(msg_length);
-			rect.width = rect.width.saturating_sub(offset);
-			rect.x += offset;
-
-			rect
-		};
+			.style(self.theme.text_danger())
+			.alignment(Alignment::Right);
 
 		f.render_widget(w, rect);
 	}
@@ -932,5 +926,24 @@ mod tests {
 			.options
 			.1
 			.contains(SearchOptions::FILTER_RESULTS));
+	}
+
+	#[test]
+	fn invalid_sha_does_not_overwrite_bottom_border() {
+		let env = Environment::test_env();
+		let mut popup = LogSearchPopupPopup::new(&env);
+		popup.open().unwrap();
+		popup.set_mode(&PopupMode::JumpCommitSha);
+		popup.find_text.set_text("not-a-sha".into());
+		let mut terminal = ratatui::Terminal::new(
+			ratatui::backend::TestBackend::new(80, 20),
+		)
+		.unwrap();
+		terminal
+			.draw(|f| popup.draw(f, f.area()).unwrap())
+			.unwrap();
+		let rendered = terminal.backend().to_string();
+		assert!(rendered.contains(POPUP_COMMIT_SHA_INVALID));
+		assert!(rendered.contains("╰────────"));
 	}
 }

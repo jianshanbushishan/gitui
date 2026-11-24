@@ -13,9 +13,11 @@ use crate::{
 	AsyncAppNotification, AsyncNotification,
 };
 use anyhow::Result;
-use crossterm::event::{Event, KeyCode, KeyModifiers};
+use crossterm::event::{
+	Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind,
+};
 use ratatui::{
-	layout::{Constraint, Direction, Layout, Margin, Rect},
+	layout::{Constraint, Direction, Layout, Margin, Position, Rect},
 	style::Style,
 	text::{Line, Span},
 	widgets::{Block, Borders},
@@ -60,6 +62,8 @@ pub struct ContentSearchPopup {
 	search_result: SearchResult,
 	searching: bool,
 	list_height: Cell<usize>,
+	last_area: Cell<Rect>,
+	list_area: Cell<Rect>,
 	app_sender: crossbeam_channel::Sender<AsyncAppNotification>,
 }
 
@@ -92,6 +96,8 @@ impl ContentSearchPopup {
 			search_result: Arc::new(Mutex::new(None)),
 			searching: false,
 			list_height: Cell::new(18),
+			last_area: Cell::new(Rect::default()),
+			list_area: Cell::new(Rect::default()),
 			app_sender: env.sender_app.clone(),
 		}
 	}
@@ -219,6 +225,65 @@ impl ContentSearchPopup {
 		});
 	}
 
+	fn handle_mouse(
+		&mut self,
+		mouse: crossterm::event::MouseEvent,
+	) -> EventState {
+		let pos = Position::new(mouse.column, mouse.row);
+		match mouse.kind {
+			MouseEventKind::Down(MouseButton::Left) => {
+				let area = self.last_area.get();
+				if !area.is_empty() && !area.contains(pos) {
+					self.hide();
+					return EventState::Consumed;
+				}
+				let list_area = self.list_area.get();
+				let rows_area = Rect::new(
+					list_area.x,
+					list_area.y.saturating_add(1),
+					list_area.width,
+					list_area.height.saturating_sub(1),
+				);
+				if rows_area.contains(pos) {
+					let list_height = self.list_height.get().max(1);
+					let scroll_skip = self
+						.selection
+						.saturating_sub(list_height.saturating_sub(1));
+					let target = scroll_skip
+						+ usize::from(mouse.row - rows_area.y);
+					if target < self.filtered.len() {
+						if self.selection == target {
+							if let Some(&line_idx) =
+								self.filtered.get(self.selection)
+							{
+								if let Some(q) = &self.query {
+									self.queue.push(
+										InternalEvent::ContentSearchSelected(
+											q.clone(),
+											line_idx,
+											self.filtered.clone(),
+										),
+									);
+								}
+							}
+							self.hide();
+						} else {
+							self.selection = target;
+						}
+					}
+				}
+			}
+			MouseEventKind::ScrollUp => {
+				self.move_selection(ScrollType::Up);
+			}
+			MouseEventKind::ScrollDown => {
+				self.move_selection(ScrollType::Down);
+			}
+			_ => {}
+		}
+		EventState::Consumed
+	}
+
 	fn move_selection(&mut self, move_type: ScrollType) -> bool {
 		let page = self.list_height.get().max(1);
 		let max = self.filtered.len().saturating_sub(1);
@@ -270,8 +335,8 @@ impl ContentSearchPopup {
 	#[inline]
 	fn draw_matches_list(&self, f: &mut Frame, mut area: Rect) {
 		{
-			// Block has two lines up and down which need to be considered
-			const HEIGHT_BLOCK_MARGIN: usize = 2;
+			// Block has one top border line which needs to be considered
+			const HEIGHT_BLOCK_MARGIN: usize = 1;
 
 			let title = if self.searching {
 				format!("Hits: {} (searching…)", self.filtered.len())
@@ -281,21 +346,23 @@ impl ContentSearchPopup {
 
 			let height = usize::from(area.height);
 			let width = usize::from(area.width);
-			let text_width = width.saturating_sub(2);
+			let line_num_w = self.contents.len().max(1).ilog10() as usize + 1;
+			let gutter_w = 2 + line_num_w + 1;
+			let text_width = width.saturating_sub(gutter_w);
 
 			let list_height =
-				height.saturating_sub(HEIGHT_BLOCK_MARGIN);
-			self.list_height.set(list_height.max(1));
+				height.saturating_sub(HEIGHT_BLOCK_MARGIN).max(1);
+			self.list_height.set(list_height);
 
 			let scroll_skip =
-				self.selection.saturating_sub(list_height);
+				self.selection.saturating_sub(list_height.saturating_sub(1));
 
 			let needle = self.filtered_needle.as_deref().unwrap_or("");
 			let items = self
 				.filtered
 				.iter()
 				.skip(scroll_skip)
-				.take(height)
+				.take(list_height)
 				.enumerate()
 				.map(|(row_idx, &idx)| {
 					let selected =
@@ -315,13 +382,16 @@ impl ContentSearchPopup {
 						needle,
 					);
 					let row_style = self.theme.text(true, selected);
+					let lineno_style = self.theme.text(false, selected);
 					let match_style =
 						self.theme.search_match(selected);
+					let lineno = format!("{:>line_num_w$} ", idx + 1);
 					let mut spans = Vec::with_capacity(8);
 					spans.push(Span::styled(
 						if selected { "> " } else { "  " },
 						row_style,
 					));
+					spans.push(Span::styled(lineno, lineno_style));
 					push_highlighted_graphemes(
 						&mut spans,
 						full_text,
@@ -331,9 +401,10 @@ impl ContentSearchPopup {
 						match_style,
 					);
 					if selected {
-						let used = 2 + unicode_width::UnicodeWidthStr::width(
-							full_text,
-						);
+						let used = gutter_w
+							+ unicode_width::UnicodeWidthStr::width(
+								full_text,
+							);
 						if width > used {
 							spans.push(Span::styled(
 								" ".repeat(width - used),
@@ -379,6 +450,7 @@ impl ContentSearchPopup {
 impl DrawableComponent for ContentSearchPopup {
 	fn draw(&self, f: &mut Frame, area: Rect) -> Result<()> {
 		if self.is_visible() {
+			let has_query = !self.find_text.get_text().is_empty();
 			let any_hits = !self.filtered.is_empty() || self.searching;
 
 			let area = ui::responsive_popup_rect(
@@ -391,6 +463,14 @@ impl DrawableComponent for ContentSearchPopup {
 
 			let area = if any_hits {
 				area
+			} else if has_query {
+				Layout::default()
+					.direction(Direction::Vertical)
+					.constraints([
+						Constraint::Length(5),
+						Constraint::Percentage(100),
+					])
+					.split(area)[0]
 			} else {
 				Layout::default()
 					.direction(Direction::Vertical)
@@ -402,6 +482,7 @@ impl DrawableComponent for ContentSearchPopup {
 			};
 
 			ui::clear_popup_area(f, area);
+			self.last_area.set(area);
 			f.render_widget(
 				Block::default()
 					.borders(Borders::all())
@@ -428,7 +509,27 @@ impl DrawableComponent for ContentSearchPopup {
 			self.find_text.draw(f, chunks[0])?;
 
 			if any_hits {
+				self.list_area.set(chunks[1]);
 				self.draw_matches_list(f, chunks[1]);
+			} else {
+				self.list_area.set(Rect::default());
+				if has_query {
+					ui::draw_list_block(
+						f,
+						chunks[1],
+						Block::default()
+							.title(Span::styled(
+								"Hits: 0",
+								self.theme.title(false),
+							))
+							.borders(Borders::TOP)
+							.border_style(self.theme.block(false)),
+						std::iter::once(Line::from(Span::styled(
+							"  No matching lines.",
+							self.theme.text(false, false),
+						))),
+					);
+				}
 			}
 		}
 		Ok(())
@@ -463,6 +564,9 @@ impl Component for ContentSearchPopup {
 		event: &crossterm::event::Event,
 	) -> Result<EventState> {
 		if self.is_visible() {
+			if let Event::Mouse(mouse) = event {
+				return Ok(self.handle_mouse(*mouse));
+			}
 			if let Event::Key(key) = event {
 				if key_match(key, self.key_config.keys.exit_popup) {
 					self.hide();
@@ -494,6 +598,12 @@ impl Component for ContentSearchPopup {
 				} else if key_match(key, self.key_config.keys.page_up)
 				{
 					self.move_selection(ScrollType::PageUp);
+					return Ok(EventState::Consumed);
+				} else if key_match(key, self.key_config.keys.home) {
+					self.move_selection(ScrollType::Home);
+					return Ok(EventState::Consumed);
+				} else if key_match(key, self.key_config.keys.end) {
+					self.move_selection(ScrollType::End);
 					return Ok(EventState::Consumed);
 				} else if key_match(key, self.key_config.keys.enter) {
 					// confirm: jump to the selected line in the preview

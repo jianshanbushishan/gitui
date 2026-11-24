@@ -299,6 +299,20 @@ impl App {
 	pub fn draw(&self, f: &mut Frame) -> Result<()> {
 		let fsize = f.area();
 
+		if fsize.width < 20 || fsize.height < 6 {
+			let msg = format!(
+				"Terminal too small ({}x{})\nMinimum: 20x6",
+				fsize.width, fsize.height
+			);
+			f.render_widget(
+				ratatui::widgets::Paragraph::new(msg)
+					.alignment(ratatui::layout::Alignment::Center)
+					.style(self.theme.text(false, false)),
+				fsize,
+			);
+			return Ok(());
+		}
+
 		self.cmdbar.borrow_mut().refresh_width(fsize.width);
 
 		let chunks_main = Layout::default()
@@ -364,7 +378,13 @@ impl App {
 				progress,
 			);
 		}
-		self.toast.draw(f, fsize, &self.theme);
+		let toast_area = Rect {
+			height: fsize.height.saturating_sub(
+				self.cmdbar.borrow().height().saturating_sub(1),
+			),
+			..fsize
+		};
+		self.toast.draw(f, toast_area, &self.theme);
 
 		Ok(())
 	}
@@ -389,6 +409,15 @@ impl App {
 							operation.label
 						));
 					}
+					return Ok(());
+				}
+			}
+
+			// Allow dismissing toast or toggling bottom command bar via mouse.
+			if let Event::Mouse(mouse) = &ev {
+				if self.toast.handle_mouse(*mouse)
+					|| self.cmdbar.borrow_mut().handle_mouse(*mouse)
+				{
 					return Ok(());
 				}
 			}
@@ -443,7 +472,9 @@ impl App {
 						|| k.modifiers == KeyModifiers::SHIFT)
 					&& (!self.any_popup_visible()
 						|| self.inspect_commit_popup.is_visible()
-						|| self.compare_commits_popup.is_visible())
+						|| self.compare_commits_popup.is_visible()
+						|| self.file_revlog_popup.is_visible()
+						|| self.revision_files_popup.is_visible())
 				{
 					let delta = if k.code == KeyCode::Char('>') {
 						5
@@ -698,6 +729,8 @@ impl App {
 	fn adjust_active_split(&mut self, delta: i16) {
 		let ratio = if self.inspect_commit_popup.is_visible()
 			|| self.compare_commits_popup.is_visible()
+			|| self.file_revlog_popup.is_visible()
+			|| self.revision_files_popup.is_visible()
 		{
 			self.options.borrow_mut().adjust_detail_left_ratio(delta)
 		} else {
@@ -710,6 +743,10 @@ impl App {
 					.options
 					.borrow_mut()
 					.adjust_log_left_ratio(delta),
+				2 => self
+					.options
+					.borrow_mut()
+					.adjust_detail_left_ratio(delta),
 				_ => return,
 			}
 		};
@@ -1324,7 +1361,8 @@ impl App {
 					AppOption::ExternalDiffTool
 					| AppOption::AiCommitBackend
 					| AppOption::StatusLeftRatio
-					| AppOption::LogLeftRatio => {}
+					| AppOption::LogLeftRatio
+					| AppOption::DetailLeftRatio => {}
 					AppOption::MouseSupport => {
 						let enabled =
 							self.options.borrow().mouse_support();
@@ -1436,6 +1474,7 @@ impl App {
 		Ok(flags)
 	}
 
+	#[allow(clippy::too_many_lines)]
 	fn process_confirmed_action(
 		&mut self,
 		action: Action,
@@ -1493,6 +1532,44 @@ impl App {
 			}
 			Action::DeleteRemoteBranch(branch_ref) => {
 				self.delete_remote_branch(&branch_ref)?;
+			}
+			Action::MergeBranch(branch_name, branch_type) => {
+				let res = sync::merge_branch(
+					&self.repo.borrow(),
+					&branch_name,
+					branch_type,
+				);
+				if let Err(e) = res {
+					self.queue.push(InternalEvent::ShowErrorMsg(
+						format!("merge branch error:\n{e}"),
+					));
+				} else {
+					self.select_branch_popup.hide();
+					let unclean = sync::repo_state(&self.repo.borrow())?
+						!= RepoState::Clean;
+					if unclean {
+						self.set_tab(0)?;
+					}
+				}
+			}
+			Action::RebaseBranch(branch_name, branch_type) => {
+				let res = sync::rebase_branch(
+					&self.repo.borrow(),
+					&branch_name,
+					branch_type,
+				);
+				if let Err(e) = res {
+					self.queue.push(InternalEvent::ShowErrorMsg(
+						format!("rebase error:\n{e}"),
+					));
+				} else {
+					self.select_branch_popup.hide();
+					let unclean = sync::repo_state(&self.repo.borrow())?
+						!= RepoState::Clean;
+					if unclean {
+						self.set_tab(0)?;
+					}
+				}
 			}
 			Action::DeleteRemote(remote_name) => {
 				self.delete_remote(&remote_name);
@@ -1990,6 +2067,7 @@ impl App {
 		}
 	}
 
+	#[allow(clippy::too_many_lines)]
 	fn build_global_context_spans(
 		&self,
 		max_width: usize,
@@ -2005,7 +2083,8 @@ impl App {
 			if badge_w <= remaining {
 				spans.push(Span::styled(
 					badge_text,
-					Theme::attention_block()
+					self.theme
+						.warning()
 						.add_modifier(ratatui::style::Modifier::BOLD),
 				));
 				remaining = remaining.saturating_sub(badge_w + 1);
@@ -2020,9 +2099,9 @@ impl App {
 			let overhead = 2 + ab_str.width();
 			let include_ab = remaining > overhead + 3;
 			let name_budget = if include_ab {
-				remaining.saturating_sub(overhead).min(24)
+				remaining.saturating_sub(overhead).min(40)
 			} else {
-				remaining.saturating_sub(2).min(24)
+				remaining.saturating_sub(2).min(40)
 			};
 
 			if name_budget >= 2 {
@@ -2031,6 +2110,7 @@ impl App {
 				}
 				let display_branch =
 					Self::truncate_display(&branch, name_budget);
+				let branch_w = display_branch.width();
 				spans.push(Span::styled(
 					"(",
 					self.theme.text(false, false),
@@ -2061,6 +2141,42 @@ impl App {
 					")",
 					self.theme.text(false, false),
 				));
+				let used_branch_w = 2
+					+ branch_w
+					+ if include_ab { ab_str.width() } else { 0 };
+				remaining = remaining.saturating_sub(used_branch_w);
+			}
+		}
+
+		let (staged, unstaged) = self.status_tab.dirty_counts();
+		if staged > 0 || unstaged > 0 {
+			let staged_str = if staged > 0 {
+				format!(" +{staged}")
+			} else {
+				String::new()
+			};
+			let unstaged_str = if unstaged > 0 {
+				format!(" ~{unstaged}")
+			} else {
+				String::new()
+			};
+			let dirty_w = staged_str.width() + unstaged_str.width();
+			if dirty_w > 0 && dirty_w <= remaining {
+				if !staged_str.is_empty() {
+					spans.push(Span::styled(
+						staged_str,
+						self.theme.diff_line(
+							asyncgit::DiffLineType::Add,
+							false,
+						),
+					));
+				}
+				if !unstaged_str.is_empty() {
+					spans.push(Span::styled(
+						unstaged_str,
+						self.theme.warning(),
+					));
+				}
 			}
 		}
 
@@ -2084,7 +2200,7 @@ impl App {
 			status_tab.push_str(" · ");
 			status_tab.push_str(label);
 		}
-		let tab_strings = [
+		let mut tab_strings = [
 			status_tab,
 			strings::tab_log(&self.key_config),
 			strings::tab_files(&self.key_config),
@@ -2093,6 +2209,20 @@ impl App {
 		];
 		let divider = strings::tab_divider(&self.key_config);
 		let divider_w = divider.width();
+		let full_tabs_w: usize = tab_strings
+			.iter()
+			.map(|s| s.width() + 2)
+			.sum::<usize>()
+			+ divider_w * 4;
+		if full_tabs_w > usize::from(r.width) {
+			tab_strings = [
+				"1:St".to_owned(),
+				"2:Log".to_owned(),
+				"3:Fil".to_owned(),
+				"4:S+".to_owned(),
+				"5:S#".to_owned(),
+			];
+		}
 
 		// Record each tab's horizontal hit range for mouse click switching.
 		let mut hit_ranges = self.tab_hit_ranges.borrow_mut();

@@ -59,6 +59,8 @@ pub struct LocalBranch {
 	pub remote: Option<String>,
 	/// Configured upstream branch as `remote/branch`.
 	pub remote_branch_name: Option<String>,
+	/// `(ahead, behind)` commit counts relative to upstream, if available.
+	pub ahead_behind: Option<(usize, usize)>,
 }
 
 ///
@@ -193,14 +195,22 @@ pub fn get_branches_info(
 					.and_then(|buf| buf.as_str().ok())
 					.map(String::from);
 
-				let upstream_branch =
-					upstream.ok().and_then(|upstream| {
-						bytes2string(upstream.get().name_bytes())
-							.ok()
-							.map(|reference| UpstreamBranch {
-								reference,
-							})
+				let upstream_res = upstream.ok();
+				let ahead_behind = upstream_res
+					.as_ref()
+					.and_then(|u| u.get().peel_to_commit().ok())
+					.and_then(|uc| {
+						repo.graph_ahead_behind(
+							top_commit.id(),
+							uc.id(),
+						)
+						.ok()
 					});
+				let upstream_branch = upstream_res.and_then(|upstream| {
+					bytes2string(upstream.get().name_bytes())
+						.ok()
+						.map(|reference| UpstreamBranch { reference })
+				});
 
 				let remote_branch_name = remote
 					.as_deref()
@@ -221,6 +231,7 @@ pub fn get_branches_info(
 					upstream: upstream_branch,
 					remote,
 					remote_branch_name,
+					ahead_behind,
 				})
 			} else {
 				let remote_url = repo

@@ -4,7 +4,7 @@ use crate::{
 		visibility_blocking, CommandBlocking, CommandInfo, Component,
 		CredComponent, DrawableComponent, EventState,
 	},
-	keys::SharedKeyConfig,
+	keys::{key_match, SharedKeyConfig},
 	popups::PushPopup,
 	queue::{InternalEvent, Queue},
 	repo_operation::RepoOperation,
@@ -45,6 +45,7 @@ pub struct PullPopup {
 	theme: SharedTheme,
 	key_config: SharedKeyConfig,
 	input_cred: CredComponent,
+	started_at: Option<std::time::Instant>,
 }
 
 impl PullPopup {
@@ -64,6 +65,7 @@ impl PullPopup {
 			input_cred: CredComponent::new(env),
 			theme: env.theme.clone(),
 			key_config: env.key_config.clone(),
+			started_at: None,
 		}
 	}
 
@@ -100,6 +102,7 @@ impl PullPopup {
 			basic_credential: cred,
 		})?;
 		self.pending = true;
+		self.started_at = Some(std::time::Instant::now());
 
 		Ok(())
 	}
@@ -180,6 +183,12 @@ impl DrawableComponent for PullPopup {
 		if self.visible {
 			let (state, progress) =
 				PushPopup::get_progress(self.progress.as_ref());
+			let label = if let Some(started) = self.started_at {
+				let secs = started.elapsed().as_secs();
+				format!("{state} ({secs}s)")
+			} else {
+				state
+			};
 
 			let area = ui::responsive_popup_rect(
 				45,
@@ -192,7 +201,7 @@ impl DrawableComponent for PullPopup {
 			ui::clear_popup_area(f, area);
 			f.render_widget(
 				Gauge::default()
-					.label(state.as_str())
+					.label(label)
 					.block(
 						Block::default()
 							.title(Span::styled(
@@ -240,7 +249,7 @@ impl Component for PullPopup {
 
 	fn event(&mut self, ev: &Event) -> Result<EventState> {
 		if self.visible {
-			if let Event::Key(_) = ev {
+			if let Event::Key(e) = ev {
 				if self.input_cred.is_visible() {
 					self.input_cred.event(ev)?;
 
@@ -252,6 +261,10 @@ impl Component for PullPopup {
 					} else if !self.input_cred.is_visible() {
 						self.hide();
 					}
+				} else if key_match(e, self.key_config.keys.exit_popup)
+					&& !self.pending
+				{
+					self.hide();
 				}
 			}
 			return Ok(EventState::Consumed);
@@ -269,6 +282,7 @@ impl Component for PullPopup {
 
 	fn hide(&mut self) {
 		self.visible = false;
+		self.started_at = None;
 	}
 
 	fn show(&mut self) -> Result<()> {

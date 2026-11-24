@@ -3,7 +3,7 @@ use crate::{
 	components::{
 		string_width_align, visibility_blocking, CommandBlocking,
 		CommandInfo, Component, DiffComponent, DiffMode,
-		DrawableComponent, EventState,
+		DrawableComponent, EventState, VerticalScroll,
 	},
 	keys::{key_match, SharedKeyConfig},
 	options::{AiCommitBackend, ExternalDiffTool, SharedOptions},
@@ -21,6 +21,7 @@ use ratatui::{
 	widgets::{Block, Borders, Padding},
 	Frame,
 };
+use std::cell::Cell;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppOption {
@@ -34,10 +35,11 @@ pub enum AppOption {
 	MouseSupport,
 	StatusLeftRatio,
 	LogLeftRatio,
+	DetailLeftRatio,
 }
 
 impl AppOption {
-	const ORDER: [Self; 10] = [
+	const ORDER: [Self; 11] = [
 		Self::StatusShowUntracked,
 		Self::DiffMode,
 		Self::DiffIgnoreWhitespaces,
@@ -48,6 +50,7 @@ impl AppOption {
 		Self::MouseSupport,
 		Self::StatusLeftRatio,
 		Self::LogLeftRatio,
+		Self::DetailLeftRatio,
 	];
 
 	const fn description(self) -> &'static str {
@@ -82,6 +85,9 @@ impl AppOption {
 			Self::LogLeftRatio => {
 				"Left list width (%) in Log & Stashes; [<]/[>] adjusts."
 			}
+			Self::DetailLeftRatio => {
+				"Left pane width (%) in Files & Inspect; [<]/[>] adjusts."
+			}
 		}
 	}
 }
@@ -93,6 +99,8 @@ pub struct OptionsPopup {
 	key_config: SharedKeyConfig,
 	options: SharedOptions,
 	theme: SharedTheme,
+	scroll: VerticalScroll,
+	last_area: Cell<Rect>,
 }
 
 impl OptionsPopup {
@@ -105,6 +113,8 @@ impl OptionsPopup {
 			key_config: env.key_config.clone(),
 			options: env.options.clone(),
 			theme: env.theme.clone(),
+			scroll: VerticalScroll::new(),
+			last_area: Cell::new(Rect::default()),
 		}
 	}
 
@@ -246,6 +256,15 @@ impl OptionsPopup {
 			&log_ratio,
 			self.is_select(AppOption::LogLeftRatio),
 		);
+		let detail_ratio =
+			format!("{}%", self.options.borrow().detail_left_ratio());
+		self.add_entry(
+			txt,
+			width,
+			"Detail split",
+			&detail_ratio,
+			self.is_select(AppOption::DetailLeftRatio),
+		);
 
 		txt.push(Line::default());
 		let desc = self.selection.description();
@@ -261,6 +280,17 @@ impl OptionsPopup {
 
 	fn is_select(&self, kind: AppOption) -> bool {
 		self.selection == kind
+	}
+
+	fn selected_line_index(lines: &[Line<'_>]) -> usize {
+		lines
+			.iter()
+			.position(|line| {
+				line.spans
+					.first()
+					.is_some_and(|s| s.content.starts_with("> "))
+			})
+			.unwrap_or(0)
 	}
 
 	fn add_header(&self, txt: &mut Vec<Line>, header: &'static str) {
@@ -405,6 +435,12 @@ impl OptionsPopup {
 				let delta = if right { 5 } else { -5 };
 				self.options.borrow_mut().adjust_log_left_ratio(delta);
 			}
+			AppOption::DetailLeftRatio => {
+				let delta = if right { 5 } else { -5 };
+				self.options
+					.borrow_mut()
+					.adjust_detail_left_ratio(delta);
+			}
 		}
 
 		self.queue
@@ -444,6 +480,21 @@ impl DrawableComponent for OptionsPopup {
 				.min(area.height);
 			let popup_area =
 				ui::centered_rect_absolute(width, height, area);
+			self.last_area.set(popup_area);
+
+			let inner_height = usize::from(height.saturating_sub(2));
+			let selected_line = Self::selected_line_index(&lines);
+			self.scroll.update(
+				selected_line,
+				lines.len(),
+				inner_height,
+			);
+			let top = self.scroll.get_top();
+			let visible_lines: Vec<Line<'_>> = lines
+				.into_iter()
+				.skip(top)
+				.take(inner_height)
+				.collect();
 
 			ui::clear_popup_area(f, popup_area);
 			let block = Block::default()
@@ -459,8 +510,9 @@ impl DrawableComponent for OptionsPopup {
 				f.buffer_mut(),
 				popup_area,
 				block,
-				&lines,
+				&visible_lines,
 			);
+			self.scroll.draw(f, popup_area, &self.theme);
 		}
 
 		Ok(())
@@ -523,6 +575,31 @@ impl Component for OptionsPopup {
 		event: &crossterm::event::Event,
 	) -> Result<EventState> {
 		if self.is_visible() {
+			if let Event::Mouse(mouse) = &event {
+				let pos = ratatui::layout::Position::new(
+					mouse.column,
+					mouse.row,
+				);
+				let area = self.last_area.get();
+				match mouse.kind {
+					crossterm::event::MouseEventKind::Down(
+						crossterm::event::MouseButton::Left,
+					) => {
+						if !area.contains(pos) {
+							self.hide();
+							return Ok(EventState::Consumed);
+						}
+					}
+					crossterm::event::MouseEventKind::ScrollUp => {
+						self.move_selection(true);
+					}
+					crossterm::event::MouseEventKind::ScrollDown => {
+						self.move_selection(false);
+					}
+					_ => {}
+				}
+				return Ok(EventState::Consumed);
+			}
 			if let Event::Key(key) = &event {
 				if key_match(key, self.key_config.keys.exit_popup) {
 					self.hide();
